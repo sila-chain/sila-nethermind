@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TieredPGO>true</TieredPGO>
+    <IsTestingPlatformApplication>false</IsTestingPlatformApplication>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Nethermind.Benchmark\Nethermind.Benchmark.csproj" />
+    <ProjectReference Include="..\Nethermind.SilaTests.Benchmark\Nethermind.SilaTests.Benchmark.csproj" />
+    <ProjectReference Include="..\Nethermind.Savm.Benchmark\Nethermind.Savm.Benchmark.csproj" />
+    <ProjectReference Include="..\Nethermind.JsonRpc.Benchmark\Nethermind.JsonRpc.Benchmark.csproj" />
+    <ProjectReference Include="..\Nethermind.Merge.Plugin.Benchmark\Nethermind.Merge.Plugin.Benchmark.csproj" />
+    <ProjectReference Include="..\Nethermind.Network.Benchmark\Nethermind.Network.Benchmark.csproj" />
+    <ProjectReference Include="..\Nethermind.Precompiles.Benchmark\Nethermind.Precompiles.Benchmark.csproj" />
+  </ItemGroup>
+
+</Project>

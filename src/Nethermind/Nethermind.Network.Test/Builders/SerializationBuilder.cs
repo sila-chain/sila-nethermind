@@ -1,0 +1,107 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using Nethermind.Core;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Crypto;
+using Nethermind.Network.Discovery.Discv4.Messages;
+using Nethermind.Network.Discovery.Discv4.Serializers;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V63.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V65.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V69.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V70.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V71.Messages;
+using Nethermind.Network.Rlpx.Handshake;
+using Nethermind.Specs;
+
+namespace Nethermind.Network.Test.Builders
+{
+    public class SerializationBuilder(ITimestamper timestamper = null) : BuilderBase<IMessageSerializationService>
+    {
+        private readonly ITimestamper _timestamper = timestamper ?? Timestamper.Default;
+        private List<SerializerInfo> _serializers = [];
+
+        public SerializationBuilder With<T>(IZeroMessageSerializer<T> serializer) where T : MessageBase
+        {
+            _serializers.Add(SerializerInfo.Create(serializer));
+            return this;
+        }
+
+        protected override void BeforeReturn() => TestObject = new MessageSerializationService(_serializers);
+
+        public SerializationBuilder WithEncryptionHandshake() => With(new AuthMessageSerializer())
+                .With(new AuthSip8MessageSerializer(new Sip8MessagePad(new CryptoRandom())))
+                .With(new AckMessageSerializer())
+                .With(new AckSip8MessageSerializer(new Sip8MessagePad(new CryptoRandom())));
+
+        public SerializationBuilder WithP2P() => With(new Nethermind.Network.P2P.Messages.PingMessageSerializer())
+                .With(new Nethermind.Network.P2P.Messages.PongMessageSerializer())
+                .With(new Nethermind.Network.P2P.Messages.HelloMessageSerializer())
+                .With(new Nethermind.Network.P2P.Messages.DisconnectMessageSerializer());
+
+        public SerializationBuilder WithEth() => With(new BlockHeadersMessageSerializer())
+                .With(new BlockBodiesMessageSerializer())
+                .With(new GetBlockBodiesMessageSerializer())
+                .With(new GetBlockHeadersMessageSerializer())
+                .With(new NewBlockHashesMessageSerializer())
+                .With(new NewBlockMessageSerializer())
+                .With(new TransactionsMessageSerializer())
+                .With(new StatusMessageSerializer());
+
+        public SerializationBuilder WithEth65() => WithEth()
+                .With(new NewPooledTransactionHashesMessageSerializer())
+                .With(new GetPooledTransactionsMessageSerializer())
+                .With(new PooledTransactionsMessageSerializer());
+
+        public SerializationBuilder WithEth66() => WithEth65()
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.GetBlockHeadersMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.BlockHeadersMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.GetBlockBodiesMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.BlockBodiesMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.GetPooledTransactionsMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.PooledTransactionsMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.GetNodeDataMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.NodeDataMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.GetReceiptsMessageSerializer())
+                .With(new Network.P2P.Subprotocols.Sil.V66.Messages.ReceiptsMessageSerializer(new ReceiptsMessageSerializer(MainnetSpecProvider.Instance)));
+
+        public SerializationBuilder WithEth68() => WithEth66()
+                .With(new Network.P2P.Subprotocols.Sil.V68.Messages.NewPooledTransactionHashesMessageSerializer());
+
+        public SerializationBuilder WithEth69(ISpecProvider specProvider) => WithEth68()
+                .With<ReceiptsMessage69>(new ReceiptsMessageSerializer69(specProvider))
+                .With(new StatusMessageSerializer69())
+                .With(new BlockRangeUpdateMessageSerializer());
+
+        public SerializationBuilder WithEth70(ISpecProvider specProvider) => WithEth69(specProvider)
+                .With<GetReceiptsMessage70>(new GetReceiptsMessageSerializer70())
+                .With<ReceiptsMessage70>(new ReceiptsMessageSerializer70(specProvider));
+
+        public SerializationBuilder WithEth71(ISpecProvider specProvider) => WithEth70(specProvider)
+                .With(new GetBlockAccessListsMessageSerializer())
+                .With(new BlockAccessListsMessageSerializer());
+
+        public SerializationBuilder WithDiscovery(PrivateKey privateKey)
+        {
+            Ecdsa ecdsa = new();
+            SameKeyGenerator privateKeyProvider = new(privateKey);
+
+            PingMsgSerializer pingSerializer = new(ecdsa, privateKeyProvider, new NodeIdResolver(ecdsa));
+            PongMsgSerializer pongSerializer = new(ecdsa, privateKeyProvider, new NodeIdResolver(ecdsa));
+            FindNodeMsgSerializer findNodeSerializer = new(ecdsa, privateKeyProvider, new NodeIdResolver(ecdsa));
+            NeighborsMsgSerializer neighborsSerializer = new(ecdsa, privateKeyProvider, new NodeIdResolver(ecdsa));
+            EnrRequestMsgSerializer enrRequestSerializer = new(ecdsa, privateKeyProvider, new NodeIdResolver(ecdsa));
+            EnrResponseMsgSerializer enrResponseSerializer = new(ecdsa, privateKeyProvider, new NodeIdResolver(ecdsa));
+
+            return With(pingSerializer)
+                .With(pongSerializer)
+                .With(findNodeSerializer)
+                .With(neighborsSerializer)
+                .With(enrRequestSerializer)
+                .With(enrResponseSerializer);
+        }
+    }
+}

@@ -1,0 +1,34 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Buffers.Binary;
+using Nethermind.Core.Extensions;
+
+namespace Nethermind.Network
+{
+    public readonly struct ForkId(uint forkHash, ulong next) : IEquatable<ForkId>
+    {
+        public uint ForkHash { get; } = forkHash;
+
+        public ulong Next { get; } = next;
+
+        public byte[] HashBytes
+        {
+            get
+            {
+                byte[] hash = new byte[4];
+                BinaryPrimitives.TryWriteUInt32BigEndian(hash, ForkHash);
+                return hash;
+            }
+        }
+
+        public bool Equals(ForkId other) => ForkHash == other.ForkHash && Next == other.Next;
+
+        public override bool Equals(object obj) => obj is ForkId other && Equals(other);
+
+        public override int GetHashCode() => HashCode.Combine(ForkHash.GetHashCode(), Next);
+
+        public override string ToString() => $"{HashBytes.ToHexString()} {Next}";
+    }
+}

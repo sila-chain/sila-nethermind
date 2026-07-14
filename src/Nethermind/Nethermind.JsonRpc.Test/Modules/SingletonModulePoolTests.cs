@@ -1,0 +1,98 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Core.Specs;
+using Nethermind.JsonRpc.Modules;
+using Nethermind.JsonRpc.Modules.Sil;
+using Nethermind.Logging;
+using Nethermind.Facade;
+using Nethermind.TxPool;
+using Nethermind.Wallet;
+using NSubstitute;
+using NUnit.Framework;
+using BlockTree = Nethermind.Blockchain.BlockTree;
+using System.Threading.Tasks;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Receipts;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Facade.Sil;
+using Nethermind.History;
+using Nethermind.JsonRpc.Modules.Sil.FeeHistory;
+using Nethermind.JsonRpc.Modules.Sil.GasPrice;
+using Nethermind.Config;
+using Nethermind.Db.LogIndex;
+using Nethermind.Network;
+using Nethermind.State;
+using Nethermind.Synchronization;
+
+namespace Nethermind.JsonRpc.Test.Modules
+{
+    [Parallelizable(ParallelScope.Self)]
+    [TestFixture]
+    public class SingletonModulePoolTests
+    {
+        private SingletonModulePool<ISilRpcModule> _modulePool = null!;
+        private SilModuleFactory _factory = null!;
+
+        [SetUp]
+        public Task Initialize()
+        {
+            ITxPool txPool = NullTxPool.Instance;
+
+            BlockTree blockTree = Build.A.BlockTree()
+                .TestObject;
+
+            _factory = new SilModuleFactory(
+                txPool,
+                Substitute.For<ITxSender>(),
+                NullWallet.Instance,
+                blockTree,
+                new JsonRpcConfig(),
+                LimboLogs.Instance,
+                Substitute.For<IStateReader>(),
+                Substitute.For<IBlockchainBridgeFactory>(),
+                Substitute.For<ISpecProvider>(),
+                Substitute.For<IReceiptStorage>(),
+                Substitute.For<IGasPriceOracle>(),
+                Substitute.For<ISilSyncingInfo>(),
+                Substitute.For<IFeeHistoryOracle>(),
+                Substitute.For<IProtocolsManager>(),
+                new BlocksConfig(),
+                Substitute.For<IForkInfo>(),
+                Substitute.For<ILogIndexConfig>(),
+                new ReceiptConfig(),
+                new SilCapabilitiesProvider(
+                    blockTree.AsReadOnly(),
+                    Substitute.For<IStateBoundary>(),
+                    new SyncConfig(),
+                    Substitute.For<ISyncPointers>(),
+                    Substitute.For<IHistoryConfig>(),
+                    Substitute.For<IHistoryPruner>()),
+                new BlockForRpcFactory());
+            return Task.CompletedTask;
+        }
+
+        [Test]
+        public void Cannot_return_exclusive_if_not_allowed()
+        {
+            _modulePool = new SingletonModulePool<ISilRpcModule>(_factory.Create(), false);
+            Assert.Throws<InvalidOperationException>(() => _modulePool.GetModule(false));
+        }
+
+        [Test]
+        public void Can_return_exclusive_if_allowed()
+        {
+            _modulePool = new SingletonModulePool<ISilRpcModule>(_factory.Create(), true);
+            _modulePool.GetModule(false);
+        }
+
+        [Test]
+        public void Ensure_unlimited_shared()
+        {
+            _modulePool = new SingletonModulePool<ISilRpcModule>(_factory.Create(), true);
+            _modulePool.GetModule(true);
+        }
+    }
+}

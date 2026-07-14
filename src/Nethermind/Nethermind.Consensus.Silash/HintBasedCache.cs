@@ -1,0 +1,134 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Logging;
+
+namespace Nethermind.Consensus.Silash
+{
+    internal class HintBasedCache(Func<uint, ISilashDataSet> createDataSet, ILogManager logManager)
+    {
+        private readonly Dictionary<Guid, HashSet<uint>> _epochsPerGuid = [];
+        private readonly Dictionary<uint, int> _epochRefs = [];
+        private readonly Dictionary<uint, Task<ISilashDataSet>> _cachedSets = [];
+        private readonly Dictionary<uint, DataSetWithTime> _recent = [];
+
+        private struct DataSetWithTime(DateTimeOffset timestamp, Task<ISilashDataSet> dataSet)
+        {
+            public DateTimeOffset Timestamp { get; set; } = timestamp;
+            public Task<ISilashDataSet> DataSet { get; set; } = dataSet;
+        }
+
+        private int _cachedEpochsCount;
+
+        public int CachedEpochsCount => _cachedEpochsCount;
+
+        private readonly Func<uint, ISilashDataSet> _createDataSet = createDataSet;
+        private readonly ILogger _logger = logManager?.GetClassLogger<HintBasedCache>() ?? throw new ArgumentNullException(nameof(logManager));
+
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        public void Hint(Guid guid, ulong start, ulong end)
+        {
+            uint startEpoch = (uint)(start / Silash.EpochLength);
+            uint endEpoch = (uint)(end / Silash.EpochLength);
+
+            if (endEpoch - startEpoch > 10)
+            {
+                throw new InvalidOperationException("Hint too wide");
+            }
+
+            ref HashSet<uint>? value = ref CollectionsMarshal.GetValueRefOrAddDefault(_epochsPerGuid, guid, out bool exists);
+            if (!exists)
+            {
+                value = [];
+            }
+
+            HashSet<uint> epochForGuid = value;
+            uint currentMin = uint.MaxValue;
+            uint currentMax = 0;
+            foreach (uint alreadyCachedEpoch in epochForGuid.ToList())
+            {
+                if (alreadyCachedEpoch < currentMin)
+                {
+                    currentMin = alreadyCachedEpoch;
+                }
+
+                if (alreadyCachedEpoch > currentMax)
+                {
+                    currentMax = alreadyCachedEpoch;
+                }
+
+                if (alreadyCachedEpoch < startEpoch || alreadyCachedEpoch > endEpoch)
+                {
+                    epochForGuid.Remove(alreadyCachedEpoch);
+                    if (!_epochRefs.TryGetValue(alreadyCachedEpoch, out int epochValue))
+                    {
+                        throw new InvalidAsynchronousStateException("Epoch ref missing");
+                    }
+
+                    _epochRefs[alreadyCachedEpoch] = epochValue - 1;
+                    if (_epochRefs[alreadyCachedEpoch] == 0)
+                    {
+                        // _logger.Warn($"Removing data set for epoch {alreadyCachedEpoch}");
+                        _cachedSets.Remove(alreadyCachedEpoch, out Task<ISilashDataSet> removed);
+                        _recent[alreadyCachedEpoch] = new DataSetWithTime(DateTimeOffset.UtcNow, removed);
+                        Interlocked.Decrement(ref _cachedEpochsCount);
+                    }
+                }
+            }
+
+            if (currentMin > startEpoch || currentMax < endEpoch)
+            {
+                for (uint i = startEpoch; i <= endEpoch; i++)
+                {
+                    uint epoch = (uint)i;
+                    if (epochForGuid.Add(epoch))
+                    {
+                        if (!_epochRefs.TryGetValue(epoch, out int epochValue))
+                        {
+                            epochValue = 0;
+                            _epochRefs[epoch] = epochValue;
+                        }
+
+                        _epochRefs[epoch] = epochValue + 1;
+                        if (_epochRefs[epoch] == 1)
+                        {
+                            // _logger.Warn($"Building data set for epoch {epoch}");
+                            if (_recent.Remove(epoch, out DataSetWithTime reused))
+                            {
+                                _cachedSets[epoch] = reused.DataSet;
+                            }
+                            else
+                            {
+                                foreach (KeyValuePair<uint, DataSetWithTime> recent in _recent.ToList())
+                                {
+                                    if (recent.Value.Timestamp < DateTimeOffset.UtcNow.AddSeconds(-30))
+                                    {
+                                        _recent.Remove(recent.Key);
+                                    }
+                                }
+
+                                _cachedSets[epoch] = Task<ISilashDataSet>.Run(() => _createDataSet(epoch));
+                            }
+
+                            Interlocked.Increment(ref _cachedEpochsCount);
+                        }
+                    }
+                }
+            }
+        }
+
+        public ISilashDataSet Get(uint epoch)
+        {
+            _cachedSets.TryGetValue(epoch, out Task<ISilashDataSet> dataSetTask);
+            return dataSetTask?.Result;
+        }
+    }
+}

@@ -1,0 +1,148 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Runtime.CompilerServices;
+using Nethermind.Core;
+using Nethermind.Core.Caching;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+
+namespace Nethermind.Serialization.Rlp;
+
+public static class KeyValueStoreRlpExtensions
+{
+
+    [SkipLocalsInit]
+    public static TItem? Get<TItem>(this IReadOnlyKeyValueStore db, ulong blockNumber, ValueHash256 hash, IRlpDecoder<TItem> decoder,
+        ClockCache<ValueHash256, TItem> cache = null, RlpBehaviors rlpBehaviors = RlpBehaviors.None, bool shouldCache = true) where TItem : class
+    {
+        Span<byte> dbKey = stackalloc byte[40];
+        KeyValueStoreExtensions.GetBlockNumPrefixedKey(blockNumber, hash, dbKey);
+        return Get(db, hash, dbKey, decoder, cache, rlpBehaviors, shouldCache);
+    }
+
+    public static TItem? Get<TItem>(this IReadOnlyKeyValueStore db, ValueHash256 key, IRlpDecoder<TItem> decoder, ClockCache<ValueHash256, TItem> cache = null, RlpBehaviors rlpBehaviors = RlpBehaviors.None, bool shouldCache = true) where TItem : class =>
+        Get(db, key, key.Bytes, decoder, cache, rlpBehaviors, shouldCache);
+
+    public static TItem? Get<TItem>(this IReadOnlyKeyValueStore db, long key, IRlpDecoder<TItem>? decoder, ClockCache<long, TItem>? cache = null, RlpBehaviors rlpBehaviors = RlpBehaviors.None, bool shouldCache = true) where TItem : class
+    {
+        ReadOnlySpan<byte> keyDb = key.ToBigEndianSpanWithoutLeadingZeros(out _);
+        return Get(db, key, keyDb, decoder, cache, rlpBehaviors, shouldCache);
+    }
+
+    public static TItem? Get<TItem>(this IReadOnlyKeyValueStore db, ulong key, IRlpDecoder<TItem>? decoder, ClockCache<ulong, TItem>? cache = null, RlpBehaviors rlpBehaviors = RlpBehaviors.None, bool shouldCache = true) where TItem : class
+    {
+        ReadOnlySpan<byte> keyDb = key.ToBigEndianSpanWithoutLeadingZeros(out _);
+        return Get(db, key, keyDb, decoder, cache, rlpBehaviors, shouldCache);
+    }
+
+    public static TItem? Get<TCacheKey, TItem>(
+        this IReadOnlyKeyValueStore db,
+        TCacheKey cacheKey,
+        ReadOnlySpan<byte> key,
+        IRlpDecoder<TItem> decoder,
+        ClockCache<TCacheKey, TItem> cache = null,
+        RlpBehaviors rlpBehaviors = RlpBehaviors.None,
+        bool shouldCache = true
+    ) where TItem : class
+      where TCacheKey : struct, IEquatable<TCacheKey>
+    {
+        TItem item = cache?.Get(cacheKey);
+        item ??= db is IReadOnlyNativeKeyValueStore native
+            ? Get(native, key, decoder, rlpBehaviors)
+            : Get(db, key, decoder, rlpBehaviors);
+
+        if (shouldCache && cache is not null && item is not null)
+        {
+            cache.Set(cacheKey, item);
+        }
+
+        return item;
+    }
+
+    [SkipLocalsInit]
+    public static TItem? Get<TItem>(this IReadOnlyKeyValueStore db, ulong blockNumber, ValueHash256 hash, IRlpDecoder<TItem> decoder,
+        AssociativeCache<ValueHash256, TItem> cache = null, RlpBehaviors rlpBehaviors = RlpBehaviors.None, bool shouldCache = true) where TItem : class
+    {
+        Span<byte> dbKey = stackalloc byte[40];
+        KeyValueStoreExtensions.GetBlockNumPrefixedKey(blockNumber, hash, dbKey);
+        return Get(db, hash, dbKey, decoder, cache, rlpBehaviors, shouldCache);
+    }
+
+    public static TItem? Get<TItem>(this IReadOnlyKeyValueStore db, ValueHash256 key, IRlpDecoder<TItem> decoder, AssociativeCache<ValueHash256, TItem> cache = null, RlpBehaviors rlpBehaviors = RlpBehaviors.None, bool shouldCache = true) where TItem : class =>
+        Get(db, key, key.Bytes, decoder, cache, rlpBehaviors, shouldCache);
+
+    public static TItem? Get<TCacheKey, TItem>(
+        this IReadOnlyKeyValueStore db,
+        TCacheKey cacheKey,
+        ReadOnlySpan<byte> key,
+        IRlpDecoder<TItem> decoder,
+        AssociativeCache<TCacheKey, TItem> cache = null,
+        RlpBehaviors rlpBehaviors = RlpBehaviors.None,
+        bool shouldCache = true
+    ) where TItem : class
+      where TCacheKey : struct, IHash64bit<TCacheKey>
+    {
+        TItem item = cache?.Get(in cacheKey);
+        item ??= db is IReadOnlyNativeKeyValueStore native
+            ? Get(native, key, decoder, rlpBehaviors)
+            : Get(db, key, decoder, rlpBehaviors);
+
+        if (shouldCache && cache is not null && item is not null)
+        {
+            cache.Set(in cacheKey, item);
+        }
+
+        return item;
+    }
+
+    private static TItem? Get<TItem>(IReadOnlyNativeKeyValueStore db, ReadOnlySpan<byte> key, IRlpDecoder<TItem> valueDecoder, RlpBehaviors rlpBehaviors) where TItem : class
+    {
+        ReadOnlySpan<byte> data = db.GetNativeSlice(key, out IntPtr handle);
+        if (data.IsNull())
+        {
+            return null;
+        }
+
+        try
+        {
+            if (data.Length == 0)
+            {
+                return null;
+            }
+
+            RlpReader reader = new(data);
+            return valueDecoder.Decode(ref reader, rlpBehaviors | RlpBehaviors.AllowExtraBytes);
+        }
+        finally
+        {
+            db.DangerousReleaseHandle(handle);
+        }
+    }
+
+    private static TItem? Get<TItem>(IReadOnlyKeyValueStore db, ReadOnlySpan<byte> key, IRlpDecoder<TItem> valueDecoder, RlpBehaviors rlpBehaviors) where TItem : class
+    {
+        Span<byte> data = db.GetSpan(key);
+        if (data.IsNull())
+        {
+            return null;
+        }
+
+        try
+        {
+            if (data.Length == 0)
+            {
+                return null;
+            }
+
+            RlpReader reader = new(data);
+            return valueDecoder.Decode(ref reader, rlpBehaviors | RlpBehaviors.AllowExtraBytes);
+        }
+        finally
+        {
+            db.DangerousReleaseMemory(data);
+        }
+    }
+}

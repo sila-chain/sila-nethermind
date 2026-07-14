@@ -1,0 +1,450 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Nethermind.Consensus;
+using Nethermind.Consensus.Silash;
+using Nethermind.Consensus.Validators;
+using Nethermind.Core;
+using Nethermind.Core.BlockAccessLists;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Messages;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Crypto;
+using Nethermind.Int256;
+using Nethermind.Logging;
+using Nethermind.Serialization.Rlp;
+using Nethermind.Specs;
+using Nethermind.Specs.Forks;
+using Nethermind.Specs.Test;
+using NSubstitute;
+using NUnit.Framework;
+
+namespace Nethermind.Blockchain.Test.Validators;
+
+[Parallelizable(ParallelScope.All)]
+[FixtureLifeCycle(LifeCycle.InstancePerTestCase)]
+public class HeaderValidatorTests
+{
+    private IHeaderValidator _validator = null!;
+    private ISealValidator _silash = null!;
+    private TestLogger _testLogger = null!;
+    private Block _parentBlock = null!;
+    private Block _block = null!;
+    private IBlockTree _blockTree = null!;
+    private ISpecProvider _specProvider = null!;
+
+    [SetUp]
+    public void Setup()
+    {
+        SilashDifficultyCalculator calculator = new(new TestSingleReleaseSpecProvider(Frontier.Instance));
+        _silash = new SilashSealValidator(LimboLogs.Instance, calculator, new CryptoRandom(), new Silash(LimboLogs.Instance), Timestamper.Default);
+        _testLogger = new TestLogger();
+        _blockTree = Build.A.BlockTree()
+            .WithSpecProvider(FrontierSpecProvider.Instance)
+            .WithoutSettingHead
+            .TestObject;
+        _specProvider = new TestSingleReleaseSpecProvider(Byzantium.Instance);
+
+        _validator = new HeaderValidator(_blockTree, _silash, _specProvider, new OneLoggerLogManager(new(_testLogger)));
+        _parentBlock = Build.A.Block.WithDifficulty(1).TestObject;
+        _block = Build.A.Block.WithParent(_parentBlock)
+            .WithDifficulty(131072)
+            .WithMixHash(new Hash256("0xd7db5fdd332d3a65d6ac9c4c530929369905734d3ef7a91e373e81d0f010b8e8"))
+            .WithNonce(0).TestObject;
+
+        _blockTree.SuggestBlock(_parentBlock);
+        _blockTree.SuggestBlock(_block);
+    }
+
+    [Test, MaxTime(Timeout.MaxTestTime)]
+    public void Valid_when_valid()
+    {
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header);
+        if (!result)
+        {
+            foreach (string error in _testLogger.LogList)
+            {
+                Console.WriteLine(error);
+            }
+        }
+
+        Assert.That(result, Is.True);
+    }
+
+    [MaxTime(Timeout.MaxTestTime)]
+    [TestCase(1, false, TestName = "When_gas_limit_too_high")]
+    [TestCase(0, true, TestName = "When_gas_limit_just_correct_high")]
+    [TestCase(-1, true, TestName = "When_gas_limit_just_correct_low")]
+    [TestCase(-2, false, TestName = "When_gas_limit_is_just_too_low")]
+    public void When_gas_limit_is_adjusted_around_parent(int boundaryIndex, bool expectedResult)
+    {
+        ulong delta = _parentBlock.Header.GasLimit / 1024ul;
+
+        _block.Header.GasLimit = boundaryIndex switch
+        {
+            1 => _parentBlock.Header.GasLimit + delta,
+            0 => _parentBlock.Header.GasLimit + delta - 1ul,
+            -1 => _parentBlock.Header.GasLimit - delta + 1ul,
+            -2 => _parentBlock.Header.GasLimit - delta,
+            _ => throw new ArgumentOutOfRangeException(nameof(boundaryIndex))
+        };
+        _block.Header.Hash = _block.CalculateHash();
+
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header);
+        Assert.That(result, Is.EqualTo(expectedResult));
+    }
+
+    private static IEnumerable<TestCaseData> InvalidFieldCases()
+    {
+        yield return new TestCaseData(new Action<Block, Block>((block, parent) => block.Header.GasUsed = parent.Header.GasLimit + 1))
+            .SetName("When_gas_used_above_gas_limit");
+        yield return new TestCaseData(new Action<Block, Block>((block, _) => block.Header.ParentHash = Keccak.Zero))
+            .SetName("When_no_parent_invalid");
+        yield return new TestCaseData(new Action<Block, Block>((block, parent) => block.Header.Timestamp = parent.Header.Timestamp))
+            .SetName("When_timestamp_same_as_parent");
+    }
+
+    [MaxTime(Timeout.MaxTestTime)]
+    [TestCaseSource(nameof(InvalidFieldCases))]
+    public void Header_field_invalidation_returns_false(Action<Block, Block> corrupt)
+    {
+        corrupt(_block, _parentBlock);
+        _block.Header.Hash = _block.CalculateHash();
+
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header);
+        Assert.That(result, Is.False);
+    }
+
+    [Test, MaxTime(Timeout.MaxTestTime)]
+    public void When_slot_number_not_greater_than_parent_is_still_valid()
+    {
+        // Arrange: Same setup as above
+        TestSpecProvider specProvider = new(SilaAmsterdam.Instance);
+        _validator = new HeaderValidator(_blockTree, Always.Valid, specProvider,
+            new OneLoggerLogManager(new(_testLogger)));
+
+        ReadOnlyBlockAccessList emptyBal = new();
+        byte[] emptyEncodedBal = Rlp.Encode(emptyBal).Bytes;
+        _parentBlock = Build.A.Block
+            .WithNumber(5)
+            .WithSlotNumber(10)
+            .WithBlobGasUsed(0)
+            .WithExcessBlobGas(0)
+            .WithEmptyRequestsHash()
+            .WithBlockAccessList(emptyBal)
+            .WithEncodedBlockAccessList(emptyEncodedBal)
+            .WithBlockAccessListHash(Keccak.OfAnEmptySequenceRlp)
+            .TestObject;
+
+        // Slot number lower than the parent's: SIP-7843 imposes no ordering on the EL,
+        // so the block must still be accepted.
+        _block = Build.A.Block
+            .WithParent(_parentBlock)
+            .WithNumber(_parentBlock.Number + 1)
+            .WithSlotNumber(7)
+            .WithBlobGasUsed(0)
+            .WithExcessBlobGas(0)
+            .WithEmptyRequestsHash()
+            .WithBlockAccessList(emptyBal)
+            .WithBlockAccessListHash(Keccak.OfAnEmptySequenceRlp)
+            .WithEncodedBlockAccessList(emptyEncodedBal)
+            .TestObject;
+
+        _block.Header.Hash = _block.CalculateHash();
+
+        // Act
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header, false, out string? error);
+
+        using (Assert.EnterMultipleScope())
+        {
+            // Assert
+            Assert.That(result, Is.True);
+            Assert.That(error, Is.Null);
+        }
+    }
+
+    private static IEnumerable<TestCaseData> CorruptedFieldCases()
+    {
+        yield return new TestCaseData(new Action<Block>(b => b.Header.ExtraData = new byte[33]))
+            .SetName("When_extra_data_too_long");
+        yield return new TestCaseData(new Action<Block>(b => b.Header.Difficulty = 1))
+            .SetName("When_incorrect_difficulty_then_invalid");
+        yield return new TestCaseData(new Action<Block>(b => b.Header.Number += 1))
+            .SetName("When_incorrect_number_then_invalid");
+    }
+
+    [MaxTime(Timeout.MaxTestTime)]
+    [TestCaseSource(nameof(CorruptedFieldCases))]
+    public void Header_field_corruption_returns_false(Action<Block> corrupt)
+    {
+        corrupt(_block);
+        _block.Header.Hash = _block.CalculateHash();
+
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header);
+        Assert.That(result, Is.False);
+    }
+
+    [MaxTime(Timeout.MaxTestTime)]
+    [TestCase(10000000ul, 4ul, 20000000ul, true)]
+    [TestCase(10000000ul, 4ul, 20019530ul, true)]
+    [TestCase(10000000ul, 4ul, 20019531ul, false)]
+    [TestCase(10000000ul, 4ul, 19980470ul, true)]
+    [TestCase(10000000ul, 4ul, 19980469ul, false)]
+    [TestCase(20000000ul, 5ul, 20000000ul, true)]
+    [TestCase(20000000ul, 5ul, 20019530ul, true)]
+    [TestCase(20000000ul, 5ul, 20019531ul, false)]
+    [TestCase(20000000ul, 5ul, 19980470ul, true)]
+    [TestCase(20000000ul, 5ul, 19980469ul, false)]
+    [TestCase(40000000ul, 5ul, 40039061ul, true)]
+    [TestCase(40000000ul, 5ul, 40039062ul, false)]
+    [TestCase(40000000ul, 5ul, 39960939ul, true)]
+    [TestCase(40000000ul, 5ul, 39960938ul, false)]
+    public void When_gaslimit_is_on_london_fork(ulong parentGasLimit, ulong blockNumber, ulong gasLimit, bool expectedResult)
+    {
+        OverridableReleaseSpec spec = new(London.Instance)
+        {
+            Sip1559TransitionBlock = 5
+        };
+        TestSpecProvider specProvider = new(spec);
+        _validator = new HeaderValidator(_blockTree, _silash, specProvider, new OneLoggerLogManager(new(_testLogger)));
+        _parentBlock = Build.A.Block.WithDifficulty(1)
+                        .WithGasLimit(parentGasLimit)
+                        .WithNumber(blockNumber)
+                        .TestObject;
+        _block = Build.A.Block.WithParent(_parentBlock)
+            .WithDifficulty(131072)
+            .WithMixHash(new Hash256("0xd7db5fdd332d3a65d6ac9c4c530929369905734d3ef7a91e373e81d0f010b8e8"))
+            .WithGasLimit(gasLimit)
+            .WithNumber(_parentBlock.Number + 1)
+            .WithBaseFeePerGas(BaseFeeCalculator.Calculate(_parentBlock.Header, specProvider.GetSpec((ForkActivation)(_parentBlock.Number + 1))))
+            .WithNonce(0).TestObject;
+        _block.Header.Hash = _block.CalculateHash();
+
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header);
+        Assert.That(result, Is.EqualTo(expectedResult));
+    }
+
+    [MaxTime(Timeout.MaxTestTime)]
+    [TestCase(0x7FFFFFFFFFFFFFFFUL, true, TestName = "When_gas_limit_at_protocol_cap")]
+    [TestCase(0x8000000000000000UL, false, TestName = "When_gas_limit_just_above_protocol_cap")]
+    [TestCase(ulong.MaxValue, false, TestName = "When_gas_limit_is_ulong_max")]
+    public void When_gas_limit_around_protocol_cap(ulong gasLimit, bool expectedResult)
+    {
+        _validator = new HeaderValidator(_blockTree, _silash, _specProvider, new OneLoggerLogManager(new(_testLogger)));
+        _parentBlock = Build.A.Block.WithDifficulty(1)
+            .WithGasLimit(long.MaxValue)
+            .WithNumber(5)
+            .TestObject;
+        _block = Build.A.Block.WithParent(_parentBlock)
+            .WithDifficulty(131072)
+            .WithMixHash(new Hash256("0xd7db5fdd332d3a65d6ac9c4c530929369905734d3ef7a91e373e81d0f010b8e8"))
+            .WithGasLimit(gasLimit)
+            .WithNumber(_parentBlock.Number + 1)
+            .WithNonce(0).TestObject;
+        _block.Header.Hash = _block.CalculateHash();
+
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header, false, out string? error);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(result, Is.EqualTo(expectedResult));
+            Assert.That(error, expectedResult ? Is.Null : Is.EqualTo(BlockErrorMessages.InvalidGasLimit));
+        }
+    }
+
+
+    [Test, MaxTime(Timeout.MaxTestTime)]
+    public void When_total_difficulty_null_we_should_skip_total_difficulty_validation()
+    {
+        _block.Header.Difficulty = 1;
+        _block.Header.TotalDifficulty = null;
+        _block.Header.Hash = _block.CalculateHash();
+
+        HeaderValidator validator = new(_blockTree, Always.Valid, _specProvider, new OneLoggerLogManager(new(_testLogger)));
+        bool result = validator.Validate(_block.Header, _parentBlock.Header);
+        Assert.That(result, Is.True);
+    }
+
+    [MaxTime(Timeout.MaxTestTime)]
+    [TestCase(0, 0, true)]
+    [TestCase(0, null, false)]
+    [TestCase(0, 1, false)]
+    [TestCase(1, 0, false)]
+    [TestCase(1, null, false)]
+    [TestCase(1, 1, false)]
+    public void When_total_difficulty_zero_we_should_skip_total_difficulty_validation_depending_on_ttd_and_genesis_td(
+            long genesisTd, long? ttd, bool expectedResult)
+    {
+        _block.Header.Difficulty = 1;
+        _block.Header.TotalDifficulty = 0;
+        _block.Header.Hash = _block.CalculateHash();
+
+        {
+            _blockTree = Build.A.BlockTree()
+                .WithSpecProvider(FrontierSpecProvider.Instance)
+                .WithoutSettingHead
+                .TestObject;
+
+            Block genesis = Build.A.Block.WithDifficulty((UInt256)genesisTd).TestObject;
+            _blockTree.SuggestBlock(genesis);
+        }
+
+        _specProvider.UpdateMergeTransitionInfo(null, (UInt256?)ttd);
+
+        HeaderValidator validator = new(_blockTree, Always.Valid, _specProvider, new OneLoggerLogManager(new(_testLogger)));
+        bool result = validator.Validate(_block.Header, _parentBlock.Header);
+        Assert.That(result, Is.EqualTo(expectedResult));
+    }
+
+    [Test]
+    public void Validate_HashIsWrong_ErrorMessageIsSet()
+    {
+        HeaderValidator sut = new(_blockTree, Always.Valid, Substitute.For<ISpecProvider>(), new OneLoggerLogManager(new(_testLogger)));
+        _block.Header.Hash = Keccak.Zero;
+        sut.Validate(_block.Header, _parentBlock.Header, false, out string? error);
+
+        Assert.That(error, Does.StartWith("InvalidHeaderHash"));
+    }
+
+    [Test]
+    public void When_given_parent_is_wrong()
+    {
+        _block.Header.Hash = _block.CalculateHash();
+
+        bool result = _validator.Validate(_block.Header, Build.A.BlockHeader.WithNonce(999).TestObject, false, out string? error);
+
+        Assert.That(result, Is.False);
+        Assert.That(error, Does.StartWith("Mismatched parent"));
+    }
+
+    [Test]
+    public void Validate_does_not_mutate_parent_header_on_mismatch()
+    {
+        _block.Header.Hash = _block.CalculateHash();
+        BlockHeader parentHeader = Build.A.BlockHeader.WithNonce(999).TestObject;
+        parentHeader.SlotNumber = null;
+
+        bool result = _validator.Validate(_block.Header, parentHeader, false, out string? error);
+
+        Assert.That(result, Is.False);
+        Assert.That(parentHeader.SlotNumber, Is.Null);
+    }
+
+    [Test]
+    public void BaseFee_validation_must_not_be_bypassed_for_NoProof_seal_engine()
+    {
+        // Arrange: Create London fork with SIP-1559
+        OverridableReleaseSpec spec = new(London.Instance)
+        {
+            Sip1559TransitionBlock = 0
+        };
+        TestSpecProvider specProvider = new(spec);
+
+        // Create validator with no-op seal validator (simulates NoProof)
+        _validator = new HeaderValidator(
+            _blockTree,
+            Always.Valid,  // No seal validation (NoProof behavior)
+            specProvider,
+            new OneLoggerLogManager(new(_testLogger))
+        );
+
+        // Parent block: baseFee=10, gasUsed=0, gasLimit=300000000
+        _parentBlock = Build.A.Block
+            .WithDifficulty(0)  // Post-merge
+            .WithBaseFeePerGas(10)
+            .WithGasUsed(0)
+            .WithGasLimit(300000000)
+            .WithNumber(5)
+            .TestObject;
+
+        // Calculate expected baseFee for child block
+        // parentGasTarget = 300000000 / 2 = 150000000
+        // gasDelta = 150000000 - 0 = 150000000
+        // feeDelta = 10 * 150000000 / 150000000 / 8 = 1
+        // expectedBaseFee = 10 - 1 = 9
+        UInt256 expectedBaseFee = BaseFeeCalculator.Calculate(
+            _parentBlock.Header,
+            specProvider.GetSpec((ForkActivation)(_parentBlock.Number + 1))
+        );
+        Assert.That(expectedBaseFee, Is.EqualTo((UInt256)9), "Test setup: expected baseFee should be 9");
+
+        // Create block with INCORRECT baseFee (10 instead of 9)
+        _block = Build.A.Block
+            .WithParent(_parentBlock)
+            .WithDifficulty(0)
+            .WithBaseFeePerGas(10)  // WRONG! Should be 9
+            .WithGasUsed(0)
+            .WithGasLimit(300000000)
+            .WithNumber(_parentBlock.Number + 1)
+            .TestObject;
+
+        _block.Header.Hash = _block.CalculateHash();
+
+        // Act: Validate the block
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header);
+
+        // Assert: Block MUST be rejected due to invalid baseFee
+        // Even though seal engine is NoProof, consensus rules must be enforced
+        Assert.That(result, Is.False,
+            "Block with invalid baseFee must be rejected even with NoProof seal engine. " +
+            $"Expected baseFee=9, actual baseFee=10");
+
+        // Verify the error message mentions baseFee
+        bool baseFeeErrorLogged = _testLogger.LogList.Any(log =>
+            log.Contains("base fee", StringComparison.OrdinalIgnoreCase) ||
+            log.Contains("baseFee", StringComparison.OrdinalIgnoreCase));
+        Assert.That(baseFeeErrorLogged, Is.True,
+            "Validation should log baseFee mismatch error");
+    }
+
+    [Test]
+    public void Valid_baseFee_with_NoProof_seal_engine_should_pass()
+    {
+        // Arrange: Same setup as above
+        OverridableReleaseSpec spec = new(London.Instance)
+        {
+            Sip1559TransitionBlock = 0
+        };
+        TestSpecProvider specProvider = new(spec);
+        _validator = new HeaderValidator(_blockTree, Always.Valid, specProvider,
+            new OneLoggerLogManager(new(_testLogger)));
+
+        _parentBlock = Build.A.Block
+            .WithDifficulty(0)
+            .WithBaseFeePerGas(10)
+            .WithGasUsed(0)
+            .WithGasLimit(300000000)
+            .WithNumber(5)
+            .TestObject;
+
+        // Calculate CORRECT baseFee
+        UInt256 correctBaseFee = BaseFeeCalculator.Calculate(
+            _parentBlock.Header,
+            specProvider.GetSpec((ForkActivation)(_parentBlock.Number + 1))
+        );
+
+        // Create block with CORRECT baseFee (9)
+        _block = Build.A.Block
+            .WithParent(_parentBlock)
+            .WithDifficulty(0)
+            .WithBaseFeePerGas(correctBaseFee)  // CORRECT: 9
+            .WithGasUsed(0)
+            .WithGasLimit(300000000)
+            .WithNumber(_parentBlock.Number + 1)
+            .TestObject;
+
+        _block.Header.Hash = _block.CalculateHash();
+
+        // Act
+        bool result = _validator.Validate(_block.Header, _parentBlock.Header);
+
+        // Assert: Valid block should pass
+        Assert.That(result, Is.True,
+            "Block with correct baseFee should be accepted with NoProof seal engine");
+    }
+}

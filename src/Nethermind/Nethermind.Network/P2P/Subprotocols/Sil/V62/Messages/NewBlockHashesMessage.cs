@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core.Crypto;
+using Nethermind.Network.P2P.Messages;
+
+namespace Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages
+{
+    public class NewBlockHashesMessage(params (Hash256, ulong)[] blockHashes) : P2PMessage
+    {
+        public override int PacketType => Sil62MessageCode.NewBlockHashes;
+        public override string Protocol => "sil";
+
+        public (Hash256, ulong)[] BlockHashes { get; } = blockHashes;
+
+        public override string ToString() => $"{nameof(NewBlockHashesMessage)}({BlockHashes?.Length ?? 0})";
+    }
+}

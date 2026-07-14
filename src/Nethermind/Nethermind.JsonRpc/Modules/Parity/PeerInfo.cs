@@ -1,0 +1,74 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Network;
+using Nethermind.Network.Contract.P2P;
+using Nethermind.Network.P2P;
+using Nethermind.Network.P2P.ProtocolHandlers;
+using Nethermind.Stats.Model;
+
+namespace Nethermind.JsonRpc.Modules.Parity
+{
+    public class PeerInfo
+    {
+        public string Id { get; set; }
+
+        public string Name { get; set; }
+
+        public List<string> Caps { get; set; }
+
+        public PeerNetworkInfo Network { get; set; }
+
+        public Dictionary<string, SilProtocolInfo> Protocols { get; set; }
+
+        public PeerInfo(Peer peer)
+        {
+            ISession session = peer.InSession ?? peer.OutSession;
+            PeerNetworkInfo peerNetworkInfo = new();
+            SilProtocolInfo silProtocolInfo = new();
+            Caps = [];
+
+            if (peer.Node is not null)
+            {
+                Name = peer.Node.ClientId;
+                peerNetworkInfo.LocalAddress = peer.Node.Host;
+            }
+
+            if (session is not null)
+            {
+                Id = session.RemoteNodeId.ToString();
+                peerNetworkInfo.RemoteAddress = session.State != SessionState.New ? session.RemoteHost : "Handshake";
+
+                if (session.TryGetProtocolHandler(Protocol.Sil, out IProtocolHandler handler))
+                {
+                    silProtocolInfo.Version = handler.ProtocolVersion;
+                    if (handler is ISyncPeer syncPeer)
+                    {
+                        silProtocolInfo.Difficulty = syncPeer.TotalDifficulty;
+                        silProtocolInfo.HeadHash = syncPeer.HeadHash;
+                    }
+                }
+
+                if (session.TryGetProtocolHandler(Protocol.P2P, out IProtocolHandler p2PHandler))
+                {
+                    if (p2PHandler is IP2PProtocolHandler p2PProtocolHandler)
+                    {
+                        foreach (Capability capability in p2PProtocolHandler.AgreedCapabilities)
+                        {
+                            Caps.Add(string.Concat(capability.ProtocolCode, "/", capability.Version));
+                        }
+                    }
+                }
+            }
+
+            Network = peerNetworkInfo;
+
+            Protocols = new Dictionary<string, SilProtocolInfo>
+            {
+                { "sil", silProtocolInfo }
+            };
+        }
+    }
+}

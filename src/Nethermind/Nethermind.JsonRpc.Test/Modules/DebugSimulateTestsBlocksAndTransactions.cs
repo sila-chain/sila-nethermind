@@ -1,0 +1,122 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Autofac;
+using Nethermind.Blockchain.Find;
+using Nethermind.Core;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Blockchain.Tracing.GethStyle;
+using Nethermind.Facade;
+using Nethermind.Facade.Sil.RpcTransaction;
+using Nethermind.Facade.Proxy.Models.Simulate;
+using Nethermind.Facade.Simulate;
+using Nethermind.Int256;
+using Nethermind.JsonRpc.Modules.Sil;
+using Nethermind.JsonRpc.Test.Modules.Simulate;
+using NSubstitute;
+using NUnit.Framework;
+using Nethermind.JsonRpc.Test.Modules.Sil;
+using Nethermind.JsonRpc.Test.Modules.Sil.Simulate;
+
+namespace Nethermind.JsonRpc.Test.Modules;
+
+public class DebugSimulateTestsBlocksAndTransactions : TracedSimulateTestsBase<GethLikeTxTrace>
+{
+    protected override ISimulateBlockTracerFactory<GethLikeTxTrace> CreateTracerFactory() =>
+        new GethStyleSimulateBlockTracerFactory(GethTraceOptions.Default);
+
+    protected override void AssertSerializationBlockResult(SimulateBlockResult<GethLikeTxTrace> blockResult) =>
+        Assert.That(blockResult.Traces.Select(static c => c.Failed), Is.EqualTo(new[] { false, false }));
+
+    [TestCaseSource(typeof(SilRpcSimulateTestsBase), nameof(SilRpcSimulateTestsBase.GasCapSimulateCases))]
+    public async Task Test_debug_simulate_respects_gas_cap(ulong gasCap, ulong? requestGas, bool expectCapped)
+    {
+        TestRpcBlockchain chain = await SilRpcSimulateTestsBase.CreateChain();
+        chain.Container.Resolve<IJsonRpcConfig>().GasCap = gasCap;
+
+        ResultWrapper<IReadOnlyList<SimulateBlockResult<GethLikeTxTrace>>> result = chain.DebugRpcModule.debug_simulateV1(
+            SilRpcSimulateTestsBase.CreateGasProbePayload(requestGas),
+            BlockParameter.Latest);
+        Assert.That((bool)result.Result, Is.True, result.Result.ToString());
+
+        GethLikeTxTrace trace = result.Data.First().Traces.First();
+        Assert.That(trace.Failed, Is.False);
+
+        UInt256 gasAvailable = new(trace.ReturnValue, isBigEndian: true);
+        if (expectCapped)
+        {
+            Assert.That(gasAvailable, Is.LessThan((UInt256)gasCap));
+        }
+
+        Assert.That(gasAvailable, Is.GreaterThan(UInt256.Zero));
+    }
+
+    [Test]
+    public async Task TestTransferLogsAddress()
+    {
+        SimulatePayload<TransactionForRpc> payload = SilSimulateTestsBlocksAndTransactions.CreateTransferLogsAddressPayload();
+        TestRpcBlockchain chain = await SilRpcSimulateTestsBase.CreateChain();
+        Console.WriteLine("current test: simulateTransferOverBlockStateCalls");
+        ResultWrapper<IReadOnlyList<SimulateBlockResult<GethLikeTxTrace>>> result = chain.DebugRpcModule.debug_simulateV1(payload!, BlockParameter.Latest);
+        Assert.That(result.Data.First().Traces.First().TxHash, Is.EqualTo(new Core.Crypto.Hash256("0xe690a6e09e13d163bc8b92c725202e9633770b14c8541a0ee48794ae014351f0")));
+    }
+
+    [Test]
+    public async Task TestSerializationDebugSimulate()
+    {
+        SimulatePayload<TransactionForRpc> payload = SilSimulateTestsBlocksAndTransactions.CreateTransferLogsAddressPayload();
+        TestRpcBlockchain chain = await SilRpcSimulateTestsBase.CreateChain();
+        JsonRpcResponse response = await RpcTest.TestRequest(chain.DebugRpcModule, "debug_simulateV1", payload!, "latest");
+        IReadOnlyList<SimulateBlockResult<GethLikeTxTrace>> data = RpcTest.AssertSuccess<IReadOnlyList<SimulateBlockResult<GethLikeTxTrace>>>(response);
+        Assert.That(data.First().Traces.First().TxHash, Is.EqualTo(new Core.Crypto.Hash256("0xe690a6e09e13d163bc8b92c725202e9633770b14c8541a0ee48794ae014351f0")));
+    }
+
+    [Test]
+    public async Task TestSerializationDebugSimulate_ensure_have_traces_instead_of_calls()
+    {
+        SimulatePayload<TransactionForRpc> payload = SilSimulateTestsBlocksAndTransactions.CreateTransferLogsAddressPayload();
+        TestRpcBlockchain chain = await SilRpcSimulateTestsBase.CreateChain();
+        string serialized = await RpcTest.TestSerializedRequest(chain.DebugRpcModule, "debug_simulateV1", payload!, "latest");
+
+        Assert.That(serialized, Does.Contain("\"traces\":"));
+    }
+
+    [Test]
+    public async Task Test_simulate_error_message_includes_block_number()
+    {
+        TestRpcBlockchain chain = await SilRpcSimulateTestsBase.CreateChain();
+
+        // Create a simple payload
+        SimulatePayload<TransactionForRpc> payload = new()
+        {
+            BlockStateCalls = [new BlockStateCall<TransactionForRpc>
+            {
+                Calls = [new LegacyTransactionForRpc
+                {
+                    From = TestItem.AddressA,
+                    To = TestItem.AddressB,
+                    Value = 1000.Sila
+                }]
+            }]
+        };
+
+        // Mock the blockchain bridge to return false for HasStateForBlock
+        IBlockchainBridge mockBridge = Substitute.For<IBlockchainBridge>();
+        mockBridge.HasStateForBlock(Arg.Any<BlockHeader>()).Returns(false);
+
+        SimulateTxExecutor<GethLikeTxTrace> executor = new(mockBridge, chain.BlockFinder, new JsonRpcConfig(), chain.SpecProvider, new GethStyleSimulateBlockTracerFactory(GethTraceOptions.Default));
+
+        // Execute and verify the error message includes block number
+        ResultWrapper<IReadOnlyList<SimulateBlockResult<GethLikeTxTrace>>> result = executor.Execute(payload, BlockParameter.Latest);
+
+        Assert.That(result.Result.ResultType, Is.EqualTo(Core.ResultType.Failure));
+        Assert.That(result.Result.Error, Does.Contain("No state available for block"));
+        // Verify the error message includes both block number and hash (format: "{number} ({hash})")
+        Assert.That(result.Result.Error, Does.Match(@"No state available for block \d+ \(0x[a-fA-F0-9]{64}\)"));
+    }
+}

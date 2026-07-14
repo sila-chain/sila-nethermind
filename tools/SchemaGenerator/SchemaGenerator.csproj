@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="update.ps1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NJsonSchema" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.BalRecorder\Nethermind.BalRecorder.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Flashbots\Nethermind.Flashbots.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Hive\Nethermind.Hive.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Api\Nethermind.Api.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Init.Snapshot\Nethermind.Init.Snapshot.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.JsonRpc.TraceStore\Nethermind.JsonRpc.TraceStore.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Optimism\Nethermind.Optimism.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Shutter\Nethermind.Shutter.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Consensus.AuRa\Nethermind.Consensus.AuRa.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Consensus.Clique\Nethermind.Consensus.Clique.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.SilStats\Nethermind.SilStats.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.HealthChecks\Nethermind.HealthChecks.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.OpcodeTracing.Plugin\Nethermind.OpcodeTracing.Plugin.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Seq\Nethermind.Seq.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.StateDiffsWriter\Nethermind.StateDiffsWriter.csproj" />
+    <ProjectReference Include="..\..\src\Nethermind\Nethermind.Taiko\Nethermind.Taiko.csproj" />
+  </ItemGroup>
+
+</Project>

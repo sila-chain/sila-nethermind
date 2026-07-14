@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindSil/core-scripts/refs/heads/main/schemas/config.json",
+  "Init": {
+    "ChainSpecPath": "chainspec/hashkeychain-sila-mainnet.json.zst",
+    "GenesisHash": "0xa96aea946b763641b616ce0c69f37e61d9cd0abd709ef13a6b833e67b76de208",
+    "BaseDbPath": "nethermind_db/hashkeychain-sila-mainnet",
+    "LogFileName": "hashkeychain-sila-mainnet.log"
+  },
+  "TxPool": {
+    "BlobsSupport": "Disabled"
+  },
+  "Sync": {
+    "FastSync": true,
+    "SnapSync": true
+  },
+  "Discovery": {
+    "DiscoveryVersion": "V5"
+  },
+  "JsonRpc": {
+    "Enabled": true,
+    "Port": 8545,
+    "EnginePort": 8551
+  },
+  "Pruning": {
+    "PruningBoundary": 256
+  },
+  "Blocks": {
+    "SecondsPerSlot": 2
+  },
+  "Merge": {
+    "Enabled": true
+  },
+  "Optimism": {
+    "SequencerUrl": "https://hashkeychain-sila-mainnet.alt.technology"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindSil/core-scripts/refs/heads/main/schemas/config.json",
+  "Init": {
+    "ChainSpecPath": "chainspec/polynomial-sila-mainnet.json.zst",
+    "GenesisHash": "0x1b5e76ad2f290fb6fa2c60755d8c52942dbefedab76d01091e24080d5c129fd0",
+    "BaseDbPath": "nethermind_db/polynomial-sila-mainnet",
+    "LogFileName": "polynomial-sila-mainnet.log"
+  },
+  "TxPool": {
+    "BlobsSupport": "Disabled"
+  },
+  "Sync": {
+    "FastSync": true,
+    "SnapSync": true
+  },
+  "Discovery": {
+    "DiscoveryVersion": "V5"
+  },
+  "JsonRpc": {
+    "Enabled": true,
+    "Port": 8545,
+    "EnginePort": 8551
+  },
+  "Pruning": {
+    "PruningBoundary": 256
+  },
+  "Blocks": {
+    "SecondsPerSlot": 2
+  },
+  "Merge": {
+    "Enabled": true
+  },
+  "Optimism": {
+    "SequencerUrl": "https://rpc.polynomial.fi"
+  }
+}

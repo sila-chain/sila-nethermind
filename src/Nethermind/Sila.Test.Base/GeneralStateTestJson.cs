@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using System.Text.Json.Serialization;
+using Nethermind.Core;
+
+namespace Sila.Test.Base
+{
+    public class GeneralStateTestJson
+    {
+        [JsonPropertyName("_info")]
+        public GeneralStateTestInfoJson? Info { get; set; }
+        public GeneralStateTestEnvJson? Env { get; set; }
+        public Dictionary<string, PostStateJson[]>? Post { get; set; }
+        public Dictionary<Address, AccountState>? Pre { get; set; }
+        public string? SealEngine { get; set; }
+        public string? LoadFailure { get; set; }
+        public TransactionJson? Transaction { get; set; }
+        public ConfigJson? Config { get; set; }
+    }
+}

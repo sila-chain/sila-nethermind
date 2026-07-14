@@ -1,0 +1,647 @@
+// SPDX-FileCopyrightText: 2025 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Numerics;
+using DotNetty.Transport.Channels;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Config;
+using Nethermind.Consensus;
+using Nethermind.Core;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Core.Timers;
+using Nethermind.Logging;
+using Nethermind.Network.Config;
+using Nethermind.Network.Contract.P2P;
+using Nethermind.Network.P2P;
+using Nethermind.Network.P2P.Analyzers;
+using Nethermind.Network.P2P.EventArg;
+using Nethermind.Network.P2P.Messages;
+using Nethermind.Network.P2P.ProtocolHandlers;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V66;
+using Nethermind.Network.P2P.Subprotocols.Sil.V67;
+using Nethermind.Network.P2P.Subprotocols.Sil.V68;
+using Nethermind.Network.P2P.Subprotocols.Sil.V69;
+using Nethermind.Network.P2P.Subprotocols.Sil.V70;
+using Nethermind.Network.P2P.Subprotocols.Sil.V71;
+using Nethermind.Network.Rlpx;
+using Nethermind.Specs;
+using Nethermind.Stats;
+using Nethermind.Stats.Model;
+using Nethermind.Synchronization;
+using Nethermind.Synchronization.Peers;
+using Nethermind.TxPool;
+using NSubstitute;
+using NUnit.Framework;
+
+namespace Nethermind.Network.Test;
+
+[Parallelizable(ParallelScope.Self)]
+public class ProtocolsManagerTests
+{
+    [SetUp]
+    public void SetUp()
+    {
+    }
+
+    public static Context When => new();
+
+    [Test]
+    public void Uses_host_disconnected_event_when_unsubscribing_on_disconnect()
+    {
+        IRlpxHost rlpxHost = Substitute.For<IRlpxHost>();
+        TrackingSession session = new();
+        _ = new ProtocolsManager(
+            Substitute.For<ISyncPeerPool>(),
+            Substitute.For<ITxPool>(),
+            Substitute.For<IDiscoveryApp>(),
+            rlpxHost,
+            Substitute.For<INodeStatsManager>(),
+            Substitute.For<IProtocolValidator>(),
+            Substitute.For<IPeerManager>(),
+            Substitute.For<INetworkStorage>(),
+            [],
+            [],
+            LimboLogs.Instance);
+
+        rlpxHost.SessionCreated += Raise.EventWith(new object(), new SessionEventArgs(session));
+
+        EventHandler<EventArgs>? initializedHandler = session.AddedInitializedHandler;
+
+        rlpxHost.SessionDisconnected += Raise.Event<SessionDisconnectedEventHandler>(
+            new object(),
+            session,
+            new DisconnectEventArgs(DisconnectReason.Other, DisconnectType.Remote, "test"));
+
+        Assert.That(initializedHandler, Is.Not.Null);
+        Assert.That(session.AddedDisconnectedHandler, Is.Null);
+        Assert.That(session.RemovedInitializedHandler, Is.SameAs(initializedHandler));
+        Assert.That(session.RemovedDisconnectedHandler, Is.Null);
+    }
+
+    [Test]
+    public void Advertised_capabilities_apply_resolver_additions_and_removals()
+    {
+        ProtocolsManager manager = BuildManagerWithResolvers(
+            new FakeCapabilityResolver(caps => caps.Add(new Capability(Protocol.Sil, 69))),
+            new FakeCapabilityResolver(caps => caps.Remove(new Capability(Protocol.Sil, 68))));
+
+        // Default sil/68 removed, sil/69 added by the resolvers.
+        Assert.That(manager.GetHighestProtocolVersion(Protocol.Sil), Is.EqualTo(69));
+    }
+
+    [Test]
+    public void Advertised_capabilities_are_cached_and_rebuilt_on_resolver_change()
+    {
+        FakeCapabilityResolver resolver = new(caps => caps.Add(new Capability(Protocol.Snap, 1)));
+        ProtocolsManager manager = BuildManagerWithResolvers(resolver);
+
+        Assert.That(manager.GetHighestProtocolVersion(Protocol.Snap), Is.EqualTo(1));
+        Assert.That(manager.GetHighestProtocolVersion(Protocol.Snap), Is.EqualTo(1));
+        Assert.That(resolver.ResolveCount, Is.EqualTo(1), "advertised capabilities should be cached across calls");
+
+        resolver.RaiseChanged();
+
+        Assert.That(manager.GetHighestProtocolVersion(Protocol.Snap), Is.EqualTo(1));
+        Assert.That(resolver.ResolveCount, Is.EqualTo(2), "cache should rebuild after a resolver signals a change");
+    }
+
+    private static ProtocolsManager BuildManagerWithResolvers(params IP2PCapabilityResolver[] resolvers) =>
+        new(
+            Substitute.For<ISyncPeerPool>(),
+            Substitute.For<ITxPool>(),
+            Substitute.For<IDiscoveryApp>(),
+            Substitute.For<IRlpxHost>(),
+            Substitute.For<INodeStatsManager>(),
+            Substitute.For<IProtocolValidator>(),
+            Substitute.For<IPeerManager>(),
+            Substitute.For<INetworkStorage>(),
+            [],
+            [new DefaultP2PCapabilityResolver(), .. resolvers],
+            LimboLogs.Instance);
+
+    private sealed class FakeCapabilityResolver(Action<ISet<Capability>> resolve) : IP2PCapabilityResolver
+    {
+        public int ResolveCount { get; private set; }
+
+        public void Resolve(ISet<Capability> capabilities)
+        {
+            ResolveCount++;
+            resolve(capabilities);
+        }
+
+        public event Action? Changed;
+
+        public void RaiseChanged() => Changed?.Invoke();
+    }
+
+    public class Context
+    {
+        private readonly int _localPort = 30312;
+        private readonly int _remotePort = 30000;
+        private readonly string _remoteHost = "35.0.0.1";
+        private ISession _currentSession;
+        private readonly IDiscoveryApp _discoveryApp;
+        private readonly IRlpxHost _rlpxHost;
+        private readonly ProtocolsManager _manager;
+        private readonly INodeStatsManager _nodeStatsManager;
+        private readonly INetworkStorage _peerStorage;
+        private readonly IProtocolValidator _protocolValidator;
+        private readonly IMessageSerializationService _serializer;
+        private readonly ISyncServer _syncServer;
+        private readonly ISyncPeerPool _syncPeerPool;
+        private readonly ITxPool _txPool;
+        private readonly IChannelHandlerContext _channelHandlerContext;
+        private readonly IChannel _channel;
+        private readonly IChannelPipeline _pipeline;
+        private readonly IPacketSender _packetSender;
+        private readonly IBlockTree _blockTree;
+        private readonly IGossipPolicy _gossipPolicy;
+        private readonly IPeerManager _peerManager;
+        private readonly INetworkConfig _networkConfig;
+        private readonly ITxPoolConfig _txPoolConfig;
+        private readonly ISpecProvider _specProvider;
+        private readonly IForkInfo _forkInfo;
+
+        public Context()
+        {
+            _channel = Substitute.For<IChannel>();
+            _channelHandlerContext = Substitute.For<IChannelHandlerContext>();
+            _pipeline = Substitute.For<IChannelPipeline>();
+            _channelHandlerContext.Channel.Returns(_channel);
+            _channel.Pipeline.Returns(_pipeline);
+            _pipeline.Get<ZeroPacketSplitter>().Returns(new ZeroPacketSplitter());
+            _packetSender = Substitute.For<IPacketSender>();
+            _syncServer = Substitute.For<ISyncServer>();
+            _syncServer = Substitute.For<ISyncServer>();
+            _syncServer.Genesis.Returns(Build.A.Block.Genesis.TestObject.Header);
+            _syncServer.Head.Returns(Build.A.BlockHeader.TestObject);
+            _txPool = Substitute.For<ITxPool>();
+            _discoveryApp = Substitute.For<IDiscoveryApp>();
+
+            _serializer = new MessageSerializationService(
+                SerializerInfo.Create(new HelloMessageSerializer()),
+                SerializerInfo.Create(new StatusMessageSerializer()),
+                SerializerInfo.Create(new DisconnectMessageSerializer())
+                );
+
+            _rlpxHost = Substitute.For<IRlpxHost>();
+            _rlpxHost.LocalPort.Returns(_localPort);
+            ITimerFactory timerFactory = Substitute.For<ITimerFactory>();
+            _nodeStatsManager = new NodeStatsManager(timerFactory, LimboLogs.Instance);
+            _blockTree = Substitute.For<IBlockTree>();
+            _blockTree.NetworkId.Returns(TestBlockchainIds.NetworkId);
+            _blockTree.ChainId.Returns(TestBlockchainIds.ChainId);
+            _blockTree.Genesis.Returns(Build.A.Block.Genesis.TestObject.Header);
+            _forkInfo = new ForkInfo(MainnetSpecProvider.Instance, _syncServer);
+            _peerManager = Substitute.For<IPeerManager>();
+            _networkConfig = new NetworkConfig();
+            _protocolValidator = new ProtocolValidator(_nodeStatsManager, _blockTree, _forkInfo, _networkConfig, LimboLogs.Instance);
+            _peerStorage = Substitute.For<INetworkStorage>();
+            _syncPeerPool = Substitute.For<ISyncPeerPool>();
+            _gossipPolicy = Substitute.For<IGossipPolicy>();
+            _txPoolConfig = Substitute.For<ITxPoolConfig>();
+            _specProvider = Substitute.For<ISpecProvider>();
+            _manager = new ProtocolsManager(
+                _syncPeerPool,
+                _txPool,
+                _discoveryApp,
+                _rlpxHost,
+                _nodeStatsManager,
+                _protocolValidator,
+                _peerManager,
+                _peerStorage,
+                BuildProtocolHandlerFactories(),
+                [new DefaultP2PCapabilityResolver()],
+                LimboLogs.Instance);
+        }
+
+        private IProtocolHandlerFactory[] BuildProtocolHandlerFactories() => [
+                new ReusableProtocolHandlerFactory<P2PProtocolHandler>(
+                    session => new P2PProtocolHandler(session, new Enode(TestItem.PublicKeyA, IPAddress.Loopback, 30303), _nodeStatsManager, _serializer, RunImmediatelyScheduler.Instance, LimboLogs.Instance),
+                    Protocol.P2P),
+                new ReusableProtocolHandlerFactory<Sil66ProtocolHandler>(
+                    session => new Sil66ProtocolHandler(session, _serializer, _nodeStatsManager, _syncServer, RunImmediatelyScheduler.Instance, _txPool, _gossipPolicy, _forkInfo, LimboLogs.Instance),
+                    Protocol.Sil,
+                    66),
+                new ReusableProtocolHandlerFactory<Sil67ProtocolHandler>(
+                    session => new Sil67ProtocolHandler(session, _serializer, _nodeStatsManager, _syncServer, RunImmediatelyScheduler.Instance, _txPool, _gossipPolicy, _forkInfo, LimboLogs.Instance),
+                    Protocol.Sil,
+                    67),
+                new ReusableProtocolHandlerFactory<Sil68ProtocolHandler>(
+                    session => new Sil68ProtocolHandler(session, _serializer, _nodeStatsManager, _syncServer, RunImmediatelyScheduler.Instance, _txPool, _gossipPolicy, _forkInfo, LimboLogs.Instance, _txPoolConfig, _specProvider),
+                    Protocol.Sil,
+                    68),
+                new ReusableProtocolHandlerFactory<Sil69ProtocolHandler>(
+                    session => new Sil69ProtocolHandler(session, _serializer, _nodeStatsManager, _syncServer, RunImmediatelyScheduler.Instance, _txPool, _gossipPolicy, _forkInfo, LimboLogs.Instance, _txPoolConfig, _specProvider),
+                    Protocol.Sil,
+                    69),
+                new ReusableProtocolHandlerFactory<Sil70ProtocolHandler>(
+                    session => new Sil70ProtocolHandler(session, _serializer, _nodeStatsManager, _syncServer, RunImmediatelyScheduler.Instance, _txPool, _gossipPolicy, _forkInfo, LimboLogs.Instance, _txPoolConfig, _specProvider),
+                    Protocol.Sil,
+                    70),
+                new ReusableProtocolHandlerFactory<Sil71ProtocolHandler>(
+                    session => new Sil71ProtocolHandler(session, _serializer, _nodeStatsManager, _syncServer, RunImmediatelyScheduler.Instance, _txPool, _gossipPolicy, _forkInfo, LimboLogs.Instance, _txPoolConfig, _specProvider),
+                    Protocol.Sil,
+                    71)
+            ];
+
+        public Context CreateIncomingSession()
+        {
+            IChannel channel = Substitute.For<IChannel>();
+            _currentSession = new Session(_localPort, channel, NullDisconnectsAnalyzer.Instance, LimboLogs.Instance);
+            _pipeline.Get<ZeroNettyP2PHandler>().Returns(new ZeroNettyP2PHandler(_currentSession, LimboLogs.Instance));
+            _rlpxHost.SessionCreated += Raise.EventWith(new object(), new SessionEventArgs(_currentSession));
+            return this;
+        }
+
+        public Context CreateOutgoingSession()
+        {
+            IChannel channel = Substitute.For<IChannel>();
+            _currentSession = new Session(_localPort, new Node(TestItem.PublicKeyB, _remoteHost, _remotePort), channel, NullDisconnectsAnalyzer.Instance, LimboLogs.Instance);
+            _pipeline.Get<ZeroNettyP2PHandler>().Returns(new ZeroNettyP2PHandler(_currentSession, LimboLogs.Instance));
+            _rlpxHost.SessionCreated += Raise.EventWith(new object(), new SessionEventArgs(_currentSession));
+            return this;
+        }
+
+        public Context Handshake()
+        {
+            _currentSession.Handshake(TestItem.PublicKeyB);
+            return this;
+        }
+
+        public Context Init()
+        {
+            _currentSession.Init(5, _channelHandlerContext, _packetSender);
+            return this;
+        }
+
+        public Context ActivateChannel()
+        {
+            _currentSession.RemoteHost = _remoteHost;
+            _currentSession.RemotePort = _remotePort;
+            return this;
+        }
+
+        public Context VerifyPingSenderSet()
+        {
+            Assert.That(_currentSession.PingSender, Is.Not.Null);
+            return this;
+        }
+
+        public Context VerifyDisconnected()
+        {
+            Assert.That(_currentSession.State, Is.EqualTo(SessionState.Disconnected));
+            return this;
+        }
+
+        public Context ReceiveDisconnect()
+        {
+            using DisconnectMessage message = new(SilDisconnectReason.Other);
+            using DisposableByteBuffer disconnectPacket = _serializer.ZeroSerialize(message).AsDisposable();
+
+            // to account for AdaptivePacketType byte
+            disconnectPacket.ReadByte();
+            _currentSession.ReceiveMessage(new ZeroPacket(disconnectPacket) { PacketType = P2PMessageCode.Disconnect });
+            return this;
+        }
+
+        public Context VerifyInitialized()
+        {
+            Assert.That(_currentSession.State, Is.EqualTo(SessionState.Initialized));
+            return this;
+        }
+
+        public Context VerifyProtocolVersion(string protocol, int version)
+        {
+            Assert.That(_manager.GetHighestProtocolVersion(protocol), Is.EqualTo(version));
+            return this;
+        }
+
+        public Context VerifyCompatibilityValidationType(CompatibilityValidationType expectedType)
+        {
+            Assert.That(_nodeStatsManager.GetOrAdd(_currentSession.Node).FailedCompatibilityValidation, Is.EqualTo(expectedType));
+            return this;
+        }
+
+        public Context Disconnect()
+        {
+            _currentSession.MarkDisconnected(DisconnectReason.TooManyPeers, DisconnectType.Local, "test");
+            _rlpxHost.SessionDisconnected += Raise.Event<SessionDisconnectedEventHandler>(
+                new object(),
+                _currentSession,
+                new DisconnectEventArgs(DisconnectReason.TooManyPeers, DisconnectType.Local, "test"));
+            return this;
+        }
+
+        public Context ReceiveStatus()
+        {
+            using StatusMessage msg = new();
+            msg.TotalDifficulty = 1;
+            msg.NetworkId = TestBlockchainIds.NetworkId;
+            msg.GenesisHash = _blockTree.Genesis.Hash;
+            msg.BestHash = _blockTree.Genesis.Hash;
+            msg.ProtocolVersion = 68;
+            msg.ForkId = new ForkId(0, 0);
+
+            return ReceiveStatus(msg);
+        }
+
+        private Context ReceiveStatus(StatusMessage msg)
+        {
+            using DisposableByteBuffer statusPacket = _serializer.ZeroSerialize(msg).AsDisposable();
+            statusPacket.ReadByte();
+
+            _currentSession.ReceiveMessage(new ZeroPacket(statusPacket) { PacketType = Sil62MessageCode.Status + 16 });
+            return this;
+        }
+
+        public Context VerifyEthInitialized()
+        {
+            INodeStats stats = _nodeStatsManager.GetOrAdd(_currentSession.Node);
+            Assert.That(stats.SilNodeDetails.NetworkId, Is.EqualTo(TestBlockchainIds.NetworkId));
+            Assert.That(stats.SilNodeDetails.GenesisHash, Is.EqualTo(_blockTree.Genesis.Hash));
+            Assert.That(stats.SilNodeDetails.ProtocolVersion, Is.EqualTo(68));
+            Assert.That(stats.SilNodeDetails.TotalDifficulty, Is.EqualTo(BigInteger.One));
+            return this;
+        }
+
+        public Context VerifySyncPeersRemoved()
+        {
+            _txPool.Received().RemovePeer(Arg.Any<PublicKey>());
+            _syncPeerPool.Received().RemovePeer(Arg.Any<ISyncPeer>());
+            return this;
+        }
+
+        private Context ReceiveHello(HelloMessage msg)
+        {
+            using DisposableByteBuffer helloPacket = _serializer.ZeroSerialize(msg).AsDisposable();
+            // to account for AdaptivePacketType byte
+            helloPacket.ReadByte();
+
+            _currentSession.ReceiveMessage(new ZeroPacket(helloPacket) { PacketType = P2PMessageCode.Hello });
+            return this;
+        }
+
+
+        public Context ReceiveHello(byte p2pVersion = 5)
+        {
+            using HelloMessage msg = new();
+            msg.Capabilities = new ArrayPoolList<Capability>(1) { new("sil", 68) };
+            msg.NodeId = TestItem.PublicKeyB;
+            msg.ClientId = "other client v1";
+            msg.P2PVersion = p2pVersion;
+            msg.ListenPort = 30314;
+
+            return ReceiveHello(msg);
+        }
+
+        public Context ReceiveHelloNoEth()
+        {
+            using HelloMessage msg = new();
+            msg.Capabilities = ArrayPoolList<Capability>.Empty();
+            msg.NodeId = TestItem.PublicKeyB;
+            msg.ClientId = "other client v1";
+            msg.P2PVersion = 5;
+            msg.ListenPort = 30314;
+            return ReceiveHello(msg);
+        }
+
+        public Context ReceiveHelloEth(int protocolVersion)
+        {
+            using HelloMessage msg = new();
+            msg.Capabilities = new ArrayPoolList<Capability>(1) { new("sil", protocolVersion) };
+            msg.NodeId = TestItem.PublicKeyB;
+            msg.ClientId = "other client v1";
+            msg.P2PVersion = 5;
+            msg.ListenPort = 30314;
+            return ReceiveHello(msg);
+        }
+
+
+        public Context ReceiveHelloWrongEth() => ReceiveHelloEth(65);
+
+        public Context ReceiveStatusWrongChain(ulong networkId)
+        {
+            using StatusMessage msg = new();
+            msg.TotalDifficulty = 1;
+            msg.NetworkId = networkId;
+            msg.GenesisHash = TestItem.KeccakA;
+            msg.BestHash = TestItem.KeccakA;
+            msg.ProtocolVersion = 68;
+
+            return ReceiveStatus(msg);
+        }
+
+        public Context ReceiveStatusWrongGenesis()
+        {
+            using StatusMessage msg = new();
+            msg.TotalDifficulty = 1;
+            msg.NetworkId = TestBlockchainIds.NetworkId;
+            msg.GenesisHash = TestItem.KeccakB;
+            msg.BestHash = TestItem.KeccakB;
+            msg.ProtocolVersion = 68;
+
+            return ReceiveStatus(msg);
+        }
+    }
+
+    [Test]
+    public void Sets_ping_sender_after_receiving_hello() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .ReceiveHello()
+            .VerifyPingSenderSet();
+
+    [Test]
+    public void Disconnects_on_p2p_before_version_4() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .ReceiveHello(3)
+            .VerifyDisconnected();
+
+    [Test]
+    public void Disconnects_on_receiving_disconnect() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .ReceiveHello()
+            .ReceiveDisconnect()
+            .VerifyDisconnected();
+
+    [Test]
+    public void Runs_ok_when_initializing_protocol_on_a_closing_session() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .Disconnect()
+            .ReceiveHello();
+
+    [Test]
+    public void Can_initialize_a_session() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyInitialized();
+
+    [Test]
+    public void Can_initialize_eth_protocol() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyInitialized()
+            .ReceiveHello()
+            .ReceiveStatus()
+            .VerifyEthInitialized();
+
+    [Test]
+    public void Removes_sync_peers_on_disconnect() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyInitialized()
+            .ReceiveHello()
+            .ReceiveStatus()
+            .VerifyEthInitialized()
+            .Disconnect()
+            .VerifySyncPeersRemoved();
+
+    [Test]
+    public void Disconnects_on_missing_eth() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyInitialized()
+            .ReceiveHelloNoEth()
+            .VerifyDisconnected();
+
+    [Test]
+    public void Disconnects_on_wrong_eth() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyInitialized()
+            .ReceiveHelloWrongEth()
+            .VerifyDisconnected();
+
+    [TestCase(TestBlockchainIds.NetworkId + 1)]
+    [TestCase(TestBlockchainIds.ChainId)]
+    public void Disconnects_on_wrong_network_id(ulong networkId) => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyInitialized()
+            .ReceiveHello()
+            .ReceiveStatusWrongChain(networkId)
+            .VerifyCompatibilityValidationType(CompatibilityValidationType.NetworkId)
+            .VerifyDisconnected();
+
+    [Test]
+    public void Disconnects_on_wrong_genesis_hash() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyInitialized()
+            .ReceiveHello()
+            .ReceiveStatusWrongGenesis()
+            .VerifyDisconnected();
+
+    [Test]
+    public void Initialized_with_eth68_only() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyInitialized()
+            .ReceiveHelloEth(68)
+            .VerifyInitialized();
+
+    [Test]
+    public void Has_correct_highest_eth_protocol_version() => When
+            .CreateIncomingSession()
+            .ActivateChannel()
+            .Handshake()
+            .Init()
+            .VerifyProtocolVersion(Protocol.Sil, 68);
+
+    private sealed class TrackingSession : ISession
+    {
+        public EventHandler<EventArgs>? AddedInitializedHandler { get; private set; }
+        public EventHandler<EventArgs>? RemovedInitializedHandler { get; private set; }
+        public EventHandler<DisconnectEventArgs>? AddedDisconnectedHandler { get; private set; }
+        public EventHandler<DisconnectEventArgs>? RemovedDisconnectedHandler { get; private set; }
+
+        public byte P2PVersion => 5;
+        public SessionState State => SessionState.Disconnected;
+        public SessionState BestStateReached => SessionState.Disconnected;
+        public bool IsClosing => true;
+        public PublicKey RemoteNodeId => null!;
+        public PublicKey ObsoleteRemoteNodeId => null!;
+        public string RemoteHost { get; set; } = string.Empty;
+        public int RemotePort { get; set; }
+        public int LocalPort => 0;
+        public bool IsNetworkIdMatched { get; set; }
+        public ConnectionDirection Direction => ConnectionDirection.In;
+        public Guid SessionId { get; } = Guid.NewGuid();
+        public Node Node => null!;
+        public DateTime LastPingUtc { get; set; }
+        public DateTime LastPongUtc { get; set; }
+        public IPingSender PingSender { get; set; } = null!;
+
+        public event EventHandler<DisconnectEventArgs> Disconnecting { add { } remove { } }
+        public event EventHandler<DisconnectEventArgs> Disconnected
+        {
+            add => AddedDisconnectedHandler = value;
+            remove => RemovedDisconnectedHandler = value;
+        }
+        public event EventHandler<EventArgs> Initialized
+        {
+            add => AddedInitializedHandler = value;
+            remove => RemovedInitializedHandler = value;
+        }
+        public event EventHandler<EventArgs> HandshakeComplete { add { } remove { } }
+        public event EventHandler<PeerEventArgs> MsgReceived { add { } remove { } }
+        public event EventHandler<PeerEventArgs> MsgDelivered { add { } remove { } }
+
+        public void RaiseDisconnected() => AddedDisconnectedHandler?.Invoke(
+            this,
+            new DisconnectEventArgs(DisconnectReason.Other, DisconnectType.Local, "test"));
+
+        public void Dispose() { }
+        public void ReceiveMessage(ZeroPacket zeroPacket) => throw new NotSupportedException();
+        public int DeliverMessage<T>(T message) where T : P2PMessage => throw new NotSupportedException();
+        public void EnableSnappy() => throw new NotSupportedException();
+        public void AddSupportedCapability(Capability capability) => throw new NotSupportedException();
+        public bool HasAvailableCapability(Capability capability) => throw new NotSupportedException();
+        public bool HasAgreedCapability(Capability capability) => throw new NotSupportedException();
+        public void AddProtocolHandler(IProtocolHandler handler) => throw new NotSupportedException();
+        public bool TryGetProtocolHandler(string protocolCode, out IProtocolHandler handler) => throw new NotSupportedException();
+        public void Init(byte p2PVersion, IChannelHandlerContext context, IPacketSender packetSender) => throw new NotSupportedException();
+        public void InitiateDisconnect(DisconnectReason disconnectReason, string details) => throw new NotSupportedException();
+        public void MarkDisconnected(DisconnectReason disconnectReason, DisconnectType disconnectType, string details) => throw new NotSupportedException();
+        public void Handshake(PublicKey handshakeRemoteNodeId) => throw new NotSupportedException();
+        public void StartTrackingSession() => throw new NotSupportedException();
+    }
+}

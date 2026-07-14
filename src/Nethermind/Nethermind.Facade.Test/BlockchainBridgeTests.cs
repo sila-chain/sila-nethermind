@@ -1,0 +1,959 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Autofac;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Receipts;
+using Nethermind.Core.Messages;
+using Nethermind.Blockchain.Tracing;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Savm.Tracing;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Int256;
+using Nethermind.Specs;
+using NSubstitute;
+using NUnit.Framework;
+using Nethermind.Consensus;
+using Nethermind.Consensus.Tracing;
+using Nethermind.Core.Test.Modules;
+using Nethermind.Savm;
+using Nethermind.Facade.Sil;
+using Nethermind.Facade.Find;
+using Nethermind.Facade.Proxy.Models.Simulate;
+using Nethermind.Facade.Simulate;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Precompiles;
+using Nethermind.State;
+
+namespace Nethermind.Facade.Test;
+
+public class BlockchainBridgeTests
+{
+    private IBlockchainBridge _blockchainBridge;
+    private IBlockTree _blockTree;
+    private IReceiptStorage _receiptStorage;
+    private ITransactionProcessor _transactionProcessor;
+    private ManualTimestamper _timestamper;
+    private ISpecProvider _specProvider;
+    private IStateReader _stateReader;
+    private IContainer _container;
+
+    [SetUp]
+    public Task SetUp()
+    {
+        _timestamper = new ManualTimestamper();
+        _blockTree = Substitute.For<IBlockTree>();
+        _receiptStorage = Substitute.For<IReceiptStorage>();
+        _transactionProcessor = Substitute.For<ITransactionProcessor>();
+        _stateReader = Substitute.For<IStateReader>();
+
+        _stateReader.HasStateForBlock(Arg.Any<BlockHeader?>()).Returns(true);
+
+        _container = new ContainerBuilder()
+            .AddModule(new TestNethermindModule())
+            .AddSingleton(_blockTree)
+            .AddSingleton<IReceiptFinder>(_receiptStorage)
+            .AddSingleton(_timestamper)
+            .AddSingleton(Substitute.For<ILogFinder>())
+            .AddSingleton<IMiningConfig>(new MiningConfig { Enabled = false })
+            .AddScoped(_transactionProcessor)
+            .AddSingleton(_stateReader)
+            .Build();
+
+        _specProvider = _container.Resolve<ISpecProvider>();
+        _blockchainBridge = _container.Resolve<IBlockchainBridge>();
+        return Task.CompletedTask;
+    }
+
+    [TearDown]
+    public void TearDown() => _container.Dispose();
+
+    [Test]
+    public void get_transaction_returns_null_when_transaction_not_found()
+    {
+        Assert.That(_blockchainBridge.TryGetTransaction(TestItem.KeccakA, out TransactionLookupResult? result), Is.False);
+        Assert.That(result, Is.Null);
+    }
+
+    [Test]
+    public void get_transaction_returns_null_when_block_not_found()
+    {
+        _receiptStorage.FindBlockHash(TestItem.KeccakA).Returns(TestItem.KeccakB);
+        Assert.That(_blockchainBridge.TryGetTransaction(TestItem.KeccakA, out TransactionLookupResult? result), Is.False);
+        Assert.That(result, Is.Null);
+    }
+
+    // regression test - was throwing NRE before
+    // when receipt at txIndex had different TxHash
+    [Test]
+    public void get_transaction_returns_false_when_receipt_hash_mismatch()
+    {
+        Hash256 txHash = TestItem.KeccakA;
+        Transaction tx = Build.A.Transaction.WithHash(txHash).TestObject;
+        Block block = Build.A.Block.WithTransactions(tx).TestObject;
+        TxReceipt receipt = Build.A.Receipt.WithTransactionHash(TestItem.KeccakC).TestObject;
+
+        _receiptStorage.FindBlockHash(txHash).Returns(TestItem.KeccakB);
+        _blockTree.FindBlock(TestItem.KeccakB, Arg.Any<BlockTreeLookupOptions>()).Returns(block);
+        _receiptStorage.Get(block).Returns([receipt]);
+
+        // checkTxnPool: false avoids falling through to the mempool path
+        bool found = _blockchainBridge.TryGetTransaction(txHash, out TransactionLookupResult? result, checkTxnPool: false);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(found, Is.False);
+            Assert.That(result, Is.Null);
+        }
+    }
+
+    [Test]
+    public void get_transaction_returns_receipt_and_transaction_when_found()
+    {
+        int index = 5;
+        Transaction[] transactions = Enumerable.Range(0, 10)
+            .Select(static i => Build.A.Transaction.WithNonce(i).WithHash(TestItem.Keccaks[i]).TestObject)
+            .ToArray();
+        Block block = Build.A.Block
+            .WithTransactions(transactions.ToArray())
+            .TestObject;
+        TxReceipt[] receipts = block.Transactions.Select((t, i) => Build.A.Receipt
+            .WithBlockHash(TestItem.KeccakB)
+            .WithIndex(i)
+            .WithTransactionHash(t.Hash)
+            .TestObject
+        ).ToArray();
+        ;
+        _blockTree.FindBlock(TestItem.KeccakB, Arg.Any<BlockTreeLookupOptions>()).Returns(block);
+        foreach (TxReceipt receipt in receipts)
+        {
+            _receiptStorage.FindBlockHash(receipt.TxHash!).Returns(TestItem.KeccakB);
+        }
+        _receiptStorage.Get(block).Returns(receipts);
+        Assert.That(_blockchainBridge.TryGetTransaction(transactions[index].Hash!, out TransactionLookupResult? result), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(result!.Value.Transaction.Nonce, Is.EqualTo((ulong)index));
+            Assert.That(result.Value.Transaction.Hash, Is.EqualTo(TestItem.Keccaks[index]));
+        });
+        Assert.That(result.Value.ExtraData, Is.EqualTo(new TransactionForRpcContext(
+            chainId: _specProvider.ChainId,
+            blockHash: block.Hash,
+            blockNumber: block.Number,
+            txIndex: receipts[index].Index,
+            blockTimestamp: block.Timestamp,
+            baseFee: UInt256.Zero,
+            receipt: receipts[index])));
+    }
+
+    [Test]
+    public void Call_uses_valid_post_merge_and_random_value()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .WithDifficulty(0)
+            .WithMixHash(TestItem.KeccakA)
+            .TestObject;
+
+        Transaction tx = Build.A.Transaction.TestObject;
+
+        _blockchainBridge.Call(header, tx);
+        _transactionProcessor.Received().SetBlockExecutionContext(Arg.Is<BlockExecutionContext>(static blkCtx =>
+            blkCtx.Header.IsPostMerge && blkCtx.Header.Random == TestItem.KeccakA));
+        _transactionProcessor.Received().CallAndRestore(
+            tx,
+            Arg.Any<ITxTracer>());
+    }
+
+    [Test]
+    public void Call_uses_valid_block_number()
+    {
+        _timestamper.UtcNow = DateTime.MinValue;
+        _timestamper.Add(TimeSpan.FromDays(123));
+        BlockHeader header = Build.A.BlockHeader.WithNumber(10).TestObject;
+        Transaction tx = new() { GasLimit = Transaction.BaseTxGasCost };
+
+        _blockchainBridge.Call(header, tx);
+        _transactionProcessor.Received().SetBlockExecutionContext(
+            Arg.Is<BlockExecutionContext>(static blkCtx => blkCtx.Header.Number == 10));
+        _transactionProcessor.Received().CallAndRestore(
+            tx,
+            Arg.Any<ITxTracer>());
+    }
+
+    [Test]
+    public void Call_uses_valid_mix_hash()
+    {
+        _timestamper.UtcNow = DateTime.MinValue;
+        _timestamper.Add(TimeSpan.FromDays(123));
+        BlockHeader header = Build.A.BlockHeader.WithMixHash(TestItem.KeccakA).TestObject;
+        Transaction tx = new() { GasLimit = Transaction.BaseTxGasCost };
+
+        _blockchainBridge.Call(header, tx);
+        _transactionProcessor.Received().SetBlockExecutionContext(
+            Arg.Is<BlockExecutionContext>(static blkCtx => blkCtx.Header.MixHash == TestItem.KeccakA));
+        _transactionProcessor.Received().CallAndRestore(
+            tx,
+            Arg.Any<ITxTracer>());
+    }
+
+    [Test]
+    public void Call_uses_valid_beneficiary()
+    {
+        _timestamper.UtcNow = DateTime.MinValue;
+        _timestamper.Add(TimeSpan.FromDays(123));
+        BlockHeader header = Build.A.BlockHeader.WithBeneficiary(TestItem.AddressB).TestObject;
+        Transaction tx = new() { GasLimit = Transaction.BaseTxGasCost };
+
+        _blockchainBridge.Call(header, tx);
+        _transactionProcessor.Received().SetBlockExecutionContext(
+            Arg.Is<BlockExecutionContext>(static blkCtx => blkCtx.Header.Beneficiary == TestItem.AddressB));
+        _transactionProcessor.Received().CallAndRestore(
+            tx,
+            Arg.Any<ITxTracer>());
+    }
+
+    [TestCase(7UL)]
+    [TestCase(0UL)]
+    public void Bridge_head_is_correct(ulong headNumber)
+    {
+        Block head = Build.A.Block.WithNumber(headNumber).TestObject;
+        Block bestSuggested = Build.A.Block.WithNumber(8UL).TestObject;
+
+        _blockTree.Head.Returns(head);
+        _blockTree.BestSuggestedBody.Returns(bestSuggested);
+
+        Assert.That(_blockchainBridge.HeadBlock, Is.EqualTo(head));
+    }
+
+    [TestCase(true, true)]
+    [TestCase(false, true)]
+    [TestCase(true, false)]
+    [TestCase(false, false)]
+    public void GetReceiptAndGasInfo_returns_correct_results(bool isCanonical, bool postSip4844)
+    {
+        Hash256 txHash = TestItem.KeccakA;
+        Hash256 blockHash = TestItem.KeccakB;
+        UInt256 effectiveGasPrice = 123;
+
+        Transaction tx = postSip4844
+            ? Build.A.Transaction
+                .WithGasPrice(effectiveGasPrice)
+                .WithMaxFeePerGas(effectiveGasPrice)
+                .WithType(TxType.Blob)
+                .WithMaxFeePerBlobGas(2)
+                .WithBlobVersionedHashes(2)
+                .WithHash(txHash)
+                .TestObject
+            : Build.A.Transaction
+                .WithGasPrice(effectiveGasPrice)
+                .WithMaxFeePerGas(effectiveGasPrice)
+                .WithHash(txHash)
+                .TestObject;
+        Block block = postSip4844
+            ? Build.A.Block
+                .WithNumber(MainnetSpecProvider.ParisBlockNumber)
+                .WithTimestamp(MainnetSpecProvider.CancunBlockTimestamp)
+                .WithTransactions(tx)
+                .WithExcessBlobGas(2)
+                .TestObject
+            : Build.A.Block
+                .WithNumber(MainnetSpecProvider.ParisBlockNumber)
+                .WithTimestamp(MainnetSpecProvider.CancunBlockTimestamp)
+                .WithTransactions(tx)
+                .TestObject;
+        TxReceipt receipt = Build.A.Receipt
+            .WithBlockHash(blockHash)
+            .WithTransactionHash(txHash)
+            .TestObject;
+
+        _blockTree.FindBlock(blockHash, Arg.Is(BlockTreeLookupOptions.RequireCanonical)).Returns(isCanonical ? block : null);
+        _blockTree.FindBlock(blockHash, Arg.Is(BlockTreeLookupOptions.TotalDifficultyNotNeeded)).Returns(block);
+        _receiptStorage.FindBlockHash(txHash).Returns(blockHash);
+        _receiptStorage.Get(block).Returns([receipt]);
+
+        (TxReceipt? Receipt, ulong BlockTimestamp, TxGasInfo? GasInfo, int LogIndexStart) result = postSip4844
+            ? (receipt, MainnetSpecProvider.CancunBlockTimestamp, new(effectiveGasPrice, 1, 262144), 0)
+            : (receipt, MainnetSpecProvider.CancunBlockTimestamp, new(effectiveGasPrice), 0);
+
+        if (!isCanonical)
+        {
+            result = (null, 0, null, 0);
+        }
+
+        Assert.That(_blockchainBridge.GetTxReceiptInfo(txHash), Is.EqualTo(result));
+    }
+
+    [Test]
+    public void Call_sets_maxFeePerBlobGas()
+    {
+        _timestamper.UtcNow = DateTime.MaxValue;
+        BlockHeader header = Build.A.BlockHeader
+            .WithBeneficiary(TestItem.AddressB)
+            .WithExcessBlobGas(0)
+            .WithBlobGasUsed(0)
+            .WithNumber(long.MaxValue)
+            .WithTimestamp(ulong.MaxValue)
+            .TestObject;
+        Transaction tx = new() { Type = TxType.Blob, MaxFeePerBlobGas = null, BlobVersionedHashes = [] };
+
+        _blockchainBridge.Call(header, tx);
+        _transactionProcessor.Received().SetBlockExecutionContext(
+            Arg.Is<BlockExecutionContext>(static blkCtx => blkCtx.Header.Beneficiary == TestItem.AddressB));
+        _transactionProcessor.Received().CallAndRestore(
+            Arg.Is<Transaction>(static tx => tx.MaxFeePerBlobGas == 1),
+            Arg.Any<ITxTracer>());
+    }
+
+    private static Action<IBlockchainBridge, BlockHeader, Transaction>[] BridgeCallSources() =>
+    [
+        (bridge, header, tx) => bridge.Call(header, tx),
+        (bridge, header, tx) => bridge.EstimateGas(header, tx, 1),
+        (bridge, header, tx) => bridge.CreateAccessList(header, tx, null, false),
+    ];
+
+    [Test, Combinatorial]
+    public void BlobBaseFee_is_set_for_non_blob_transaction([ValueSource(nameof(BridgeCallSources))] Action<IBlockchainBridge, BlockHeader, Transaction> bridgeCall, [Values(0ul, 100ul)] ulong excessBlobGas)
+    {
+        _timestamper.UtcNow = DateTime.MaxValue;
+        BlockHeader header = Build.A.BlockHeader
+            .WithBeneficiary(TestItem.AddressB)
+            .WithExcessBlobGas(excessBlobGas)
+            .WithBlobGasUsed(0)
+            .WithNumber(long.MaxValue)
+            .WithTimestamp(ulong.MaxValue)
+            .TestObject;
+        Transaction tx = new() { GasLimit = Transaction.BaseTxGasCost };
+
+        IReleaseSpec spec = _specProvider.GetSpec(header);
+        BlobGasCalculator.TryCalculateFeePerBlobGas(excessBlobGas, spec.BlobBaseFeeUpdateFraction, out UInt256 expectedBlobBaseFee);
+        ValueHash256 expectedBlobBaseFeeHash = expectedBlobBaseFee.ToValueHash();
+
+        bridgeCall(_blockchainBridge, header, tx);
+
+        _transactionProcessor.Received().SetBlockExecutionContext(
+            Arg.Is<BlockExecutionContext>(blkCtx => blkCtx.BlobBaseFee == expectedBlobBaseFeeHash));
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void CreateAccessList_filters_precompile_addresses_with_empty_storage_keys(bool optimize)
+    {
+        CallOutput callOutput = InvokeCreateAccessListWithMockedAccess(
+            optimize,
+            [PrecompiledAddresses.ECRecover, TestItem.AddressC],
+            [new StorageCell(TestItem.AddressC, UInt256.One)]);
+
+        Assert.That(callOutput.AccessList, Is.Not.Null);
+        Assert.That(callOutput.AccessList!.Any(e => e.Address == PrecompiledAddresses.ECRecover), Is.False);
+        Assert.That(callOutput.AccessList.Any(e => e.Address == TestItem.AddressC), Is.True);
+    }
+
+    [Test]
+    public void CreateAccessList_keeps_precompile_address_when_storage_key_is_present()
+    {
+        CallOutput callOutput = InvokeCreateAccessListWithMockedAccess(
+            optimize: false,
+            [PrecompiledAddresses.ECRecover],
+            [new StorageCell(PrecompiledAddresses.ECRecover, UInt256.One)]);
+
+        Assert.That(callOutput.AccessList, Is.Not.Null);
+        Assert.That(callOutput.AccessList!.Any(e => e.Address == PrecompiledAddresses.ECRecover), Is.True);
+    }
+
+    [TestCase(null, null)]
+    [TestCase(null, "revert")]
+    [TestCase(null, "some plain error string")]
+    public void CreateAccessList_reverting_tx_returns_execution_reverted_error(byte[]? returnValue, string? tracerError)
+    {
+        BlockHeader header = Build.A.BlockHeader.TestObject;
+        Transaction tx = Build.A.Transaction
+            .WithSenderAddress(TestItem.AddressA)
+            .WithTo(TestItem.AddressB)
+            .TestObject;
+
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(callInfo =>
+            {
+                ITxTracer tracer = callInfo.ArgAt<ITxTracer>(1);
+                tracer.ReportAction(tx.GasLimit, UInt256.Zero, TestItem.AddressA, TestItem.AddressB, ReadOnlyMemory<byte>.Empty, ExecutionType.TRANSACTION);
+                tracer.ReportActionError(SavmExceptionType.Revert);
+                tracer.MarkAsFailed(TestItem.AddressB, new GasConsumed(21000, 0), returnValue ?? [], tracerError);
+                return TransactionResult.SavmException(SavmExceptionType.Revert);
+            });
+
+        CallOutput callOutput = _blockchainBridge.CreateAccessList(header, tx, null, false, null, default);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(callOutput.Error, Is.EqualTo("execution reverted"));
+            Assert.That(callOutput.ExecutionReverted, Is.True);
+        }
+    }
+
+    private CallOutput InvokeCreateAccessListWithMockedAccess(
+        bool optimize,
+        Address[] accessedAddresses,
+        StorageCell[] accessedCells)
+    {
+        BlockHeader header = Build.A.BlockHeader.TestObject;
+        Transaction tx = Build.A.Transaction
+            .WithSenderAddress(TestItem.AddressA)
+            .WithTo(TestItem.AddressB)
+            .TestObject;
+
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(callInfo =>
+            {
+                ITxTracer tracer = callInfo.ArgAt<ITxTracer>(1);
+                tracer.ReportAccess(accessedAddresses, accessedCells);
+                tracer.MarkAsSuccess(TestItem.AddressB, new GasConsumed(21000, 0), Array.Empty<byte>(), Array.Empty<LogEntry>());
+                return TransactionResult.Ok;
+            });
+
+        return _blockchainBridge.CreateAccessList(header, tx, null, optimize, null, default);
+    }
+
+    [Test]
+    public void Call_tx_returns_InsufficientSenderBalanceError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 100 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.InsufficientSenderBalance);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo(GasEstimator.InsufficientBalance));
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_InsufficientSenderBalanceError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 100 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.InsufficientSenderBalance);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo(GasEstimator.InsufficientBalance));
+    }
+
+    [Test]
+    public void Call_tx_returns_SenderNotSpecifiedError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 123 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.SenderNotSpecified);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("sender not specified"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_SenderNotSpecifiedError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 123 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.SenderNotSpecified);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("sender not specified"));
+    }
+
+    [Test]
+    public void Call_tx_returns_MalformedTransactionError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.MalformedTransaction);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("malformed"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_MalformedTransactionError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.MalformedTransaction);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("malformed"));
+    }
+
+    [Test]
+    public void Call_tx_returns_TransactionNonceIsToHighError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 456 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.TransactionNonceTooHigh);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("nonce too high"));
+    }
+
+    [Test]
+    public void Call_tx_returns_TransactionNonceIsToLowError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 456 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.TransactionNonceTooLow);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("nonce too low"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_TransactionNonceIsToHighError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 456 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.TransactionNonceTooHigh);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("nonce too high"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_TransactionNonceIsTooLowError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 456 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.TransactionNonceTooLow);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("nonce too low"));
+    }
+
+    [Test]
+    public void Call_tx_returns_NonceOverflowError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 0 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.NonceOverflow);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("nonce overflow"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_NonceOverflowError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 0 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.NonceOverflow);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("nonce overflow"));
+    }
+
+    private static IEnumerable<TestCaseData> MinerPremiumNegativeCases()
+    {
+        yield return new TestCaseData(
+            new Transaction { GasLimit = 1 },
+            TransactionResult.MinerPremiumNegative,
+            "miner premium is negative"
+        ).SetName("Fallback");
+
+        Address sender = TestItem.AddressA;
+        UInt256 baseFee = 146_283_608_928UL;
+        ulong maxFeePerGas = 140_000_000_000UL;
+        Transaction descriptiveTx = new()
+        {
+            GasLimit = 56786,
+            SenderAddress = sender,
+            DecodedMaxFeePerGas = maxFeePerGas,
+            Type = TxType.SIP1559
+        };
+        yield return new TestCaseData(
+            descriptiveTx,
+            TransactionResult.ErrorType.MaxFeePerGasBelowBaseFee.WithDetail($"max fee per gas less than block base fee: address {sender}, maxFeePerGas: {maxFeePerGas}, baseFee: {baseFee}"),
+            $"max fee per gas less than block base fee: address {sender}, maxFeePerGas: {maxFeePerGas}, baseFee: {baseFee}"
+        ).SetName("Descriptive");
+    }
+
+    [TestCaseSource(nameof(MinerPremiumNegativeCases))]
+    public void Call_tx_returns_MinerPremiumIsNegativeError(Transaction tx, TransactionResult result, string expectedError)
+    {
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(result);
+
+        CallOutput callOutput = _blockchainBridge.Call(Build.A.BlockHeader.TestObject, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo(expectedError));
+    }
+
+    [TestCaseSource(nameof(MinerPremiumNegativeCases))]
+    public void EstimateGas_tx_returns_MinerPremiumIsNegativeError(Transaction tx, TransactionResult result, string expectedError)
+    {
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(result);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(Build.A.BlockHeader.TestObject, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo(expectedError));
+    }
+
+    [Test]
+    public void Call_tx_returns_BlockGasLimitExceededError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 1 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.BlockGasLimitExceeded);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("Block gas limit exceeded"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_block_gas_limit_exceeded_returns_allowance_error()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 1 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.BlockGasLimitExceeded);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("gas required exceeds allowance (4000000)"));
+    }
+
+
+    [Test]
+    public void Call_tx_returns_SenderHasDeployedCodeError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 1 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.SenderHasDeployedCode);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("sender has deployed code"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_SenderHasDeployedCodeError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 1 };
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.SenderHasDeployedCode);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("sender has deployed code"));
+    }
+
+    [Test]
+    public void Call_tx_returns_TransactionSizeOverMaxInitCodeSizeError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.TransactionSizeOverMaxInitCodeSize);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("SIP-3860 - transaction size over max init code size"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_TransactionSizeOverMaxInitCodeSizeError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.TransactionSizeOverMaxInitCodeSize);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("SIP-3860 - transaction size over max init code size"));
+    }
+
+    [Test]
+    public void Call_tx_returns_GasLimitBelowIntrinsicGasError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.GasLimitBelowIntrinsicGas);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo("intrinsic gas too low"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_gas_limit_below_intrinsic_gas_returns_allowance_error()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.GasLimitBelowIntrinsicGas);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("gas required exceeds allowance (4000000)"));
+    }
+
+    [Test]
+    public void EstimateGas_tx_gas_limit_below_intrinsic_but_estimation_reverts_returns_revert()
+    {
+        BlockHeader header = Build.A.BlockHeader.TestObject;
+        Transaction tx = new() { GasLimit = 1, SenderAddress = TestItem.AddressA };
+
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(callInfo =>
+            {
+                Transaction currentTx = callInfo.ArgAt<Transaction>(0);
+                ITxTracer tracer = callInfo.ArgAt<ITxTracer>(1);
+
+                if (currentTx.GasLimit < Transaction.BaseTxGasCost)
+                {
+                    return TransactionResult.GasLimitBelowIntrinsicGas;
+                }
+
+                tracer.ReportAction(currentTx.GasLimit, UInt256.Zero, TestItem.AddressA, TestItem.AddressB, ReadOnlyMemory<byte>.Empty, ExecutionType.TRANSACTION);
+                tracer.ReportActionError(SavmExceptionType.Revert);
+                tracer.MarkAsFailed(TestItem.AddressB, new GasConsumed(21000, 0), Array.Empty<byte>(), null);
+                return TransactionResult.Ok;
+            });
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(callOutput.Error, Is.EqualTo("execution reverted"));
+            Assert.That(callOutput.ExecutionReverted, Is.True);
+            Assert.That(callOutput.InputError, Is.False);
+            Assert.That(callOutput.OutputData, Is.EqualTo(Array.Empty<byte>()));
+        }
+    }
+
+    [Test]
+    public void EstimateGas_tx_gas_limit_below_intrinsic_but_estimation_succeeds_returns_estimate()
+    {
+        BlockHeader header = Build.A.BlockHeader.TestObject;
+        Transaction tx = new() { GasLimit = 1, SenderAddress = TestItem.AddressA, To = TestItem.AddressB };
+
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(callInfo =>
+            {
+                Transaction currentTx = callInfo.ArgAt<Transaction>(0);
+                ITxTracer tracer = callInfo.ArgAt<ITxTracer>(1);
+
+                if (currentTx.GasLimit < Transaction.BaseTxGasCost)
+                {
+                    return TransactionResult.GasLimitBelowIntrinsicGas;
+                }
+
+                tracer.ReportAction(currentTx.GasLimit, UInt256.Zero, TestItem.AddressA, TestItem.AddressB, ReadOnlyMemory<byte>.Empty, ExecutionType.TRANSACTION);
+                tracer.ReportActionEnd(currentTx.GasLimit - Transaction.BaseTxGasCost, ReadOnlyMemory<byte>.Empty);
+                tracer.MarkAsSuccess(TestItem.AddressB, new GasConsumed(Transaction.BaseTxGasCost, 0), Array.Empty<byte>(), Array.Empty<LogEntry>());
+                return TransactionResult.Ok;
+            });
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(callOutput.Error, Is.Null);
+            Assert.That(callOutput.ExecutionReverted, Is.False);
+            Assert.That(callOutput.InputError, Is.False);
+            Assert.That(callOutput.GasSpent, Is.EqualTo(Transaction.BaseTxGasCost));
+            Assert.That(callOutput.OutputData, Is.EqualTo(Array.Empty<byte>()));
+        }
+    }
+
+    [Test]
+    public void EstimateGas_tx_returns_GasLimitOverCap()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new() { GasLimit = 30_000_000, Data = new byte[1_680_000] };
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.EqualTo("Cannot estimate gas, gas spent exceeded transaction and block gas limit or transaction gas limit cap"));
+    }
+
+    [Test]
+    public void Call_tx_returns_InsufficientMaxFeePerGasForSenderBalanceError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.InsufficientMaxFeePerGasForSenderBalance);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.EqualTo(TxErrorMessages.InsufficientFundsForGas));
+    }
+
+    [Test]
+    public void Call_tx_returns_noError()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.Ok);
+
+        CallOutput callOutput = _blockchainBridge.Call(header, tx);
+
+        Assert.That(callOutput.Error, Is.Null);
+    }
+
+    [Test]
+    public void EstimateGas_invalid_tx_returns_error()
+    {
+        BlockHeader header = Build.A.BlockHeader
+            .TestObject;
+        Transaction tx = new();
+
+        _transactionProcessor.CallAndRestore(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(TransactionResult.Ok);
+
+        CallOutput callOutput = _blockchainBridge.EstimateGas(header, tx, 1);
+
+        Assert.That(callOutput.Error, Is.Not.Null);
+    }
+
+    [Test]
+    public void Sil_simulate_is_lazy()
+    {
+        ISimulateReadOnlyBlocksProcessingEnvFactory testFactory = Substitute.For<ISimulateReadOnlyBlocksProcessingEnvFactory>();
+        testFactory.Create().Returns(Substitute.For<ISimulateReadOnlyBlocksProcessingEnv>());
+
+        using IContainer container = new ContainerBuilder()
+            .AddModule(new TestNethermindModule())
+            .AddSingleton<ISimulateReadOnlyBlocksProcessingEnvFactory>(testFactory)
+            .Build();
+
+        IBlockchainBridge blockchainBridge = container.Resolve<IBlockchainBridgeFactory>().CreateBlockchainBridge();
+        testFactory.DidNotReceive().Create();
+
+        try
+        {
+            blockchainBridge.Simulate(Build.A.EmptyBlockHeader, new SimulatePayload<TransactionWithSourceDetails>(),
+                Substitute.For<ISimulateBlockTracerFactory<GethStyleTracer>>(), 10_000_000, default);
+        }
+        catch (Exception)
+        {
+        }
+
+        testFactory.Received().Create();
+    }
+
+    [Test]
+    public void HasStateForBlock_returns_true_when_stateReader_returns_true()
+    {
+        BlockHeader header = Build.A.BlockHeader.WithNumber(100).WithStateRoot(TestItem.KeccakA).TestObject;
+
+        _stateReader.HasStateForBlock(header).Returns(true);
+
+        Assert.That(_blockchainBridge.HasStateForBlock(header), Is.True);
+    }
+
+    [Test]
+    public void HasStateForBlock_returns_false_when_stateReader_returns_false()
+    {
+        BlockHeader header = Build.A.BlockHeader.WithNumber(250).WithStateRoot(TestItem.KeccakA).TestObject;
+
+        _stateReader.HasStateForBlock(header).Returns(false);
+
+        Assert.That(_blockchainBridge.HasStateForBlock(header), Is.False);
+    }
+
+    [Test]
+    public void Simulate_adapter_uses_block_gas_used_for_budget()
+    {
+        SimulateRequestState simulateRequestState = new()
+        {
+            TotalGasLeft = 100_000,
+            BlockGasLeft = 80_000,
+            Validate = true,
+        };
+        simulateRequestState.SetTxsWithExplicitGas(
+            [
+                new()
+                {
+                    HadGasLimitInRequest = true,
+                    Transaction = Build.A.Transaction.WithSenderAddress(TestItem.AddressA).TestObject
+                }
+            ]);
+
+        ITransactionProcessor processor = Substitute.For<ITransactionProcessor>();
+        processor.Execute(Arg.Any<Transaction>(), Arg.Any<ITxTracer>())
+            .Returns(ci =>
+            {
+                Transaction tx = ci.Arg<Transaction>();
+                tx.SpentGas = 10_000;
+                tx.BlockGasUsed = 50_000;
+                return TransactionResult.Ok;
+            });
+
+        SimulateTransactionProcessorAdapter adapter = new(processor, simulateRequestState);
+        Transaction transaction = Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(1)
+            .WithGasLimit(60_000).SignedAndResolved(TestItem.PrivateKeyA).TestObject;
+
+        adapter.Execute(transaction, Substitute.For<ITxTracer>());
+
+        Assert.That(simulateRequestState.TotalGasLeft, Is.EqualTo(50_000));
+        Assert.That(simulateRequestState.BlockGasLeft, Is.EqualTo(30_000));
+    }
+}

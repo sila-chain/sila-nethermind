@@ -1,0 +1,119 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Autofac;
+using BenchmarkDotNet.Attributes;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Find;
+using Nethermind.Blockchain.Receipts;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Blockchain.Tracing;
+using Nethermind.History;
+using Nethermind.Synchronization;
+using NSubstitute;
+using Nethermind.Consensus.Processing;
+using Nethermind.Core;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Specs;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Savm.State;
+using Nethermind.Facade;
+using Nethermind.JsonRpc.Modules.Sil;
+using Nethermind.Logging;
+using Nethermind.State;
+using Nethermind.Facade.Sil;
+using Nethermind.JsonRpc.Modules.Sil.FeeHistory;
+using Nethermind.JsonRpc.Modules.Sil.GasPrice;
+using Nethermind.TxPool;
+using Nethermind.Wallet;
+using Nethermind.Config;
+using Nethermind.Core.Test.Modules;
+using Nethermind.Db.LogIndex;
+using Nethermind.Network;
+
+namespace Nethermind.JsonRpc.Benchmark
+{
+    public class SilModuleBenchmarks
+    {
+        private SilRpcModule _ethModule;
+        private IContainer _container;
+        private HeadBlockSignal _headBlockSignal;
+
+        [GlobalSetup]
+        public void GlobalSetup()
+        {
+            _container = new ContainerBuilder()
+                .AddModule(new TestNethermindModule())
+                .AddSingleton<ISpecProvider>(MainnetSpecProvider.Instance)
+                .Build();
+
+            IWorldState stateProvider = _container.Resolve<IMainProcessingContext>().WorldState;
+            stateProvider.CreateAccount(Address.Zero, 1000.Sila);
+            IReleaseSpec spec = MainnetSpecProvider.Instance.GenesisSpec;
+            stateProvider.Commit(spec);
+            stateProvider.CommitTree(0);
+
+            Block genesisBlock = Build.A.Block.Genesis.TestObject;
+            IBlockTree blockTree = _container.Resolve<IBlockTree>();
+            blockTree.SuggestBlock(genesisBlock);
+
+            Block block1 = Build.A.Block.WithParent(genesisBlock).WithNumber(1).TestObject;
+            blockTree.SuggestBlock(block1);
+
+            IBlockchainProcessor blockchainProcessor = _container.Resolve<IMainProcessingContext>().BlockchainProcessor;
+            blockchainProcessor.Process(genesisBlock, ProcessingOptions.None, NullBlockTracer.Instance);
+            blockchainProcessor.Process(block1, ProcessingOptions.None, NullBlockTracer.Instance);
+
+            IBlockchainBridge bridge = _container.Resolve<IBlockchainBridgeFactory>().CreateBlockchainBridge();
+
+            ISpecProvider specProvider = _container.Resolve<ISpecProvider>();
+            FeeHistoryOracle feeHistoryOracle = new(blockTree, NullReceiptStorage.Instance, specProvider);
+
+            _headBlockSignal = new HeadBlockSignal(blockTree);
+            _ethModule = new SilRpcModule(
+                _container.Resolve<IJsonRpcConfig>(),
+                bridge,
+                blockTree,
+                blockTree,
+                _container.Resolve<IReceiptFinder>(),
+                _container.Resolve<IStateReader>(),
+                NullTxPool.Instance,
+                NullTxSender.Instance,
+                NullWallet.Instance,
+                LimboLogs.Instance,
+                specProvider,
+                _container.Resolve<IGasPriceOracle>(),
+                _container.Resolve<ISilSyncingInfo>(),
+                feeHistoryOracle,
+                _container.Resolve<IProtocolsManager>(),
+                _container.Resolve<IForkInfo>(),
+                new LogIndexConfig(),
+                new ReceiptConfig(),
+                new BlocksConfig().SecondsPerSlot,
+                _headBlockSignal,
+                new SilCapabilitiesProvider(
+                    blockTree.AsReadOnly(),
+                    _container.Resolve<IStateBoundary>(),
+                    _container.Resolve<ISyncConfig>(),
+                    Substitute.For<ISyncPointers>(),
+                    Substitute.For<IHistoryConfig>(),
+                    Substitute.For<IHistoryPruner>()),
+                new BlockForRpcFactory());
+        }
+
+        [GlobalCleanup]
+        public void TearDown()
+        {
+            _headBlockSignal.Dispose();
+            _container.Dispose();
+        }
+
+        [Benchmark]
+        public void Current()
+        {
+            _ethModule.sil_getBalance(Address.Zero, new BlockParameter(1));
+            _ethModule.sil_getBlockByNumber(new BlockParameter(1), false);
+        }
+    }
+}

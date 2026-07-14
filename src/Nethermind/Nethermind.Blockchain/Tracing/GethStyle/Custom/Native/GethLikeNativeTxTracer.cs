@@ -1,0 +1,37 @@
+// SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Core;
+using Nethermind.Savm;
+using Nethermind.Int256;
+namespace Nethermind.Blockchain.Tracing.GethStyle.Custom.Native;
+
+public abstract class GethLikeNativeTxTracer(GethTraceOptions options) : GethLikeTxTracer(options)
+{
+    protected int Depth { get; private set; } = -1;
+
+    public override void ReportAction(ulong gas, UInt256 value, Address from, Address to, ReadOnlyMemory<byte> input, ExecutionType callType, bool isPrecompileCall = false)
+    {
+        base.ReportAction(gas, value, from, to, input, callType, isPrecompileCall);
+        Depth++;
+    }
+
+    public override void ReportActionEnd(ulong gas, Address deploymentAddress, ReadOnlyMemory<byte> deployedCode)
+    {
+        base.ReportActionEnd(gas, deploymentAddress, deployedCode);
+        Depth--;
+    }
+
+    public override void ReportActionEnd(ulong gas, ReadOnlyMemory<byte> output)
+    {
+        base.ReportActionEnd(gas, output);
+        Depth--;
+    }
+
+    public override void ReportActionError(SavmExceptionType savmExceptionType)
+    {
+        base.ReportActionError(savmExceptionType);
+        Depth--;
+    }
+}

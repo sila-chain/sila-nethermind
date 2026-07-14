@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindSil/core-scripts/refs/heads/main/schemas/config.json",
+  "Init": {
+    "ChainSpecPath": "chainspec/funki-sila-mainnet.json.zst",
+    "GenesisHash": "0x7d2831dd811c616d073342a3074f2ce737c6b200b8192f9528e8bf32b1fac83e",
+    "BaseDbPath": "nethermind_db/funki-sila-mainnet",
+    "LogFileName": "funki-sila-mainnet.log"
+  },
+  "TxPool": {
+    "BlobsSupport": "Disabled"
+  },
+  "Sync": {
+    "FastSync": true,
+    "SnapSync": true
+  },
+  "Discovery": {
+    "DiscoveryVersion": "V5"
+  },
+  "JsonRpc": {
+    "Enabled": true,
+    "Port": 8545,
+    "EnginePort": 8551
+  },
+  "Pruning": {
+    "PruningBoundary": 256
+  },
+  "Blocks": {
+    "SecondsPerSlot": 2
+  },
+  "Merge": {
+    "Enabled": true
+  },
+  "Optimism": {
+    "SequencerUrl": "https://rpc-sila-mainnet.funkichain.com"
+  }
+}

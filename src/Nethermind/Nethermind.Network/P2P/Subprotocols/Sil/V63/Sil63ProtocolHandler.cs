@@ -1,0 +1,158 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Consensus;
+using Nethermind.Consensus.Scheduler;
+using Nethermind.Core;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Logging;
+using Nethermind.Network.Contract.P2P;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62;
+using Nethermind.Network.P2P.Subprotocols.Sil.V63.Messages;
+using Nethermind.Network.Rlpx;
+using Nethermind.Stats;
+using Nethermind.Synchronization;
+using Nethermind.TxPool;
+
+namespace Nethermind.Network.P2P.Subprotocols.Sil.V63
+{
+    public class Sil63ProtocolHandler : Sil62ProtocolHandler
+    {
+        private readonly MessageQueue<GetNodeDataMessage, IByteArrayList> _nodeDataRequests;
+
+        private readonly MessageQueue<GetReceiptsMessage, (IOwnedReadOnlyList<TxReceipt[]>, long)> _receiptsRequests;
+
+        public Sil63ProtocolHandler(ISession session,
+            IMessageSerializationService serializer,
+            INodeStatsManager nodeStatsManager,
+            ISyncServer syncServer,
+            IBackgroundTaskScheduler backgroundTaskScheduler,
+            ITxPool txPool,
+            IGossipPolicy gossipPolicy,
+            ILogManager logManager,
+            ITxGossipPolicy? transactionsGossipPolicy = null)
+            : base(session, serializer, nodeStatsManager, syncServer, backgroundTaskScheduler, txPool, gossipPolicy, logManager, transactionsGossipPolicy)
+        {
+            _nodeDataRequests = new MessageQueue<GetNodeDataMessage, IByteArrayList>(this);
+            _receiptsRequests = new MessageQueue<GetReceiptsMessage, (IOwnedReadOnlyList<TxReceipt[]>, long)>(this);
+        }
+
+        public override byte ProtocolVersion => SilVersions.Sil63;
+
+        public override int MessageIdSpaceSize => 17; // magic number here following Go
+
+        protected override bool HandleMessageCore(ZeroPacket message)
+        {
+            int size = message.Content.ReadableBytes;
+
+            switch (message.PacketType)
+            {
+                case Sil63MessageCode.GetReceipts:
+                    HandleInBackground<GetReceiptsMessage, ReceiptsMessage>(message, Handle);
+                    return true;
+                case Sil63MessageCode.Receipts:
+                    ReceiptsMessage receiptsMessage = Deserialize<ReceiptsMessage>(message.Content);
+                    ReportIn(receiptsMessage, size);
+                    Handle(receiptsMessage, size);
+                    return true;
+                case Sil63MessageCode.GetNodeData:
+                    HandleInBackground<GetNodeDataMessage, NodeDataMessage>(message, Handle);
+                    return true;
+                case Sil63MessageCode.NodeData:
+                    NodeDataMessage nodeDataMessage = Deserialize<NodeDataMessage>(message.Content);
+                    ReportIn(nodeDataMessage, size);
+                    Handle(nodeDataMessage, size);
+                    return true;
+                default:
+                    return base.HandleMessageCore(message);
+            }
+        }
+
+        public override string Name => "sil63";
+
+        protected virtual void Handle(ReceiptsMessage msg, long size) => _receiptsRequests.Handle((msg.TxReceipts, size), size);
+
+        private async Task<NodeDataMessage> Handle(GetNodeDataMessage msg, CancellationToken cancellationToken)
+        {
+            using GetNodeDataMessage message = msg;
+
+            long startTime = Stopwatch.GetTimestamp();
+            NodeDataMessage response = await FulfillNodeDataRequest(message, cancellationToken);
+            if (Logger.IsTrace) Logger.Trace($"OUT {Counter:D5} NodeData to {Node:c} in {Stopwatch.GetElapsedTime(startTime).TotalMilliseconds:N0}ms");
+
+            return response;
+        }
+
+        protected Task<NodeDataMessage> FulfillNodeDataRequest(GetNodeDataMessage msg, CancellationToken cancellationToken)
+        {
+            IByteArrayList nodeData = SyncServer.GetNodeData(msg.Hashes, cancellationToken);
+            return Task.FromResult(new NodeDataMessage(nodeData));
+        }
+
+        protected virtual void Handle(NodeDataMessage msg, int size) => _nodeDataRequests.Handle(msg.Data, size);
+
+        public override Task<IByteArrayList> GetNodeData(IReadOnlyList<Hash256> keys, CancellationToken token)
+        {
+            if (keys.Count == 0)
+            {
+                return Task.FromResult<IByteArrayList>(EmptyByteArrayList.Instance);
+            }
+
+            GetNodeDataMessage msg = new(keys.ToPooledList());
+
+            // could use more array pooled lists (pooled memory) here.
+            // maybe remeasure allocations on another network since goerli has been phased out.
+            return SendRequest(msg, token);
+        }
+        public override async Task<IOwnedReadOnlyList<TxReceipt[]>> GetReceipts(IReadOnlyList<Hash256> blockHashes, CancellationToken token)
+        {
+            if (blockHashes.Count == 0)
+            {
+                return ArrayPoolList<TxReceipt[]>.Empty();
+            }
+
+            IOwnedReadOnlyList<TxReceipt[]> txReceipts = await _nodeStats.RunSizeAndLatencyRequestSizer<IOwnedReadOnlyList<TxReceipt[]>, Hash256, TxReceipt[]>(RequestType.Receipts, blockHashes, async clampedBlockHashes =>
+                await SendRequest(new GetReceiptsMessage(clampedBlockHashes.ToPooledList()), token));
+
+            return txReceipts;
+        }
+
+        protected virtual Task<IByteArrayList> SendRequest(GetNodeDataMessage message, CancellationToken token)
+        {
+            if (Logger.IsTrace)
+            {
+                Logger.Trace("Sending node data request:");
+                Logger.Trace($"Keys count: {message.Hashes.Count}");
+            }
+
+            return SendRequestGeneric(
+                _nodeDataRequests,
+                message,
+                TransferSpeedType.NodeData,
+                static (_) => $"{nameof(GetNodeDataMessage)}",
+                token);
+        }
+
+        protected virtual Task<(IOwnedReadOnlyList<TxReceipt[]>, long)> SendRequest(GetReceiptsMessage message, CancellationToken token)
+        {
+            if (Logger.IsTrace)
+            {
+                Logger.Trace("Sending receipts request:");
+                Logger.Trace($"Hashes count: {message.Hashes.Count}");
+            }
+
+            return SendRequestGeneric(
+                _receiptsRequests,
+                message,
+                TransferSpeedType.Receipts,
+                static (_) => $"{nameof(GetReceiptsMessage)}",
+                token);
+        }
+    }
+}

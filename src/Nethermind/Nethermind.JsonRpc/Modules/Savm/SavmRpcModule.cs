@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Consensus.Producers;
+
+namespace Nethermind.JsonRpc.Modules.Savm
+{
+    public class SavmRpcModule(IManualBlockProductionTrigger? trigger) : ISavmRpcModule
+    {
+        private readonly IManualBlockProductionTrigger _trigger = trigger ?? throw new ArgumentNullException(nameof(trigger));
+
+        public ResultWrapper<bool> savm_mine()
+        {
+            _trigger.BuildBlock();
+            return ResultWrapper<bool>.Success(true);
+        }
+    }
+}

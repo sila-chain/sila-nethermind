@@ -1,0 +1,52 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Specs;
+
+namespace Sila.Test.Base
+{
+    public class HalfBlockchainTestJson : BlockchainTestJson
+    {
+        public new Hash256 PostState { get; set; }
+    }
+
+    public class BlockchainTestJson
+    {
+        public string? Network { get; set; }
+        public IReleaseSpec? SilaNetwork { get; set; }
+        public IReleaseSpec? SilaNetworkAfterTransition { get; set; }
+        public ForkActivation? TransitionForkActivation { get; set; }
+        public string? LastBlockHash { get; set; }
+        public ConfigJson? Config { get; set; }
+        public string? GenesisRlp { get; set; }
+
+        public TestBlockJson[]? Blocks { get; set; }
+        public TestBlockHeaderJson? GenesisBlockHeader { get; set; }
+        public TestEngineNewPayloadsJson[]? EngineNewPayloads { get; set; }
+
+        public Dictionary<Address, AccountState>? Pre { get; set; }
+        public Dictionary<Address, AccountState>? PostState { get; set; }
+
+        public Hash256? PostStateHash { get; set; }
+
+        public string? SealEngine { get; set; }
+        public string? LoadFailure { get; set; }
+    }
+
+    public class ConfigJson
+    {
+        public string? Network { get; set; }
+        public string? Chainid { get; set; }
+        public Dictionary<string, BlobScheduleEntryJson>? BlobSchedule;
+    }
+
+    public class BlobScheduleEntryJson
+    {
+        public string? Target;
+        public string? Max;
+        public string? BaseFeeUpdateFraction;
+    }
+}

@@ -1,0 +1,74 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Nethermind.Consensus.Transactions;
+using Nethermind.Core;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Int256;
+using NSubstitute;
+using NUnit.Framework;
+
+namespace Nethermind.Blockchain.Test.Consensus;
+
+[Parallelizable(ParallelScope.All)]
+public class CompositeTxSourceTests
+{
+    [Test, MaxTime(Timeout.MaxTestTime)]
+    public void To_string_does_not_throw()
+    {
+        ITxSource txSource = Substitute.For<ITxSource>();
+        CompositeTxSource selector = new(txSource);
+        _ = selector.ToString();
+    }
+
+    [Test, MaxTime(Timeout.MaxTestTime)]
+    public void Throws_on_null_argument() =>
+        Assert.Throws<ArgumentNullException>(static () => new CompositeTxSource(null!));
+
+    [Test, MaxTime(Timeout.MaxTestTime)]
+    public void selectTransactions_injects_transactions_from_ImmediateTransactionSources_in_front_of_block_transactions()
+    {
+        ITxSource CreateImmediateTransactionSource(BlockHeader header, Address address, List<Transaction> txs, bool createsTransaction)
+        {
+            ITxSource immediateTransactionSource = Substitute.For<ITxSource>();
+            immediateTransactionSource.GetTransactions(header, Arg.Any<ulong>()).Returns(x =>
+            {
+                if (createsTransaction)
+                {
+                    GeneratedTransaction transaction = Build.A.GeneratedTransaction.To(address).WithGasPrice(UInt256.Zero).TestObject;
+                    txs.Add(transaction);
+                    return new[] { transaction };
+                }
+                else
+                {
+                    return Array.Empty<Transaction>();
+                }
+            });
+            return immediateTransactionSource;
+        }
+
+        BlockHeader parentHeader = Build.A.BlockHeader.TestObject;
+        ulong gasLimit = 1000ul;
+        List<Transaction> expected = [];
+
+        ITxSource innerPendingTxSelector = Substitute.For<ITxSource>();
+
+        ITxSource immediateTransactionSource1 = CreateImmediateTransactionSource(parentHeader, TestItem.AddressB, expected, true);
+        ITxSource immediateTransactionSource2 = CreateImmediateTransactionSource(parentHeader, TestItem.AddressC, expected, false);
+        ITxSource immediateTransactionSource3 = CreateImmediateTransactionSource(parentHeader, TestItem.AddressD, expected, true);
+
+        Transaction[] originalTxs = Build.A.Transaction.TestObjectNTimes(5);
+        innerPendingTxSelector.GetTransactions(parentHeader, Arg.Any<ulong>()).Returns(originalTxs);
+
+        CompositeTxSource compositeTxSource = new(
+            immediateTransactionSource1, immediateTransactionSource2, immediateTransactionSource3, innerPendingTxSelector);
+
+        Transaction[] transactions = compositeTxSource.GetTransactions(parentHeader, gasLimit).ToArray();
+        expected.AddRange(originalTxs);
+
+        Assert.That(transactions, Is.EqualTo(expected));
+    }
+}

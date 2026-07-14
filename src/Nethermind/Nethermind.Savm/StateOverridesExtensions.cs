@@ -1,0 +1,164 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Savm.CodeAnalysis;
+using Nethermind.Int256;
+using Nethermind.Savm.State;
+
+namespace Nethermind.Savm;
+
+public static class StateOverridesExtensions
+{
+    private static readonly UInt256 MaxNonce = ulong.MaxValue;
+
+    public static void ApplyStateOverridesNoCommit(
+        this IWorldState state,
+        IOverridableCodeInfoRepository overridableCodeInfoRepository,
+        Dictionary<Address, AccountOverride>? overrides,
+        IReleaseSpec spec)
+    {
+        if (overrides is not null)
+        {
+            overridableCodeInfoRepository.ResetPrecompileOverrides();
+            foreach ((Address address, AccountOverride accountOverride) in overrides)
+            {
+                if (accountOverride.Nonce is not null && accountOverride.Nonce.Value > MaxNonce)
+                    throw new ArgumentException($"Nonce override {accountOverride.Nonce.Value} exceeds the maximum supported value ({MaxNonce})");
+
+                if (!state.TryGetAccount(address, out AccountStruct account))
+                {
+                    if (accountOverride.HasStateChanges)
+                    {
+                        state.CreateAccount(address, accountOverride.Balance ?? UInt256.Zero, accountOverride.Nonce ?? 0);
+                    }
+                }
+                else
+                {
+                    state.UpdateBalance(spec, account, accountOverride, address);
+                    state.UpdateNonce(account, accountOverride, address);
+                }
+
+                state.UpdateCode(overridableCodeInfoRepository, spec, accountOverride, address);
+                state.UpdateState(accountOverride, address);
+            }
+        }
+    }
+
+    public static void ApplyStateOverrides(
+        this IWorldState state,
+        IOverridableCodeInfoRepository overridableCodeInfoRepository,
+        Dictionary<Address, AccountOverride>? overrides,
+        IReleaseSpec spec,
+        ulong blockNumber)
+    {
+        // SIP-158 must not delete accounts whose code/nonce were zeroed
+        // while storage remains, or SIP-7610 CREATE collision checks will miss it.
+        spec = spec.WithoutSip158();
+        state.ApplyStateOverridesNoCommit(overridableCodeInfoRepository, overrides, spec);
+        state.Commit(spec, commitRoots: true);
+        state.CommitTree(blockNumber);
+        state.RecalculateStateRoot();
+    }
+
+    private static void UpdateState(this IWorldState stateProvider, AccountOverride accountOverride, Address address)
+    {
+        void ApplyState(Dictionary<UInt256, Hash256> diff)
+        {
+            foreach ((UInt256 index, Hash256 value) in diff)
+            {
+                stateProvider.Set(new StorageCell(address, index), value.Bytes.WithoutLeadingZeros().ToArray());
+            }
+        }
+
+        if (accountOverride.State is not null)
+        {
+            stateProvider.ClearStorage(address);
+            ApplyState(accountOverride.State);
+        }
+        else if (accountOverride.StateDiff is not null)
+        {
+            ApplyState(accountOverride.StateDiff);
+        }
+    }
+
+    private static void UpdateCode(
+        this IWorldState stateProvider,
+        IOverridableCodeInfoRepository overridableCodeInfoRepository,
+        IReleaseSpec currentSpec,
+        AccountOverride accountOverride,
+        Address address)
+    {
+        if (accountOverride.MovePrecompileToAddress is not null)
+        {
+            if (!overridableCodeInfoRepository.GetCachedCodeInfoNoDelegation(address, currentSpec).IsPrecompile)
+            {
+                throw new ArgumentException($"Account {address} is not a precompile");
+            }
+
+            overridableCodeInfoRepository.MovePrecompile(
+                currentSpec,
+                address,
+                accountOverride.MovePrecompileToAddress);
+        }
+
+        if (accountOverride.Code is not null)
+        {
+            stateProvider.InsertCode(address, accountOverride.Code, currentSpec);
+
+            overridableCodeInfoRepository.SetCodeOverride(
+                currentSpec,
+                address,
+                new CodeInfo(accountOverride.Code));
+        }
+    }
+
+    private static void UpdateNonce(
+        this IWorldState stateProvider,
+        in AccountStruct account,
+        AccountOverride accountOverride,
+        Address address)
+    {
+        if (accountOverride.Nonce is not null)
+        {
+            ulong nonce = account.Nonce;
+            ulong newNonce = accountOverride.Nonce.Value;
+            if (nonce > newNonce)
+            {
+                stateProvider.DecrementNonce(address, nonce - newNonce);
+            }
+            else if (nonce < newNonce)
+            {
+                stateProvider.IncrementNonce(address, newNonce - nonce);
+            }
+        }
+    }
+
+    private static void UpdateBalance(
+        this IWorldState stateProvider,
+        IReleaseSpec spec,
+        in AccountStruct account,
+        AccountOverride accountOverride,
+        Address address)
+    {
+        if (accountOverride.Balance is not null)
+        {
+            UInt256 balance = account.Balance;
+            UInt256 newBalance = accountOverride.Balance.Value;
+            if (balance > newBalance)
+            {
+                stateProvider.SubtractFromBalance(address, balance - newBalance, spec);
+            }
+            else if (balance < newBalance)
+            {
+                stateProvider.AddToBalanceAndCreateIfNotExists(address, newBalance - balance, spec);
+            }
+        }
+    }
+}
+

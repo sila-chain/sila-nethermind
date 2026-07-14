@@ -1,0 +1,104 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using Nethermind.Abi;
+using Nethermind.Consensus.AuRa.Contracts;
+using Nethermind.Core;
+using Nethermind.Core.Caching;
+using Nethermind.Core.Crypto;
+using Nethermind.Int256;
+using Nethermind.Logging;
+
+namespace Nethermind.Consensus.AuRa
+{
+    public class AuRaContractGasLimitOverride(
+        IList<IBlockGasLimitContract> contracts,
+        AuRaContractGasLimitOverride.Cache cache,
+        bool minimum2MlnGasPerBlockWhenUsingBlockGasLimitContract,
+        IGasLimitCalculator innerCalculator,
+        ILogManager logManager) : IGasLimitCalculator
+    {
+        private static UInt256? _minimalContractGasLimit;
+
+        private static UInt256 MinimalContractGasLimit
+        {
+            get
+            {
+                _minimalContractGasLimit ??= 2_000_000L;
+                return _minimalContractGasLimit.Value;
+            }
+        }
+        private readonly IList<IBlockGasLimitContract> _contracts = contracts ?? throw new ArgumentNullException(nameof(contracts));
+        private readonly Cache _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+        private readonly bool _minimum2MlnGasPerBlockWhenUsingBlockGasLimitContract = minimum2MlnGasPerBlockWhenUsingBlockGasLimitContract;
+        private readonly IGasLimitCalculator _innerCalculator = innerCalculator ?? throw new ArgumentNullException(nameof(innerCalculator));
+        private readonly ILogger _logger = logManager?.GetClassLogger<AuRaContractGasLimitOverride>() ?? throw new ArgumentNullException(nameof(logManager));
+
+        public ulong GetGasLimit(BlockHeader parentHeader, ulong? targetGasLimit = null) =>
+            targetGasLimit is not null
+                ? _innerCalculator.GetGasLimit(parentHeader, targetGasLimit)
+                : GetGasLimitFromContract(parentHeader) ?? _innerCalculator.GetGasLimit(parentHeader);
+
+        private ulong? GetGasLimitFromContract(BlockHeader parentHeader)
+        {
+            if (_cache.GasLimitCache.TryGet(parentHeader.Hash, out ulong? gasLimit))
+            {
+                return gasLimit;
+            }
+
+            if (_contracts.TryGetForBlock(parentHeader.Number + 1, out IBlockGasLimitContract contract))
+            {
+                UInt256? contractLimit = GetContractGasLimit(parentHeader, contract);
+                gasLimit = contractLimit.HasValue ? (ulong)contractLimit.Value : null;
+                _cache.GasLimitCache.Set(parentHeader.Hash, gasLimit);
+                if (gasLimit.HasValue)
+                {
+                    if (gasLimit.Value != parentHeader.GasLimit)
+                    {
+                        if (_logger.IsInfo)
+                            _logger.Info($"Block gas limit was changed from {parentHeader.GasLimit} to {gasLimit.Value}.");
+                    }
+                }
+                else
+                {
+                    if (_logger.IsTrace)
+                        _logger.Trace("Contract call returned nothing. Not changing the block gas limit.");
+                }
+            }
+
+            return gasLimit;
+        }
+
+        private UInt256? GetContractGasLimit(BlockHeader parent, IBlockGasLimitContract contract)
+        {
+            try
+            {
+                UInt256? contractGasLimit = contract.BlockGasLimit(parent);
+                return contractGasLimit.HasValue && _minimum2MlnGasPerBlockWhenUsingBlockGasLimitContract && contractGasLimit < MinimalContractGasLimit
+                    ? MinimalContractGasLimit
+                    : contractGasLimit;
+            }
+            catch (AbiException e)
+            {
+                if (_logger.IsError) _logger.Error($"Contract call failed. Not changing the block gas limit on block {parent.ToString(BlockHeader.Format.FullHashAndNumber)} {new StackTrace()}.", e);
+                return null;
+            }
+        }
+
+        public class Cache
+        {
+            private const int MaxCacheSize = 10;
+
+            internal LruCache<ValueHash256, ulong?> GasLimitCache { get; } = new(MaxCacheSize, "BlockGasLimit");
+        }
+
+        public bool IsGasLimitValid(BlockHeader parentHeader, in ulong gasLimit, out ulong? expectedGasLimit)
+        {
+            expectedGasLimit = GetGasLimitFromContract(parentHeader);
+            return expectedGasLimit is null || expectedGasLimit == gasLimit;
+        }
+    }
+}

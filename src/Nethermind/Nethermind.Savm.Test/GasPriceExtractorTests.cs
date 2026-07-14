@@ -1,0 +1,135 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Linq;
+using Nethermind.Blockchain.Tracing;
+using Nethermind.Core;
+using Nethermind.Specs;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Serialization.Rlp;
+using NUnit.Framework;
+
+namespace Nethermind.Savm.Test
+{
+    [Explicit("Failing on MacOS GitHub Actions with stack overflow")]
+    [TestFixture]
+    public class GasPriceExtractorTests : VirtualMachineTestsBase
+    {
+        protected override ulong BlockNumber => MainnetSpecProvider.IstanbulBlockNumber;
+
+        [Test]
+        public void Block_header_rlp_size_assumption_is_correct()
+        {
+            Rlp rlp = BuildHeader();
+
+            Assert.That(rlp.Bytes.Length, Is.LessThan(600));
+        }
+
+        [Test]
+        public void Intrinsic_gas_cost_assumption_is_correct()
+        {
+            Rlp rlp = BuildHeader();
+
+            Transaction tx = Build.A.Transaction.WithData(rlp.Bytes).TestObject;
+            SilaIntrinsicGas gasCost = IntrinsicGasCalculator.Calculate(tx, Spec);
+            Assert.That(gasCost.FloorGas, Is.EqualTo(0));
+            Assert.That(gasCost.Standard, Is.LessThan(21000 + 9600));
+        }
+
+        [Test]
+        public void Keccak_gas_cost_assumption_is_correct()
+        {
+            Rlp rlp = BuildHeader();
+
+            Transaction tx = Build.A.Transaction.WithData(rlp.Bytes).TestObject;
+            SilaIntrinsicGas gasCost = IntrinsicGasCalculator.Calculate(tx, Spec);
+            Assert.That(gasCost.FloorGas, Is.EqualTo(0));
+            Assert.That(gasCost.Standard, Is.LessThan(21000 + 9600));
+
+            byte[] bytecode =
+                Prepare.SavmCode
+                    .PushData("0x0200")
+                    .PushData(0)
+                    .PushData(0)
+                    .Op(Instruction.CALLDATACOPY)
+                    .PushData("0x0200")
+                    .PushData(0)
+                    .Op(Instruction.KECCAK256)
+                    .Done;
+
+            (Block block, Transaction transaction) = PrepareTx(
+                BlockNumber, 1000000, bytecode, rlp.Bytes, 0);
+
+            CallOutputTracer callOutputTracer = new();
+            _processor.Execute(transaction, new BlockExecutionContext(block.Header, Spec), callOutputTracer);
+            long minorCostsEstimate = 100;
+            long keccakCostEstimate = 30 + 512 / 6;
+            Assert.That(callOutputTracer.GasSpent, Is.LessThan(21000 + 9600 + minorCostsEstimate + keccakCostEstimate));
+        }
+
+        [Test]
+        public void Blockhash_times_256_gas_cost_assumption_is_correct()
+        {
+            Rlp rlp = BuildHeader();
+            byte[] bytecode =
+                Prepare.SavmCode
+                    .PushData(256)
+                    .Op(Instruction.JUMPDEST)
+                    .PushData(1)
+                    .Op(Instruction.DUP2)
+                    .Op(Instruction.SUB)
+                    .Op(Instruction.DUP1)
+                    .Op(Instruction.BLOCKHASH)
+                    .Op(Instruction.POP)
+                    .PushData(0)
+                    .Op(Instruction.DUP2)
+                    .Op(Instruction.GT)
+                    .PushData(3)
+                    .Op(Instruction.JUMPI)
+                    .Op(Instruction.STOP)
+                    .Done;
+
+            (Block block, Transaction transaction) = PrepareTx(
+                BlockNumber, 1000000, bytecode, rlp.Bytes, 0);
+
+            CallOutputTracer callOutputTracer = new();
+            _processor.Execute(transaction, new BlockExecutionContext(block.Header, Spec), callOutputTracer);
+            Assert.That(callOutputTracer.GasSpent, Is.LessThan(21000 + 9600 + 20000));
+        }
+
+        [Test]
+        public void Blockhash_times_256_no_loop()
+        {
+            Rlp rlp = BuildHeader();
+            Prepare bytecodeBuilder = Prepare.SavmCode
+                    .PushData(0)
+                    .PushData(1);
+
+            for (int i = 0; i < 256; i++)
+            {
+                bytecodeBuilder.Op(Instruction.ADD)
+                    .Op(Instruction.BLOCKHASH)
+                    .PushData(1);
+            }
+
+            byte[] bytecode = bytecodeBuilder.Done;
+
+            (Block block, Transaction transaction) = PrepareTx(
+                BlockNumber, 1000000, bytecode, rlp.Bytes, 0);
+
+            CallOutputTracer callOutputTracer = new();
+            _processor.Execute(transaction, new BlockExecutionContext(block.Header, Spec), callOutputTracer);
+            Assert.That(callOutputTracer.GasSpent, Is.LessThan(21000 + 9600 + 20000));
+        }
+
+        private static Rlp BuildHeader()
+        {
+            HeaderDecoder decoder = new();
+            BlockHeader blockHeader = Build.A.BlockHeader
+                .WithBloom(new Bloom(Enumerable.Repeat((byte)1, 256).ToArray())).TestObject;
+            Rlp rlp = decoder.Encode(blockHeader);
+            return rlp;
+        }
+    }
+}

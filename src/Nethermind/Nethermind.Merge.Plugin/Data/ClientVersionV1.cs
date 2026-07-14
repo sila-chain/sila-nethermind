@@ -1,0 +1,23 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+
+namespace Nethermind.Merge.Plugin.Data;
+
+/// <summary>
+///   The client version specification.
+///   <seealso cref="https://github.com/sila-chain/execution-apis/pull/517/files?short_path=f1e647c#diff-f1e647ce063c92e6fd6cd448746b1d1effcfd2fa2e1b031a71f8ce2f74ba0952"/>
+/// </summary>
+public readonly struct ClientVersionV1
+{
+    public ClientVersionV1() { }
+
+    public string Code { get; init; } = ProductInfo.ClientCode;
+    public string Name { get; init; } = ProductInfo.Name;
+    public string Version { get; init; } = ProductInfo.Version;
+    public string Commit { get; init; } = ProductInfo.Commit.Length < 8
+        ? string.Empty.PadLeft(8, '0')
+        : ProductInfo.Commit[..8];
+}
+

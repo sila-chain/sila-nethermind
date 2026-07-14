@@ -1,0 +1,137 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Consensus;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Crypto;
+using Nethermind.Logging;
+using Nethermind.Merge.Plugin.Handlers;
+using Nethermind.Synchronization;
+
+namespace Nethermind.Merge.Plugin.Synchronization
+{
+    public class BeaconSync(
+        IBeaconPivot beaconPivot,
+        IBlockTree blockTree,
+        ISyncConfig syncConfig,
+        IBlockCacheService blockCacheService,
+        IPoSSwitcher poSSwitcher,
+        ILogManager logManager) : IMergeSyncController, IBeaconSyncStrategy
+    {
+        private readonly IBeaconPivot _beaconPivot = beaconPivot;
+        private readonly IBlockTree _blockTree = blockTree;
+        private readonly ISyncConfig _syncConfig = syncConfig;
+        private readonly IBlockCacheService _blockCacheService = blockCacheService;
+        private readonly IPoSSwitcher _poSSwitcher = poSSwitcher;
+        private bool _isInBeaconModeControl = false;
+        private readonly ILogger _logger = logManager.GetClassLogger<BeaconSync>();
+
+        public void StopSyncing()
+        {
+            if (!_isInBeaconModeControl)
+            {
+                _beaconPivot.RemoveBeaconPivot();
+                _blockCacheService.Clear();
+            }
+
+            _isInBeaconModeControl = true;
+        }
+
+        public void InitBeaconHeaderSync(BlockHeader blockHeader)
+        {
+            StopBeaconModeControl();
+            _beaconPivot.EnsurePivot(blockHeader);
+        }
+
+        public void StopBeaconModeControl() => _isInBeaconModeControl = false;
+
+        public bool ShouldBeInBeaconHeaders()
+        {
+            bool beaconPivotExists = _beaconPivot.BeaconPivotExists();
+            bool notInBeaconModeControl = !_isInBeaconModeControl;
+            bool notFinishedBeaconHeaderSync = !IsBeaconSyncHeadersFinished();
+
+            if (_logger.IsTrace) _logger.Trace($"ShouldBeInBeaconHeaders: NotInBeaconModeControl: {notInBeaconModeControl}, BeaconPivotExists: {beaconPivotExists}, NotFinishedBeaconHeaderSync: {notFinishedBeaconHeaderSync} LowestInsertedBeaconHeaderNumber: {_blockTree.LowestInsertedBeaconHeader?.Number}, BeaconPivot: {_beaconPivot.PivotNumber}, BeaconPivotDestinationNumber: {_beaconPivot.PivotDestinationNumber}");
+            return beaconPivotExists &&
+                   notInBeaconModeControl &&
+                   notFinishedBeaconHeaderSync;
+        }
+
+        public bool ShouldBeInBeaconModeControl() => _isInBeaconModeControl;
+
+        public bool IsBeaconSyncHeadersFinished()
+        {
+            BlockHeader? lowestInsertedBeaconHeader = _blockTree.LowestInsertedBeaconHeader;
+            bool chainMerged =
+                ((lowestInsertedBeaconHeader?.Number ?? 0) - 1) <= (_blockTree.BestSuggestedHeader?.Number ?? long.MaxValue) &&
+                lowestInsertedBeaconHeader is not null &&
+                _blockTree.IsKnownBlock(lowestInsertedBeaconHeader.Number - 1, lowestInsertedBeaconHeader.ParentHash!);
+            bool finished = lowestInsertedBeaconHeader is null
+                            || lowestInsertedBeaconHeader.Number <= _beaconPivot.PivotDestinationNumber
+                            || (!_syncConfig.StrictMode && chainMerged);
+
+            if (_logger.IsTrace) _logger.Trace(
+                $"IsBeaconSyncHeadersFinished: {finished}," +
+                $" BeaconPivotExists: {_beaconPivot.BeaconPivotExists()}," +
+                $" LowestInsertedBeaconHeaderHash: {_blockTree.LowestInsertedBeaconHeader?.Hash}," +
+                $" LowestInsertedBeaconHeaderNumber: {_blockTree.LowestInsertedBeaconHeader?.Number}," +
+                $" BestSuggestedHeader: {_blockTree.BestSuggestedHeader?.Number}," +
+                $" ChainMerged: {chainMerged}," +
+                $" StrictMode: {_syncConfig.StrictMode}," +
+                $" BeaconPivot: {_beaconPivot.PivotNumber}," +
+                $" BeaconPivotDestinationNumber: {_beaconPivot.PivotDestinationNumber}");
+            return finished;
+        }
+
+        // At this point, beacon headers sync is finished and has found an ancestor that exists in the block tree
+        // beacon sync moves forward from the ancestor and is finished when the block body gap is filled + processed
+        // in the case of fast sync, this is the gap between the state sync head with beacon block head
+        /// <summary>
+        /// Tells if <see cref="blockHeader"/>
+        /// </summary>
+        /// <param name="blockHeader"></param>
+        /// <returns></returns>
+        public bool IsBeaconSyncFinished(BlockHeader? blockHeader) => !_beaconPivot.BeaconPivotExists() || (blockHeader is not null && _blockTree.WasProcessed(blockHeader.Number, blockHeader.GetOrCalculateHash()));
+
+        public bool MergeTransitionFinished => _poSSwitcher.TransitionFinished;
+
+        public ulong? GetTargetBlockHeight()
+        {
+            if (_beaconPivot.BeaconPivotExists())
+            {
+                return _beaconPivot.ProcessDestination?.Number ?? _beaconPivot.PivotNumber;
+            }
+            return null;
+        }
+
+        /// <remarks>
+        /// Falls back to the finalized hash persisted by the block tree when the cache holds nothing usable
+        /// (no forkchoice update yet, or a zero finalized hash), so that a node restarted before its first
+        /// pivot update can make progress. Safe because finalized blocks cannot be reorged and pivot updates
+        /// enforce monotonicity, so a stale persisted value can only produce an older-but-valid pivot.
+        /// </remarks>
+        public Hash256? GetFinalizedHash()
+        {
+            Hash256? cached = _blockCacheService.FinalizedHash;
+            return cached is not null && cached != Keccak.Zero ? cached : _blockTree.FinalizedHash;
+        }
+
+        /// <remarks>
+        /// Unlike <see cref="GetFinalizedHash"/>, there is no block tree fallback: a head can be reorged away,
+        /// and the block tree's own head reflects local processing progress, not the CL forkchoice target.
+        /// </remarks>
+        public Hash256? GetHeadBlockHash() => _blockCacheService.HeadBlockHash;
+    }
+
+    public interface IMergeSyncController
+    {
+        void StopSyncing();
+
+        void InitBeaconHeaderSync(BlockHeader blockHeader);
+
+        void StopBeaconModeControl();
+    }
+}

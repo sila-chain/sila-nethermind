@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Net;
+using Nethermind.Serialization.Rlp;
+
+namespace Nethermind.Network.Enr;
+
+/// <summary>
+/// An entry storing the IP address of the node.
+/// </summary>
+public class IpEntry(IPAddress ipAddress) : EnrContentEntry<IPAddress>(ipAddress)
+{
+    public override string Key => EnrContentKey.Ip;
+
+    protected override int GetRlpLengthOfValue() => 5;
+
+    protected override void EncodeValue<TWriter>(ref TWriter writer)
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        Value.MapToIPv4().TryWriteBytes(bytes, out int _);
+        writer.Encode(bytes);
+    }
+}

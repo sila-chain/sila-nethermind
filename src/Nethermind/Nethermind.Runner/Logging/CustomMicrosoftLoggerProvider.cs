@@ -1,0 +1,26 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Microsoft.Extensions.Logging;
+using Nethermind.Logging;
+using ILogger = Microsoft.Extensions.Logging.ILogger;
+
+namespace Nethermind.Runner.Logging
+{
+    public class CustomMicrosoftLoggerProvider(ILogManager logManager) : ILoggerProvider
+    {
+        private readonly ILogManager _logManager = logManager;
+        private const string WebApiLogNamePrefix = "JsonWebAPI";
+
+        public ILogger CreateLogger(string categoryName)
+        {
+            Nethermind.Logging.ILogger coreLogger = _logManager.GetLogger($"{WebApiLogNamePrefix}.{categoryName}");
+            CustomMicrosoftLogger customLogger = new(coreLogger);
+            return customLogger;
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+}

@@ -1,0 +1,53 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Network.P2P.Subprotocols.Sil.V66.Messages;
+using Nethermind.Specs;
+using NUnit.Framework;
+
+namespace Nethermind.Network.Test.P2P.Subprotocols.Sil.V66
+{
+    [TestFixture]
+    public class ReceiptsMessageSerializerTests
+    {
+        //modified test from https://github.com/sila-chain/SIPs/blob/master/SIPS/sip-2481.md
+        [Test]
+        public void RoundTrip()
+        {
+            string rlp = "f90172820457f9016cf90169f901668001b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f85ff85d940000000000000000000000000000000000000011f842a0000000000000000000000000000000000000000000000000000000000000deada0000000000000000000000000000000000000000000000000000000000000beef830100ff";
+            byte[] bytes = Bytes.FromHexString(rlp);
+            Network.P2P.Subprotocols.Sil.V63.Messages.ReceiptsMessageSerializer serializer63 = new(MainnetSpecProvider.Instance);
+            ReceiptsMessageSerializer serializer = new(serializer63);
+            ReceiptsMessage deserializedMessage = serializer.Deserialize(bytes);
+            byte[] serialized = serializer.Serialize(deserializedMessage);
+
+            using Network.P2P.Subprotocols.Sil.V63.Messages.ReceiptsMessage silMessage = deserializedMessage.SilMessage;
+
+            TxReceipt txReceipt = silMessage.TxReceipts[0][0];
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(serialized, Is.EqualTo(bytes));
+                Assert.That(txReceipt.StatusCode, Is.EqualTo(0));
+                Assert.That(txReceipt.GasUsedTotal, Is.EqualTo(1));
+                Assert.That(txReceipt.Bloom, Is.EqualTo(Bloom.Empty));
+
+                Assert.That(txReceipt.Logs[0].Address, Is.EqualTo(new Address("0x0000000000000000000000000000000000000011")));
+                Assert.That(txReceipt.Logs[0].Topics[0], Is.EqualTo(new Hash256("0x000000000000000000000000000000000000000000000000000000000000dead")));
+                Assert.That(txReceipt.Logs[0].Topics[1], Is.EqualTo(new Hash256("0x000000000000000000000000000000000000000000000000000000000000beef")));
+                Assert.That(txReceipt.Logs[0].Data, Is.EqualTo(Bytes.FromHexString("0x0100ff")));
+                Assert.That(txReceipt.BlockNumber, Is.EqualTo(0x0));
+                Assert.That(txReceipt.TxHash, Is.Null);
+                Assert.That(txReceipt.BlockHash, Is.Null);
+                Assert.That(txReceipt.Index, Is.EqualTo(0x0));
+            }
+
+            using ReceiptsMessage message = new(1111, silMessage);
+
+            SerializerTester.TestZero(serializer, message, rlp);
+        }
+    }
+}

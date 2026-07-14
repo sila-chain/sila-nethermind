@@ -1,0 +1,131 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Blockchain;
+using Nethermind.Core;
+using Nethermind.Core.Attributes;
+using Nethermind.Logging;
+using Nethermind.Network.Config;
+using Nethermind.Network.Contract.P2P;
+using Nethermind.Network.P2P;
+using Nethermind.Network.P2P.EventArg;
+using Nethermind.Stats;
+using Nethermind.Stats.Model;
+using System.Text.RegularExpressions;
+
+namespace Nethermind.Network
+{
+    [Todo(Improve.Refactor, "Allow protocols validators to be loaded per protocol")]
+    public class ProtocolValidator : IProtocolValidator
+    {
+        private static readonly TimeSpan ClientIdMatcherTimeout = TimeSpan.FromMilliseconds(250);
+        protected readonly ILogger _logger;
+        protected readonly IBlockTree _blockTree;
+        protected virtual bool MustValidateForkId { get; set; } = true;
+
+        private readonly INodeStatsManager _nodeStatsManager;
+        private readonly IForkInfo _forkInfo;
+        private readonly Regex? _clientIdPattern;
+
+        public ProtocolValidator(
+            INodeStatsManager nodeStatsManager,
+            IBlockTree blockTree,
+            IForkInfo forkInfo,
+            INetworkConfig networkConfig,
+            ILogManager logManager
+        )
+        {
+            if (networkConfig.ClientIdMatcher is not null)
+            {
+                _clientIdPattern = new Regex(networkConfig.ClientIdMatcher, RegexOptions.Compiled, ClientIdMatcherTimeout);
+            }
+            _logger = logManager.GetClassLogger<ProtocolValidator>();
+            _nodeStatsManager = nodeStatsManager;
+            _blockTree = blockTree;
+            _forkInfo = forkInfo;
+        }
+
+        public bool ValidateOrDisconnect(string protocol, ISession session, ProtocolInitializedEventArgs eventArgs) => protocol switch
+        {
+            Protocol.P2P => ValidateP2PProtocol(session, eventArgs),
+            Protocol.Sil => (session.Node.ValidatedProtocol = ValidateEthProtocol(session, eventArgs)).Value,
+            _ => true,
+        };
+
+        private bool ValidateP2PProtocol(ISession session, ProtocolInitializedEventArgs eventArgs)
+        {
+            P2PProtocolInitializedEventArgs args = (P2PProtocolInitializedEventArgs)eventArgs;
+            bool valid = ValidateP2PVersion(args.P2PVersion) || Disconnect(session, DisconnectReason.IncompatibleP2PVersion, CompatibilityValidationType.P2PVersion, $"p2p.{args.P2PVersion}");
+            if (!valid) return false;
+
+            try
+            {
+                if (_clientIdPattern?.IsMatch(args.ClientId) == false)
+                {
+                    session.InitiateDisconnect(DisconnectReason.ClientFiltered, $"clientId: {args.ClientId}");
+                    return false;
+                }
+            }
+            catch (RegexMatchTimeoutException)
+            {
+                session.InitiateDisconnect(DisconnectReason.ClientFiltered, "clientId regex timeout");
+                return false;
+            }
+
+            return true;
+        }
+
+        protected virtual bool ValidateEthProtocol(ISession session, ProtocolInitializedEventArgs eventArgs)
+        {
+            SyncPeerProtocolInitializedEventArgs syncPeerArgs = (SyncPeerProtocolInitializedEventArgs)eventArgs;
+            if (!ValidateNetworkId(session, syncPeerArgs.NetworkId))
+                return false;
+
+            if (!ValidateGenesisHash(session, syncPeerArgs))
+                return false;
+
+            if (!MustValidateForkId)
+                return true;
+
+            if (syncPeerArgs.ForkId is null)
+            {
+                return Disconnect(session, DisconnectReason.MissingForkId, CompatibilityValidationType.MissingForkId, "missing fork id");
+            }
+
+            ValidationResult validationResult = _forkInfo.ValidateForkId(syncPeerArgs.ForkId.Value, _blockTree.Head?.Header);
+            if (validationResult != ValidationResult.Valid)
+            {
+                return Disconnect(session, DisconnectReason.InvalidForkId, CompatibilityValidationType.InvalidForkId, $"{validationResult}, network id {syncPeerArgs.NetworkId} fork id {syncPeerArgs.ForkId.Value}");
+            }
+            return true;
+        }
+
+        protected bool ValidateGenesisHash(ISession session, SyncPeerProtocolInitializedEventArgs syncPeerArgs)
+        {
+            if (syncPeerArgs.GenesisHash != _blockTree.Genesis.Hash)
+                return Disconnect(session, DisconnectReason.InvalidGenesis, CompatibilityValidationType.DifferentGenesis, "invalid genesis",
+                    _logger.IsTrace ? $", different genesis hash: {syncPeerArgs.GenesisHash}, our: {_blockTree.Genesis.Hash}" : "");
+            return true;
+        }
+
+        protected bool Disconnect(ISession session, DisconnectReason reason, CompatibilityValidationType type, string details, string traceDetails = "")
+        {
+            if (_logger.IsTrace) _logger.Trace($"Initiating disconnect with peer: {session.RemoteNodeId}, {details}{traceDetails}");
+            _nodeStatsManager.ReportFailedValidation(session.Node, type);
+            session.InitiateDisconnect(reason, details);
+            if (session.Node.IsStatic && _logger.IsWarn) _logger.Warn($"Disconnected an invalid static node: {session.Node.Host}:{session.Node.Port}, reason: {reason} ({details}).");
+            return false;
+        }
+
+        protected static bool ValidateP2PVersion(byte p2PVersion) => p2PVersion is 4 or 5;
+
+        protected bool ValidateNetworkId(ISession session, ulong networkId)
+        {
+            if (networkId != _blockTree.NetworkId)
+                return Disconnect(session, DisconnectReason.InvalidNetworkId, CompatibilityValidationType.NetworkId, $"invalid network id - {networkId}",
+                    _logger.IsTrace ? $", different networkId: {BlockchainIds.GetBlockchainName(networkId)}, our networkId: {BlockchainIds.GetBlockchainName(_blockTree.NetworkId)}" : "");
+            return true;
+        }
+    }
+}

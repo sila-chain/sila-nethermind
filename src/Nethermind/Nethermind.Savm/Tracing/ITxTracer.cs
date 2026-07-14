@@ -1,0 +1,447 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Savm.Tracing.State;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Int256;
+
+namespace Nethermind.Savm.Tracing;
+
+public interface ITxTracer : IWorldStateTracer, IDisposable
+{
+    bool IsCancelable => false;
+    bool IsCancelled => false;
+    /// <summary>
+    /// Defines whether MarkAsSuccess or MarkAsFailed will be called
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="MarkAsSuccess"/>
+    /// - <see cref="MarkAsFailed"/>
+    /// </remarks>
+    bool IsTracingReceipt { get; }
+
+    /// <summary>
+    /// High level calls with information on the target account
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="ReportSelfDestruct"/>
+    /// - <see cref="ReportAction"/>
+    /// - <see cref="ReportActionEnd"/>
+    /// - <see cref="ReportActionError"/>
+    /// </remarks>
+    bool IsTracingActions { get; }
+
+    /// <summary>
+    /// SSTORE and SLOAD level storage operations
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="SetOperationStorage"/>
+    /// - <see cref="LoadOperationStorage"/>
+    /// - <see cref="LoadOperationTransientStorage"/>
+    /// - <see cref="SetOperationTransientStorage"/>
+    /// </remarks>
+    bool IsTracingOpLevelStorage { get; }
+
+    /// <summary>
+    /// SAVM memory access operations
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="SetOperationMemory"/>
+    /// - <see cref="SetOperationMemorySize"/>
+    /// </remarks>
+    bool IsTracingMemory { get; }
+
+    /// <summary>
+    /// SAVM instructions
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="StartOperation"/>
+    /// - <see cref="ReportOperationError"/>
+    /// - <see cref="ReportOperationRemainingGas"/>
+    /// - <see cref="ReportStackPush"/>
+    /// - <see cref="ReportMemoryChange"/>
+    /// - <see cref="ReportGasUpdateForVmTrace"/>
+    /// </remarks>
+    bool IsTracingInstructions { get; }
+
+    /// <summary>
+    /// Updates of refund counter
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="ReportRefund"/>
+    /// - <see cref="ReportExtraGasPressure"/>
+    /// </remarks>
+    bool IsTracingRefunds { get; }
+
+    /// <summary>
+    /// Per-opcode return-data buffer (the output of the most recent inner call/create).
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="SetOperationReturnData"/>
+    /// </remarks>
+    bool IsTracingReturnData { get; }
+
+    /// <summary>
+    /// Code deployment
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="ReportByteCode"/>
+    /// </remarks>
+    bool IsTracingCode { get; }
+
+    /// <summary>
+    /// SAVM stack tracing after each operation
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="SetOperationStack"/>
+    /// </remarks>
+    bool IsTracingStack { get; }
+
+    /// <summary>
+    /// Traces blockhash calls
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="ReportBlockHash"/>
+    /// </remarks>
+    bool IsTracingBlockHash { get; }
+
+    /// <summary>
+    /// Traces storage access
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="ReportAccess"/>
+    /// </remarks>
+    bool IsTracingAccess { get; }
+
+    /// <summary>
+    /// Traces fees and burned fees
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="ReportFees"/>
+    /// </remarks>
+    bool IsTracingFees { get; }
+
+    /// <summary>
+    /// Traces operation logs
+    /// </summary>
+    /// <remarks>
+    /// Controls
+    /// - <see cref="ReportLog"/>
+    /// </remarks>
+    bool IsTracingLogs { get; }
+
+    bool IsTracing => IsTracingReceipt
+                      || IsTracingActions
+                      || IsTracingOpLevelStorage
+                      || IsTracingMemory
+                      || IsTracingInstructions
+                      || IsTracingRefunds
+                      || IsTracingReturnData
+                      || IsTracingCode
+                      || IsTracingStack
+                      || IsTracingBlockHash
+                      || IsTracingAccess
+                      || IsTracingFees
+                      || IsTracingLogs;
+
+    /// <summary>
+    /// Transaction completed successfully
+    /// </summary>
+    /// <param name="recipient">Transaction recipient</param>
+    /// <param name="gasSpent">Gas spent on transaction execution</param>
+    /// <param name="output">Output of transaction</param>
+    /// <param name="logs">Logs for transaction</param>
+    /// <param name="stateRoot">State root after transaction, depends on SIP-658</param>
+    /// <remarks>Depends on <see cref="IsTracingReceipt"/></remarks>
+    void MarkAsSuccess(Address recipient, in GasConsumed gasSpent, byte[] output, LogEntry[] logs, Hash256? stateRoot = null);
+
+    /// <summary>
+    /// Transaction failed
+    /// </summary>
+    /// <param name="recipient">Transaction recipient</param>
+    /// <param name="gasSpent">Gas spent on transaction execution</param>
+    /// <param name="output">Output of transaction</param>
+    /// <param name="error">Error that failed the transaction</param>
+    /// <param name="stateRoot">State root after transaction, depends on SIP-658</param>
+    /// <remarks>Depends on <see cref="IsTracingReceipt"/></remarks>
+    void MarkAsFailed(Address recipient, in GasConsumed gasSpent, byte[] output, string? error, Hash256? stateRoot = null);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="pc"></param>
+    /// <param name="opcode"></param>
+    /// <param name="gas"></param>
+    /// <param name="env"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void StartOperation(int pc, Instruction opcode, ulong gas, in ExecutionEnvironment env);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="error"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportOperationError(SavmExceptionType error);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="gas"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportOperationRemainingGas(ulong gas);
+
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="log"></param>
+    /// <remarks>Depends on <see cref="IsTracingLogs"/></remarks>
+    void ReportLog(LogEntry log);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="stack"></param>
+    /// <remarks>Depends on <see cref="IsTracingStack"/></remarks>
+    void SetOperationStack(TraceStack stack);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="stackItem"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportStackPush(in ReadOnlySpan<byte> stackItem);
+
+    /// <summary>
+    /// </summary>
+    /// <param name="stackItem"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportStackPush(byte stackItem) => ReportStackPush(new[] { stackItem });
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="stackItem"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportStackPush(in ZeroPaddedSpan stackItem) => ReportStackPush(stackItem.ToArray().AsSpan());
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="memoryTrace"></param>
+    /// <remarks>Depends on <see cref="IsTracingMemory"/></remarks>
+    void SetOperationMemory(TraceMemory memoryTrace);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="newSize"></param>
+    /// <remarks>Depends on <see cref="IsTracingMemory"/></remarks>
+    void SetOperationMemorySize(ulong newSize);
+
+    /// <summary>
+    /// Reports the return-data buffer visible to the current opcode (the output of the most
+    /// recent inner call or create).
+    /// </summary>
+    /// <param name="returnData">The current return-data buffer.</param>
+    /// <remarks>Depends on <see cref="IsTracingReturnData"/></remarks>
+    void SetOperationReturnData(ReadOnlyMemory<byte> returnData);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="offset"></param>
+    /// <param name="data"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportMemoryChange(long offset, in ReadOnlySpan<byte> data);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="offset"></param>
+    /// <param name="data"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportMemoryChange(UInt256 offset, in ReadOnlySpan<byte> data)
+    {
+        if (offset is { u1: <= 0, u2: <= 0, u3: <= 0, u0: <= long.MaxValue })
+        {
+            ReportMemoryChange((long)offset, data);
+        }
+    }
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="offset"></param>
+    /// <param name="data"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportMemoryChange(UInt256 offset, byte data) => ReportMemoryChange(offset, new[] { data });
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="offset"></param>
+    /// <param name="data"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportMemoryChange(UInt256 offset, in ZeroPaddedSpan data) => ReportMemoryChange(offset, data.ToArray());
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="address"></param>
+    /// <param name="storageIndex"></param>
+    /// <param name="newValue"></param>
+    /// <param name="currentValue"></param>
+    /// <remarks>Depends on <see cref="IsTracingOpLevelStorage"/></remarks>
+    void SetOperationStorage(Address address, UInt256 storageIndex, ReadOnlySpan<byte> newValue, ReadOnlySpan<byte> currentValue);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="storageCellAddress"></param>
+    /// <param name="storageIndex"></param>
+    /// <param name="newValue"></param>
+    /// <param name="currentValue"></param>
+    /// <remarks>Depends on <see cref="IsTracingOpLevelStorage"/></remarks>
+    void SetOperationTransientStorage(Address storageCellAddress, UInt256 storageIndex, ReadOnlySpan<byte> newValue, ReadOnlySpan<byte> currentValue) { }
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="address"></param>
+    /// <param name="storageIndex"></param>
+    /// <param name="value"></param>
+    /// <remarks>Depends on <see cref="IsTracingOpLevelStorage"/></remarks>
+    void LoadOperationStorage(Address address, UInt256 storageIndex, ReadOnlySpan<byte> value);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="storageCellAddress"></param>
+    /// <param name="storageIndex"></param>
+    /// <param name="value"></param>
+    /// <remarks>Depends on <see cref="IsTracingOpLevelStorage"/></remarks>
+    void LoadOperationTransientStorage(Address storageCellAddress, UInt256 storageIndex, ReadOnlySpan<byte> value) { }
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="address"></param>
+    /// <param name="balance"></param>
+    /// <param name="refundAddress"></param>
+    /// <remarks>Depends on <see cref="IsTracingActions"/></remarks>
+    void ReportSelfDestruct(Address address, UInt256 balance, Address refundAddress);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="gas"></param>
+    /// <param name="value"></param>
+    /// <param name="from"></param>
+    /// <param name="to"></param>
+    /// <param name="input"></param>
+    /// <param name="callType"></param>
+    /// <param name="isPrecompileCall"></param>
+    /// <remarks>Depends on <see cref="IsTracingActions"/></remarks>
+    void ReportAction(ulong gas, UInt256 value, Address from, Address to, ReadOnlyMemory<byte> input, ExecutionType callType, bool isPrecompileCall = false);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="gas"></param>
+    /// <param name="output"></param>
+    /// <remarks>Depends on <see cref="IsTracingActions"/></remarks>
+    void ReportActionEnd(ulong gas, ReadOnlyMemory<byte> output);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="gasLeft"></param>
+    /// <param name="output"></param>
+    /// <remarks>Depends on <see cref="IsTracingActions"/></remarks>
+    void ReportActionRevert(ulong gasLeft, ReadOnlyMemory<byte> output);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="savmExceptionType"></param>
+    /// <remarks>Depends on <see cref="IsTracingActions"/></remarks>
+    void ReportActionError(SavmExceptionType savmExceptionType);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="gas"></param>
+    /// <param name="deploymentAddress"></param>
+    /// <param name="deployedCode"></param>
+    /// <remarks>Depends on <see cref="IsTracingActions"/></remarks>
+    void ReportActionEnd(ulong gas, Address deploymentAddress, ReadOnlyMemory<byte> deployedCode);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="blockHash"></param>
+    /// <remarks>Depends on <see cref="IsTracingBlockHash"/></remarks>
+    void ReportBlockHash(Hash256 blockHash);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="byteCode"></param>
+    /// <remarks>Depends on <see cref="IsTracingCode"/></remarks>
+    void ReportByteCode(ReadOnlyMemory<byte> byteCode);
+
+    /// <summary>
+    /// Special case for VM trace in Parity but we consider removing support for it
+    /// </summary>
+    /// <param name="refund"></param>
+    /// <param name="gasAvailable"></param>
+    /// <remarks>Depends on <see cref="IsTracingInstructions"/></remarks>
+    void ReportGasUpdateForVmTrace(ulong refund, ulong gasAvailable);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="refund"></param>
+    /// <remarks>Depends on <see cref="IsTracingRefunds"/></remarks>
+    void ReportRefund(long refund);
+
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name="extraGasPressure"></param>
+    /// <remarks>Depends on <see cref="IsTracingRefunds"/></remarks>
+    void ReportExtraGasPressure(ulong extraGasPressure);
+
+    /// <summary>
+    /// Reports access to storage cell
+    /// </summary>
+    /// <param name="accessedAddresses">address</param>
+    /// <param name="accessedStorageCells">cell</param>
+    /// <remarks>Depends on <see cref="IsTracingAccess"/></remarks>
+    void ReportAccess(IEnumerable<Address> accessedAddresses, IEnumerable<StorageCell> accessedStorageCells);
+
+    /// <summary>
+    /// Reports fees of a transaction
+    /// </summary>
+    /// <param name="fees">Fees sent to block author</param>
+    /// <param name="burntFees">SIP-1559 burnt fees</param>
+    /// <remarks>Depends on <see cref="IsTracingFees"/></remarks>
+    void ReportFees(UInt256 fees, UInt256 burntFees);
+}

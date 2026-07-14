@@ -1,0 +1,231 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Nethermind.Blockchain.Find;
+using Nethermind.Config;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Specs;
+using Nethermind.Int256;
+using Nethermind.Logging;
+
+namespace Nethermind.JsonRpc.Modules.Sil.GasPrice
+{
+    public class GasPriceOracle(
+        IBlockFinder blockFinder,
+        ISpecProvider specProvider,
+        ILogManager logManager,
+        UInt256? minGasPrice = null) : IGasPriceOracle
+    {
+        protected readonly IBlockFinder _blockFinder = blockFinder;
+        protected readonly ILogger _logger = logManager.GetClassLogger<GasPriceOracle>();
+        protected readonly UInt256 _minGasPrice = minGasPrice ?? new BlocksConfig().MinGasPrice;
+        protected internal PriceCache _gasPriceEstimation;
+        protected internal PriceCache _maxPriorityFeePerGasEstimation;
+        private UInt256 FallbackGasPrice(in UInt256? baseFeePerGas = null) => _gasPriceEstimation.LastPrice ?? GetMinimumGasPrice(baseFeePerGas ?? UInt256.Zero);
+        protected ISpecProvider SpecProvider { get; } = specProvider;
+        internal UInt256 IgnoreUnder { get; init; } = SilGasPriceConstants.DefaultIgnoreUnder;
+        internal int BlockLimit { get; init; } = SilGasPriceConstants.DefaultBlocksLimit;
+        private int SoftTxThreshold => BlockLimit * 2;
+        private readonly UInt256 _defaultMinGasPriceMultiplier = 110;
+
+        public virtual ValueTask<UInt256> GetGasPriceEstimate()
+        {
+            Block? headBlock = _blockFinder.Head;
+            if (headBlock is null)
+            {
+                return ValueTask.FromResult(FallbackGasPrice());
+            }
+
+            Hash256 headBlockHash = headBlock.Hash!;
+            if (_gasPriceEstimation.TryGetPrice(headBlockHash, out UInt256? price))
+            {
+                return ValueTask.FromResult(price!.Value);
+            }
+
+            IEnumerable<UInt256> txGasPrices = GetGasPricesFromRecentBlocks(headBlock.Number);
+            UInt256 gasPriceEstimate = GetGasPriceAtPercentile(txGasPrices.ToList()) ?? GetMinimumGasPrice(headBlock.BaseFeePerGas);
+            gasPriceEstimate = UInt256.Min(gasPriceEstimate!, SilGasPriceConstants.MaxGasPrice);
+            _gasPriceEstimation.Set(headBlockHash, gasPriceEstimate);
+            return ValueTask.FromResult(gasPriceEstimate!);
+        }
+
+        internal IEnumerable<UInt256> GetGasPricesFromRecentBlocks(ulong blockNumber) =>
+            GetGasPricesFromRecentBlocks(blockNumber, BlockLimit,
+            static (transaction, sip1559Enabled, baseFee) => transaction.CalculateEffectiveGasPrice(sip1559Enabled, baseFee));
+
+        public virtual UInt256 GetMaxPriorityGasFeeEstimate()
+        {
+            Block? headBlock = _blockFinder.Head;
+            if (headBlock is null)
+            {
+                return SilGasPriceConstants.FallbackMaxPriorityFeePerGas;
+            }
+
+            Hash256 headBlockHash = headBlock.Hash!;
+            if (_maxPriorityFeePerGasEstimation.TryGetPrice(headBlockHash, out UInt256? price))
+            {
+                return price!.Value;
+            }
+
+            IEnumerable<UInt256> gasPricesWithFee = GetGasPricesFromRecentBlocks(headBlock.Number,
+                SilGasPriceConstants.DefaultBlocksLimitMaxPriorityFeePerGas,
+                static (transaction, sip1559Enabled, baseFee) => transaction.CalculateMaxPriorityFeePerGas(sip1559Enabled, baseFee));
+
+            UInt256 gasPriceEstimate = GetGasPriceAtPercentile(gasPricesWithFee.ToList()) ?? _maxPriorityFeePerGasEstimation.LastPrice ?? GetMinimumGasPrice(headBlock.BaseFeePerGas);
+            gasPriceEstimate = UInt256.Min(gasPriceEstimate!, SilGasPriceConstants.MaxGasPrice);
+            _maxPriorityFeePerGasEstimation.Set(headBlockHash, gasPriceEstimate);
+            return gasPriceEstimate!;
+        }
+
+        private UInt256 GetMinimumGasPrice(in UInt256 baseFeePerGas) => (_minGasPrice + baseFeePerGas) * _defaultMinGasPriceMultiplier / 100ul;
+
+        private delegate UInt256 CalculateGas(Transaction transaction, bool sip1559, UInt256 baseFee);
+
+        private IEnumerable<UInt256> GetGasPricesFromRecentBlocks(ulong blockNumber, int numberOfBlocks, CalculateGas calculateGasFromTransaction)
+        {
+            IEnumerable<Block> GetBlocks(ulong currentBlockNumber)
+            {
+                do
+                {
+                    if (_logger.IsTrace) _logger.Trace($"GasPriceOracle - searching for block number {currentBlockNumber}");
+                    yield return _blockFinder.FindBlock(currentBlockNumber)!;
+                } while (currentBlockNumber-- != 0);
+            }
+
+            return GetGasPricesFromRecentBlocks(GetBlocks(blockNumber), numberOfBlocks, calculateGasFromTransaction);
+        }
+
+        private IEnumerable<UInt256> GetGasPricesFromRecentBlocks(IEnumerable<Block> blocks, int blocksToGoBack, CalculateGas calculateGasFromTransaction)
+        {
+            int txCount = 0;
+
+            foreach (Block currentBlock in blocks)
+            {
+                Transaction[] currentBlockTransactions = currentBlock.Transactions;
+                int txFromCurrentBlock = 0;
+                bool sip1559Enabled = SpecProvider.GetSpec(currentBlock.Header).IsSip1559Enabled;
+                UInt256 baseFee = currentBlock.BaseFeePerGas;
+                IEnumerable<UInt256> effectiveGasPrices = currentBlockTransactions.Where(tx => tx.SenderAddress != currentBlock.Beneficiary)
+                        .Select(tx => calculateGasFromTransaction(tx, sip1559Enabled, baseFee))
+                        .Where(g => g >= IgnoreUnder)
+                        .OrderBy(g => g);
+
+                foreach (UInt256 gasPrice in effectiveGasPrices)
+                {
+                    yield return gasPrice;
+                    txFromCurrentBlock++;
+                    txCount++;
+
+                    if (txFromCurrentBlock >= SilGasPriceConstants.TxLimitFromABlock)
+                    {
+                        break;
+                    }
+                }
+
+                if (txFromCurrentBlock == 0)
+                {
+                    blocksToGoBack--;
+                    yield return FallbackGasPrice(currentBlock.BaseFeePerGas);
+                }
+
+                if (txFromCurrentBlock > 1 || txCount + blocksToGoBack >= SoftTxThreshold)
+                {
+                    blocksToGoBack--;
+                }
+
+                if (blocksToGoBack < 1)
+                {
+                    break;
+                }
+            }
+        }
+
+        private static UInt256? GetGasPriceAtPercentile(List<UInt256> txGasPriceList)
+        {
+            int roundedIndex = GetRoundedIndexAtPercentile(txGasPriceList.Count);
+
+            return roundedIndex < 0
+                ? null
+                : SelectKthSmallestInPlace(txGasPriceList, roundedIndex);
+        }
+
+        /// <summary>
+        /// Selects the kth smallest element (0-based) in-place using a Quickselect-style partitioning algorithm.
+        /// This mutates the input list order.
+        /// </summary>
+        internal static UInt256 SelectKthSmallestInPlace(List<UInt256> list, int k)
+        {
+            if ((uint)k >= (uint)list.Count)
+            {
+                throw new ArgumentOutOfRangeException(nameof(k), k, "k must be within [0, list.Count).");
+            }
+
+            int left = 0;
+            int right = list.Count - 1;
+
+            while (true)
+            {
+                if (left == right)
+                {
+                    return list[left];
+                }
+
+                // Deterministic pivot for stable perf/repro (median-of-range).
+                int pivotIndex = left + ((right - left) >> 1);
+                pivotIndex = Partition(list, left, right, pivotIndex, GenericComparer<UInt256>.Default);
+
+                if (k == pivotIndex)
+                {
+                    return list[k];
+                }
+
+                if (k < pivotIndex)
+                {
+                    right = pivotIndex - 1;
+                }
+                else
+                {
+                    left = pivotIndex + 1;
+                }
+            }
+        }
+
+        private static int Partition(List<UInt256> list, int left, int right, int pivotIndex, IComparer<UInt256> comparer)
+        {
+            UInt256 pivotValue = list[pivotIndex];
+            Swap(list, pivotIndex, right);
+
+            int storeIndex = left;
+            for (int i = left; i < right; i++)
+            {
+                if (comparer.Compare(list[i], pivotValue) < 0)
+                {
+                    Swap(list, storeIndex, i);
+                    storeIndex++;
+                }
+            }
+
+            Swap(list, right, storeIndex);
+            return storeIndex;
+        }
+
+        private static void Swap(List<UInt256> list, int a, int b)
+        {
+            if (a == b) return;
+            (list[a], list[b]) = (list[b], list[a]);
+        }
+
+        private static int GetRoundedIndexAtPercentile(int count)
+        {
+            int lastIndex = count - 1;
+            float percentileOfLastIndex = lastIndex * ((float)SilGasPriceConstants.PercentileOfSortedTxs / 100);
+            int roundedIndex = (int)Math.Round(percentileOfLastIndex);
+            return roundedIndex;
+        }
+    }
+}

@@ -1,0 +1,13 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+
+namespace Nethermind.Consensus.Test
+{
+    public class ManualGasLimitCalculator : IGasLimitCalculator
+    {
+        public ulong GasLimit { get; set; }
+        public ulong GetGasLimit(BlockHeader parentHeader, ulong? targetGasLimit = null) => GasLimit;
+    }
+}

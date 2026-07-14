@@ -1,0 +1,156 @@
+// SPDX-FileCopyrightText: 2025 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+using Nethermind.Blockchain.Tracing.GethStyle;
+using Nethermind.Blockchain.Tracing.GethStyle.Custom;
+using Nethermind.Int256;
+using Nethermind.Serialization.Json;
+using NUnit.Framework;
+
+namespace Nethermind.Savm.Test.Tracing;
+
+public class GethLikeTxTraceConverterTests
+{
+    private readonly SilaJsonSerializer _serializer = new();
+
+    [Test]
+    public void Write_null()
+    {
+        string result = _serializer.Serialize((GethLikeTxTrace?)null);
+
+        Assert.That(result, Is.EqualTo("null"));
+    }
+
+    [TestCaseSource(nameof(TraceAndJsonSource))]
+    public void Write_traces(GethLikeTxTrace trace, string json)
+    {
+        string result = _serializer.Serialize(trace);
+
+        Assert.That(JsonElement.DeepEquals(
+            JsonDocument.Parse(result).RootElement,
+            JsonDocument.Parse(json).RootElement),
+            result);
+    }
+
+    [TestCaseSource(nameof(CustomValueTracerResults))]
+    public void Write_custom_tracer_result(object value, string expected)
+    {
+        GethLikeTxTrace trace = new()
+        {
+            CustomTracerResult = new GethLikeCustomTrace { Value = value }
+        };
+
+        string result = _serializer.Serialize(trace);
+
+        Assert.That(JsonElement.DeepEquals(
+            JsonDocument.Parse(result).RootElement,
+            JsonDocument.Parse(expected).RootElement),
+            result);
+    }
+
+    [Test]
+    public void Read_null()
+    {
+        GethLikeTxTrace result = _serializer.Deserialize<GethLikeTxTrace>("null");
+
+        Assert.That(result, Is.Null);
+    }
+
+    [TestCaseSource(nameof(TraceAndJsonSource))]
+    public void Read_traces(GethLikeTxTrace expectedTrace, string json)
+    {
+        GethLikeTxTrace result = _serializer.Deserialize<GethLikeTxTrace>(json);
+
+        AssertTraceEquivalent(result, expectedTrace);
+    }
+
+
+    [TestCaseSource(nameof(CustomValueTracerResults))]
+    public void Read_custom_tracer_result_throws(object expectedValue, string json) => Assert.Throws<JsonException>(() => _serializer.Deserialize<GethLikeTxTrace>(json));
+
+    private void AssertTraceEquivalent(GethLikeTxTrace actual, GethLikeTxTrace expected)
+    {
+        string actualJson = _serializer.Serialize(actual);
+        string expectedJson = _serializer.Serialize(expected);
+        using JsonDocument actualDocument = JsonDocument.Parse(actualJson);
+        using JsonDocument expectedDocument = JsonDocument.Parse(expectedJson);
+
+        Assert.That(JsonElement.DeepEquals(actualDocument.RootElement, expectedDocument.RootElement), actualJson);
+    }
+
+    private static IEnumerable<TestCaseData> TraceAndJsonSource()
+    {
+        yield return new TestCaseData(
+            new GethLikeTxTrace { Gas = 1, ReturnValue = [0x01] },
+            """{ "gas": 1, "failed": false, "returnValue": "0x01", "structLogs": [] }""")
+            .SetName("Gas1_NoEntries");
+        yield return new TestCaseData(
+            new GethLikeTxTrace
+            {
+                Gas = 100,
+                Failed = false,
+                ReturnValue = [0x01, 0x02, 0x03],
+                Entries =
+                [
+                    new()
+                    {
+                        Storage = new Dictionary<UInt256, UInt256>
+                        {
+                            { (UInt256)1, (UInt256)2 },
+                            { (UInt256)3, (UInt256)4 },
+                        },
+                        Memory = (ReadOnlyMemory<byte>?)new byte[64]
+                        {
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6
+                        },
+                        Stack = (ReadOnlyMemory<byte>?)new byte[64]
+                        {
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8
+                        },
+                        Opcode = "STOP",
+                        Gas = 22000,
+                        GasCost = 1,
+                        Depth = 1
+                    }
+                ]
+            },
+            """
+            {
+              "gas" : 100,
+              "failed" : false,
+              "returnValue" : "0x010203",
+              "structLogs" : [ {
+                "pc" : 0,
+                "op" : "STOP",
+                "gas" : 22000,
+                "gasCost" : 1,
+                "depth" : 1,
+                "stack" : [ "0x7", "0x8" ],
+                "memory" : [ "0x0000000000000000000000000000000000000000000000000000000000000005", "0x0000000000000000000000000000000000000000000000000000000000000006" ],
+                "storage" : {
+                  "0x0000000000000000000000000000000000000000000000000000000000000001" : "0x0000000000000000000000000000000000000000000000000000000000000002",
+                  "0x0000000000000000000000000000000000000000000000000000000000000003" : "0x0000000000000000000000000000000000000000000000000000000000000004"
+                }
+              } ]
+            }
+            """)
+            .SetName("Gas100_1Entry");
+    }
+
+    private static IEnumerable<TestCaseData> CustomValueTracerResults()
+    {
+        yield return new TestCaseData(1, "1").SetName("Custom_Int");
+        yield return new TestCaseData("1", "\"1\"").SetName("Custom_String");
+        yield return new TestCaseData(new[] { 1, 2 }, "[1, 2]").SetName("Custom_Array");
+        yield return new TestCaseData(new { a = 1, b = 2 }, "{ \"a\": 1, \"b\": 2 }").SetName("Custom_Object");
+    }
+}

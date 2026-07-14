@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using Nethermind.Core;
+
+namespace Nethermind.Facade.Filters.Topics
+{
+    public abstract class TopicsFilter
+    {
+        public abstract IEnumerable<TopicExpression> Expressions { get; }
+        public abstract bool AcceptsAnyBlock { get; }
+
+        public abstract bool Accepts(LogEntry entry);
+
+        public abstract bool Accepts(ref LogEntryStructRef entry);
+
+        public abstract bool Matches(Bloom bloom);
+
+        public abstract bool Matches(ref BloomStructRef bloom);
+    }
+}

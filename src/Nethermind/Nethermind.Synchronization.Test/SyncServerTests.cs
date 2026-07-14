@@ -1,0 +1,829 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Buffers;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.BlockAccessLists;
+using Nethermind.Blockchain.Receipts;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Consensus;
+using Nethermind.Consensus.Validators;
+using Nethermind.Core;
+using Nethermind.Core.Buffers;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Db;
+using Nethermind.History;
+using Nethermind.Int256;
+using Nethermind.Logging;
+using Nethermind.Merge.Plugin;
+using Nethermind.Merge.Plugin.Handlers;
+using Nethermind.Merge.Plugin.InvalidChainTracker;
+using Nethermind.Specs;
+using Nethermind.Specs.ChainSpecStyle;
+using Nethermind.Specs.Forks;
+using Nethermind.State;
+using Nethermind.Stats.Model;
+using Nethermind.Synchronization.FastSync;
+using Nethermind.Synchronization.ParallelSync;
+using Nethermind.Synchronization.Peers;
+using Nethermind.Trie;
+using Nethermind.Trie.Pruning;
+using NSubstitute;
+using NUnit.Framework;
+using BlockTree = Nethermind.Blockchain.BlockTree;
+
+namespace Nethermind.Synchronization.Test;
+
+// TODO: add tests for new block notification for sil/69
+[Parallelizable(ParallelScope.All)]
+public class SyncServerTests
+{
+    [Test]
+    public void When_finding_hash_it_does_not_load_headers()
+    {
+        Context ctx = new();
+        ctx.BlockTree.FindHash(123).Returns(TestItem.KeccakA);
+        Hash256 result = ctx.SyncServer.FindHash(123)!;
+
+        ctx.BlockTree.DidNotReceive().FindHeader(Arg.Any<ulong>(), Arg.Any<BlockTreeLookupOptions>());
+        ctx.BlockTree.DidNotReceive().FindHeader(Arg.Any<Hash256>(), Arg.Any<BlockTreeLookupOptions>());
+        ctx.BlockTree.DidNotReceive().FindBlock(Arg.Any<Hash256>(), Arg.Any<BlockTreeLookupOptions>());
+        Assert.That(result, Is.EqualTo(TestItem.KeccakA));
+    }
+
+    [Test]
+    public void Does_not_request_peer_refresh_on_known_hints()
+    {
+        Context ctx = new();
+        ctx.BlockTree.IsKnownBlock(1, TestItem.KeccakA).ReturnsForAnyArgs(true);
+        ctx.SyncServer.HintBlock(TestItem.KeccakA, 1, ctx.NodeWhoSentTheBlock);
+        ctx.PeerPool.DidNotReceiveWithAnyArgs().RefreshTotalDifficulty(null!, null!);
+    }
+
+    [Test]
+    public void Requests_peer_refresh_on_unknown_hints()
+    {
+        Context ctx = new();
+        ctx.BlockTree.IsKnownBlock(1, TestItem.KeccakA).ReturnsForAnyArgs(false);
+        ctx.SyncServer.HintBlock(TestItem.KeccakA, 1, ctx.NodeWhoSentTheBlock);
+        ctx.PeerPool.Received().ReceivedWithAnyArgs();
+    }
+
+    [Test]
+    public void When_finding_by_hash_block_info_is_not_loaded()
+    {
+        Context ctx = new();
+        ctx.SyncServer.Find(TestItem.KeccakA);
+        ctx.BlockTree.Received().FindBlock(Arg.Any<Hash256>(), BlockTreeLookupOptions.TotalDifficultyNotNeeded | BlockTreeLookupOptions.ExcludeTxHashes);
+    }
+
+    [TestCase(true, true, true)]
+    [TestCase(false, true, false)]
+    [TestCase(true, false, false)]
+    public void Can_accept_new_valid_blocks(bool sealOk, bool validationOk, bool accepted)
+    {
+        Context ctx = new();
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+
+        ISealValidator sealValidator = sealOk ? Always.Valid : Always.Invalid;
+        IBlockValidator blockValidator = validationOk ? Always.Valid : Always.Invalid;
+        ctx.SyncServer = ctx.CreateSyncServer(localBlockTree, blockValidator, sealValidator);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+
+        if (!accepted)
+        {
+            Assert.Throws<SilSyncException>(() => ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock));
+        }
+        else
+        {
+            ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+        }
+
+        if (accepted)
+        {
+            Assert.That(block.Header, Is.EqualTo(localBlockTree.BestSuggestedHeader));
+        }
+        else
+        {
+            Assert.That(block.Header, Is.Not.EqualTo(localBlockTree.BestSuggestedHeader));
+        }
+    }
+
+    [TestCase(SyncMode.FastSync, false)]
+    [TestCase(SyncMode.StateNodes, false)]
+    [TestCase(SyncMode.Full, true)]
+    public void Should_accept_or_not_blocks_depends_on_sync_mode(SyncMode syncMode, bool expectBlockAccepted)
+    {
+        Context ctx = new();
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        StaticSelector staticSelector = syncMode switch
+        {
+            SyncMode.FastSync => StaticSelector.FastSync,
+            SyncMode.StateNodes => StaticSelector.StateNodesWithFastBlocks,
+            _ => StaticSelector.Full,
+        };
+        ctx.SyncServer = ctx.CreateSyncServer(localBlockTree, syncModeSelector: staticSelector);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+
+        ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+
+        Assert.That(block.Header.Equals(localBlockTree.BestSuggestedHeader), Is.EqualTo(expectBlockAccepted));
+    }
+
+    [Test]
+    public void Terminal_block_with_lower_td_should_not_change_best_suggested_but_should_be_added_to_block_tree()
+    {
+        Context ctx = new();
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        TestSpecProvider testSpecProvider = new(London.Instance)
+        {
+            TerminalTotalDifficulty = 10_000_000,
+        };
+
+        Block newBestLocalBlock = Build.A.Block
+            .WithNumber(localBlockTree.Head!.Number + 1)
+            .WithParent(localBlockTree.Head!).WithDifficulty(10_000_002L).TestObject;
+        localBlockTree.SuggestBlock(newBestLocalBlock);
+
+        PoSSwitcher poSSwitcher = new(
+            new MergeConfig
+            {
+                TerminalTotalDifficulty = $"{testSpecProvider.TerminalTotalDifficulty}"
+            },
+            new TestSyncConfig(),
+            new MemDb(),
+            localBlockTree,
+            testSpecProvider,
+            new ChainSpec(),
+            LimboLogs.Instance);
+        HeaderValidator headerValidator = new(
+            localBlockTree,
+            Always.Valid,
+            testSpecProvider,
+            LimboLogs.Instance);
+
+        MergeHeaderValidator mergeHeaderValidator = new(
+            poSSwitcher,
+            headerValidator,
+            localBlockTree,
+            testSpecProvider,
+            Always.Valid,
+            LimboLogs.Instance);
+        BlockValidator blockValidator = new(
+            Always.Valid,
+            mergeHeaderValidator,
+            Always.Valid,
+            MainnetSpecProvider.Instance,
+            LimboLogs.Instance);
+
+        ctx.SyncServer = new SyncServer(
+            ctx.WorldStateManager,
+            new MemDb(),
+            localBlockTree,
+            NullReceiptStorage.Instance,
+            Substitute.For<IBlockAccessListStore>(),
+            blockValidator,
+            Always.Valid,
+            ctx.PeerPool,
+            StaticSelector.Full,
+            new TestSyncConfig(),
+            Policy.FullGossip,
+            ctx.HistoryPruner,
+            testSpecProvider,
+            LimboLogs.Instance);
+
+        Block? remoteBestBlock = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None);
+
+        ctx.SyncServer.AddNewBlock(remoteBestBlock!, ctx.NodeWhoSentTheBlock);
+        Assert.That(localBlockTree.BestSuggestedHeader!.Hash, Is.EqualTo(newBestLocalBlock.Header.Hash));
+        Assert.That(localBlockTree.FindBlock(remoteBestBlock!.Hash, BlockTreeLookupOptions.None)!.Hash, Is.EqualTo(remoteBestBlock.Hash));
+    }
+
+    [TestCase(10000000)]
+    [TestCase(20000000)]
+    public void Fake_total_difficulty_from_peer_does_not_trick_the_node(long ttd)
+    {
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        Context ctx = CreateMergeContext(9, (UInt256)ttd);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+        block.Header.TotalDifficulty = block.Header.TotalDifficulty * 2;
+
+        ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+        Assert.That(block.Header.Hash, Is.EqualTo(ctx.LocalBlockTree.BestSuggestedHeader!.Hash));
+
+        Block parentBlock = remoteBlockTree.FindBlock(8, BlockTreeLookupOptions.None)!;
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader.TotalDifficulty, Is.EqualTo(parentBlock.TotalDifficulty + block.Difficulty));
+    }
+
+    [TestCase(9000000, true)]
+    [TestCase(9000000, false)]
+    [TestCase(8000010, true)]
+    public void Can_reject_block_POW_block_after_TTD(long ttd, bool sendFakeTd)
+    {
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        Context ctx = CreateMergeContext(9, (UInt256)ttd);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+        ApplyFakeTotalDifficulty(block, sendFakeTd);
+
+        Assert.Throws<SilSyncException>(() => ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock));
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader!.Number, Is.EqualTo(8));
+    }
+
+    [TestCase(9000000, true)]
+    [TestCase(9000000, false)]
+    [TestCase(8000010, true)]
+    public void Post_merge_blocks_wont_be_accepted_by_gossip(long ttd, bool sendFakeTd)
+    {
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        Block postMergeBlock = Build.A.Block
+            .WithDifficulty(0)
+            .WithParent(remoteBlockTree.Head!)
+            .WithTotalDifficulty(remoteBlockTree.Head!.TotalDifficulty)
+            .WithNonce(0u)
+            .TestObject;
+        remoteBlockTree.SuggestBlock(postMergeBlock);
+        Context ctx = CreateMergeContext(9, (UInt256)ttd);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+        ApplyFakeTotalDifficulty(block, sendFakeTd);
+
+        ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader!.Number, Is.EqualTo(8));
+        Assert.That(ctx.LocalBlockTree.FindBlock(postMergeBlock.Hash!, BlockTreeLookupOptions.None), Is.Null);
+    }
+
+    [TestCase(9000010, true, 100)]
+    [TestCase(9000010, false, 100)]
+    [TestCase(9000010, false, 1000000)]
+    [TestCase(9000010, true, 1000000)]
+    public void Can_inject_terminal_block_with_not_higher_td_than_head(long ttd, bool sendFakeTd, long difficulty)
+    {
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        Block terminalBlockWithLowerDifficulty = Build.A.Block
+            .WithDifficulty((UInt256)difficulty)
+            .WithParent(remoteBlockTree.Head!)
+            .WithGasLimit(remoteBlockTree.Head!.GasLimit + 1)
+            .WithTotalDifficulty(remoteBlockTree.Head.TotalDifficulty + (UInt256)difficulty)
+            .TestObject;
+        remoteBlockTree.SuggestBlock(terminalBlockWithLowerDifficulty);
+        Context ctx = CreateMergeContext(10, (UInt256)ttd);
+        Assert.That(terminalBlockWithLowerDifficulty.IsTerminalBlock(ctx.SpecProvider), Is.True);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+        ApplyFakeTotalDifficulty(block, sendFakeTd);
+
+        ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader!.Number, Is.EqualTo(9));
+        Assert.That(ctx.LocalBlockTree.FindBlock(terminalBlockWithLowerDifficulty.Hash!, BlockTreeLookupOptions.None), Is.Not.Null);
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader!.Hash, Is.Not.EqualTo(terminalBlockWithLowerDifficulty.Hash!));
+    }
+
+    [TestCase(9000010, true)]
+    [TestCase(9000010, false)]
+    public void Can_inject_terminal_block_with_higher_td_than_head(long ttd, bool sendFakeTd)
+    {
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        Block terminalBlockWithHigherTotalDifficulty = Build.A.Block
+            .WithDifficulty(1000010)
+            .WithParent(remoteBlockTree.Head!)
+            .WithTotalDifficulty(remoteBlockTree.Head!.TotalDifficulty + 1000010)
+            .TestObject;
+        remoteBlockTree.SuggestBlock(terminalBlockWithHigherTotalDifficulty);
+        Context ctx = CreateMergeContext(10, (UInt256)ttd);
+        Assert.That(terminalBlockWithHigherTotalDifficulty.IsTerminalBlock(ctx.SpecProvider), Is.True);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+        ApplyFakeTotalDifficulty(block, sendFakeTd);
+
+        ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader!.Number, Is.EqualTo(9));
+        Assert.That(ctx.LocalBlockTree.FindBlock(terminalBlockWithHigherTotalDifficulty.Hash!, BlockTreeLookupOptions.None), Is.Not.Null);
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader!.Hash, Is.EqualTo(terminalBlockWithHigherTotalDifficulty.Hash!));
+    }
+
+
+    [TestCase(9000010)]
+    public void PostMerge_block_from_gossip_should_not_override_main_chain(long ttd)
+    {
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        Block poWBlockPostMerge = Build.A.Block
+            .WithDifficulty(1000010)
+            .WithParent(remoteBlockTree.Head!)
+            .WithTotalDifficulty(remoteBlockTree.Head!.TotalDifficulty + 1000010)
+            .TestObject;
+        remoteBlockTree.SuggestBlock(poWBlockPostMerge);
+
+        Context ctx = CreateMergeContext(10, (UInt256)ttd);
+        Block newPostMergeBlock = Build.A.Block
+            .WithDifficulty(0)
+            .WithParent(ctx.LocalBlockTree.Head!)
+            .WithTotalDifficulty(ctx.LocalBlockTree.Head!.TotalDifficulty)
+            .TestObject;
+        ctx.LocalBlockTree.SuggestBlock(newPostMergeBlock);
+        ctx.LocalBlockTree.TryUpdateMainChain(newPostMergeBlock.Header, true, true, preloadedBlocks: new[] { newPostMergeBlock });
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+
+        ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader!.Number, Is.EqualTo(10));
+        Assert.That(ctx.LocalBlockTree.FindBlock(poWBlockPostMerge.Hash!, BlockTreeLookupOptions.None), Is.Not.Null);
+        Assert.That(ctx.LocalBlockTree.BestSuggestedHeader!.Hash, Is.EqualTo(newPostMergeBlock.Hash!));
+        Assert.That(ctx.LocalBlockTree.FindCanonicalBlockInfo(poWBlockPostMerge.Number).BlockHash, Is.Not.EqualTo(poWBlockPostMerge.Hash!));
+    }
+
+
+    private Context CreateMergeContext(int blockTreeChainLength, UInt256 ttd)
+    {
+        Context ctx = new();
+        TestSpecProvider testSpecProvider = new(London.Instance)
+        {
+            TerminalTotalDifficulty = ttd,
+        };
+        Block genesis = Build.A.Block.Genesis.TestObject;
+        BlockTree localBlockTree = Build.A.BlockTree(genesis, testSpecProvider).OfChainLength(blockTreeChainLength).TestObject;
+
+        PoSSwitcher poSSwitcher = new(
+            new MergeConfig
+            {
+                TerminalTotalDifficulty = $"{ttd}"
+            },
+            new TestSyncConfig(),
+            new MemDb(),
+            localBlockTree,
+            testSpecProvider,
+            new ChainSpec(),
+            LimboLogs.Instance);
+        MergeSealer mergeSealer = new(new NethDevSealEngine(), poSSwitcher);
+        MergeSealValidator mergeSealValidator = new(poSSwitcher, Always.Valid);
+        SealEngine sealEngine = new(mergeSealer, mergeSealValidator);
+        HeaderValidator headerValidator = new(
+            localBlockTree,
+            sealEngine,
+            testSpecProvider,
+            LimboLogs.Instance);
+        MergeHeaderValidator mergeHeaderValidator = new(
+            poSSwitcher,
+            headerValidator,
+            localBlockTree,
+            testSpecProvider,
+            Always.Valid,
+            LimboLogs.Instance);
+
+        InvalidChainTracker invalidChainTracker = new(
+            poSSwitcher,
+            localBlockTree,
+            new BlockCacheService(),
+            LimboLogs.Instance);
+        InvalidHeaderInterceptor headerValidatorWithInterceptor = new(
+            mergeHeaderValidator,
+            invalidChainTracker,
+            LimboLogs.Instance);
+        BlockValidator blockValidator = new(
+            Always.Valid,
+            headerValidatorWithInterceptor,
+            Always.Valid,
+            MainnetSpecProvider.Instance,
+            LimboLogs.Instance);
+
+        ctx.SyncServer = new SyncServer(
+            ctx.WorldStateManager,
+            new MemDb(),
+            localBlockTree,
+            NullReceiptStorage.Instance,
+            Substitute.For<IBlockAccessListStore>(),
+            blockValidator,
+            sealEngine,
+            ctx.PeerPool,
+            StaticSelector.Full,
+            new TestSyncConfig(),
+            Policy.FullGossip,
+            ctx.HistoryPruner,
+            testSpecProvider,
+            LimboLogs.Instance);
+        ctx.SpecProvider = testSpecProvider;
+        ctx.LocalBlockTree = localBlockTree;
+
+        return ctx;
+    }
+
+
+    [Test]
+    public void Will_not_reject_block_with_bad_total_diff_but_will_reset_diff_to_null()
+    {
+        Context ctx = new();
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+
+        HeaderValidator headerValidator = new(
+            localBlockTree,
+            Always.Valid,
+            MainnetSpecProvider.Instance,
+            LimboLogs.Instance);
+
+        BlockValidator blockValidator = new(
+            Always.Valid,
+            headerValidator,
+            Always.Valid,
+            MainnetSpecProvider.Instance,
+            LimboLogs.Instance);
+
+        ctx.SyncServer = ctx.CreateSyncServer(localBlockTree, blockValidator);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+        block.Header.TotalDifficulty = block.Header.TotalDifficulty * 2;
+
+        ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+        Assert.That(block.Header.Hash, Is.EqualTo(localBlockTree.BestSuggestedHeader!.Hash));
+
+        Block? parentBlock = remoteBlockTree.FindBlock(8, BlockTreeLookupOptions.None);
+        Assert.That(localBlockTree.BestSuggestedHeader.TotalDifficulty, Is.EqualTo(parentBlock!.TotalDifficulty + block.Difficulty));
+    }
+
+    [Test]
+    public void Rejects_new_old_blocks()
+    {
+        Context ctx = new();
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(600).TestObject;
+
+        ISealValidator sealValidator = Substitute.For<ISealValidator>();
+        ctx.SyncServer = ctx.CreateSyncServer(localBlockTree, sealValidator: sealValidator);
+
+        Block block = remoteBlockTree.FindBlock(9, BlockTreeLookupOptions.None)!;
+
+        ctx.SyncServer.AddNewBlock(block, ctx.NodeWhoSentTheBlock);
+
+        sealValidator.DidNotReceive().ValidateSeal(Arg.Any<BlockHeader>(), Arg.Any<bool>());
+    }
+
+    [Test]
+    public async Task Broadcast_NewBlock_on_arrival()
+    {
+        Context ctx = new();
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        ctx.SyncServer = ctx.CreateSyncServer(localBlockTree);
+
+        ISyncServer remoteServer1 = Substitute.For<ISyncServer>();
+        SyncPeerMock syncPeerMock1 = CreateSyncPeerMock(remoteBlockTree, remoteServer1, TestItem.PublicKeyA);
+        PeerInfo peer1 = new(syncPeerMock1);
+        ISyncServer remoteServer2 = Substitute.For<ISyncServer>();
+        SyncPeerMock syncPeerMock2 = CreateSyncPeerMock(remoteBlockTree, remoteServer2, TestItem.PublicKeyB);
+        PeerInfo peer2 = new(syncPeerMock2);
+        ConfigurePeers(ctx, [peer1, peer2]);
+        ctx.SyncServer.AddNewBlock(remoteBlockTree.Head!, peer1.SyncPeer);
+        ctx.SyncServer.AddNewBlock(remoteBlockTree.Head!, peer2.SyncPeer);
+        await Task.Delay(100); // notifications fire on separate task
+        await Task.WhenAll(syncPeerMock1.Close(), syncPeerMock2.Close());
+        remoteServer1.DidNotReceive().AddNewBlock(remoteBlockTree.Head!, Arg.Any<ISyncPeer>());
+        remoteServer2.Received().AddNewBlock(Arg.Is<Block>(b => b.Hash == remoteBlockTree.Head!.Hash), Arg.Any<ISyncPeer>());
+    }
+
+    [Test]
+    public async Task Skip_known_block()
+    {
+        Context ctx = new();
+        BlockTree blockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        ctx.SyncServer = ctx.CreateSyncServer(blockTree);
+
+        ISyncServer remoteServer1 = Substitute.For<ISyncServer>();
+        SyncPeerMock syncPeerMock1 = CreateSyncPeerMock(blockTree, remoteServer1, TestItem.PublicKeyA);
+        PeerInfo peer1 = new(syncPeerMock1);
+        ISyncServer remoteServer2 = Substitute.For<ISyncServer>();
+        SyncPeerMock syncPeerMock2 = CreateSyncPeerMock(blockTree, remoteServer2, TestItem.PublicKeyB);
+        PeerInfo peer2 = new(syncPeerMock2);
+        ConfigurePeers(ctx, [peer1, peer2]);
+        Block head = blockTree.Head!;
+        ctx.SyncServer.AddNewBlock(head, peer1.SyncPeer);
+        await Task.Delay(100); // notifications fire on separate task
+        await Task.WhenAll(syncPeerMock1.Close(), syncPeerMock2.Close());
+        remoteServer1.DidNotReceive().AddNewBlock(head, Arg.Any<ISyncPeer>());
+        remoteServer2.DidNotReceive().AddNewBlock(head, Arg.Any<ISyncPeer>());
+        Assert.That(blockTree.FindLevel(head.Number)!.BlockInfos.Length, Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Broadcast_NewBlock_on_arrival_to_sqrt_of_peers([Values(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100)] int peerCount)
+    {
+        int expectedPeers = (int)Math.Ceiling(Math.Sqrt(peerCount - 1));
+
+        Context ctx = new();
+        BlockTree remoteBlockTree = Build.A.BlockTree().OfChainLength(10).TestObject;
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(9).TestObject;
+        ctx.SyncServer = ctx.CreateSyncServer(localBlockTree);
+
+        ISyncServer remoteServer = Substitute.For<ISyncServer>();
+        int count = 0;
+        CountdownEvent received = expectedPeers > 0 ? new CountdownEvent(expectedPeers) : null!;
+        remoteServer
+            .When(r => r.AddNewBlock(Arg.Is<Block>(b => b.Hash == remoteBlockTree.Head!.Hash), Arg.Any<ISyncPeer>()))
+            .Do(_ =>
+            {
+                int n = Interlocked.Increment(ref count);
+                if (received is not null && n <= expectedPeers) received.Signal();
+            });
+        PeerInfo[] peers = CreatePeerInfos(peerCount, remoteBlockTree, remoteServer);
+        ConfigurePeers(ctx, peers);
+        ctx.SyncServer.AddNewBlock(remoteBlockTree.Head!, peers[0].SyncPeer);
+
+        if (received is not null)
+        {
+            Assert.That(received.Wait(TimeSpan.FromSeconds(30)), Is.True, "Broadcast did not reach all expected peers");
+        }
+        Assert.That(count, Is.EqualTo(expectedPeers));
+        await CloseSyncPeerMocks(peers);
+    }
+
+    [Test]
+    [Parallelizable(ParallelScope.None)]
+    public void Broadcast_BlockRangeUpdate_when_latest_increased_enough()
+    {
+        Context ctx = new();
+
+        const int frequency = 32;
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(1).TestObject;
+
+        ctx.SyncServer = ctx.CreateSyncServer(localBlockTree);
+
+        PeerInfo[] peers = Enumerable.Range(0, 3)
+            .Select(_ => Substitute.For<ISyncPeer>())
+            .Select(p => new PeerInfo(p))
+            .ToArray();
+
+        const int blocksCount = 100;
+        int startBlock = (int)localBlockTree.Head!.Number;
+
+        // Older in-flight range broadcasts are cancelled as the head advances, so intermediate updates
+        // may be coalesced away; only the latest range is guaranteed to reach every peer.
+        ulong genesisNumber = localBlockTree.Genesis!.Number;
+        // AddBranch adds blocks up to branchLength - 1, so the highest head is blocksCount - 1, not blocksCount.
+        ulong finalLatest = (ulong)Enumerable.Range(startBlock + 1, blocksCount - 1).Last(x => x % frequency == 0);
+
+        ManualResetEventSlim[] perPeerFinalRange = peers.Select(_ => new ManualResetEventSlim(false)).ToArray();
+        for (int i = 0; i < peers.Length; i++)
+        {
+            int idx = i;
+            peers[i].SyncPeer
+                .When(p => p.NotifyOfNewRange(Arg.Any<BlockHeader>(), Arg.Any<BlockHeader>()))
+                .Do(call =>
+                {
+                    if (call.ArgAt<BlockHeader>(0).Number == genesisNumber &&
+                        call.ArgAt<BlockHeader>(1).Number == finalLatest)
+                        perPeerFinalRange[idx].Set();
+                });
+        }
+
+        ConfigurePeers(ctx, peers);
+
+        localBlockTree.AddBranch(blocksCount / 3, splitBlockNumber: startBlock, splitVariant: 0);
+        localBlockTree.AddBranch(blocksCount * 2 / 3, splitBlockNumber: startBlock, splitVariant: 0);
+        localBlockTree.AddBranch(blocksCount, splitBlockNumber: startBlock, splitVariant: 0);
+
+        for (int i = 0; i < peers.Length; i++)
+        {
+            Assert.That(perPeerFinalRange[i].Wait(TimeSpan.FromSeconds(30)), Is.True,
+                $"Peer {i} was not notified of the latest block range (genesis -> {finalLatest})");
+        }
+    }
+
+    [Test]
+    public void GetNodeData_returns_cached_trie_nodes()
+    {
+        Context ctx = new();
+        BlockTree localBlockTree = Build.A.BlockTree().OfChainLength(600).TestObject;
+        MemDb stateDb = new();
+        TrieStore trieStore = TestTrieStoreFactory.Build(stateDb, Prune.WhenCacheReaches(10.MB), NoPersistence.Instance, LimboLogs.Instance);
+
+        IWorldStateManager worldStateManager = Substitute.For<IWorldStateManager>();
+        worldStateManager.HashServer.Returns(trieStore.TrieNodeRlpStore);
+
+        ctx.SyncServer = new SyncServer(
+            worldStateManager,
+            new MemDb(),
+            localBlockTree,
+            NullReceiptStorage.Instance,
+            Substitute.For<IBlockAccessListStore>(),
+            Always.Valid,
+            Always.Valid,
+            ctx.PeerPool,
+            StaticSelector.Full,
+            new TestSyncConfig(),
+            Policy.FullGossip,
+            ctx.HistoryPruner,
+            MainnetSpecProvider.Instance,
+            LimboLogs.Instance);
+
+        Hash256 nodeKey = TestItem.KeccakA;
+        TrieNode node = new(NodeType.Leaf, nodeKey, TestItem.KeccakB.Bytes);
+        IScopedTrieStore scopedTrieStore = trieStore.GetTrieStore(null);
+        using (IBlockCommitter _ = trieStore.BeginBlockCommit(1))
+        {
+            using ICommitter committer = scopedTrieStore.BeginCommit(node);
+            TreePath path = TreePath.Empty;
+            committer.CommitNode(ref path, node);
+        }
+
+        Assert.That(stateDb.KeyExists(nodeKey), Is.False);
+        using IByteArrayList nodeData = ctx.SyncServer.GetNodeData(new[] { nodeKey }, CancellationToken.None, NodeDataType.All);
+        Assert.That(nodeData.Count, Is.EqualTo(1));
+        Assert.That(nodeData[0].ToArray(), Is.EqualTo(TestItem.KeccakB.BytesToArray()));
+    }
+
+    [Test]
+    public void Correctly_clips_lowestBlock()
+    {
+        Context ctx = new();
+        ctx.BlockTree.GetLowestBlock().Returns(5UL);
+        Assert.That(ctx.SyncServer.LowestBlock, Is.EqualTo(0));
+    }
+
+    private static SyncPeerMock CreateSyncPeerMock(
+        BlockTree blockTree,
+        ISyncServer remoteServer,
+        PublicKey remotePublicKey) =>
+        new(blockTree, remoteSyncServer: remoteServer, remotePublicKey: remotePublicKey);
+
+    private static PeerInfo[] CreatePeerInfos(int peerCount, BlockTree blockTree, ISyncServer remoteServer)
+    {
+        PeerInfo[] peers = new PeerInfo[peerCount];
+        for (int i = 0; i < peers.Length; i++)
+        {
+            peers[i] = new PeerInfo(new SyncPeerMock(blockTree, remoteSyncServer: remoteServer));
+        }
+
+        return peers;
+    }
+
+    private static void ConfigurePeers(Context ctx, PeerInfo[] peers)
+    {
+        ctx.PeerPool.AllPeers.Returns(peers);
+        ctx.PeerPool.PeerCount.Returns(peers.Length);
+    }
+
+    private static Task CloseSyncPeerMocks(PeerInfo[] peers)
+    {
+        Task[] closeTasks = new Task[peers.Length];
+        for (int i = 0; i < peers.Length; i++)
+        {
+            closeTasks[i] = ((SyncPeerMock)peers[i].SyncPeer).Close();
+        }
+
+        return Task.WhenAll(closeTasks);
+    }
+
+    [TestCaseSource(nameof(BlockAccessListRlpCases))]
+    public void GetBlockAccessListRlp_returns_expected_value(
+        Hash256? blockAccessListHash,
+        byte[]? expectedRlp,
+        bool shouldReadStore)
+    {
+        Context ctx = new();
+        IBlockAccessListStore blockAccessListStore = Substitute.For<IBlockAccessListStore>();
+        BlockHeader header = BuildBlockAccessListHeader(blockAccessListHash);
+
+        ctx.BlockTree.FindHeader(TestItem.KeccakA, BlockTreeLookupOptions.TotalDifficultyNotNeeded).Returns(header);
+        if (shouldReadStore)
+        {
+            blockAccessListStore.GetRlp(header.Number, TestItem.KeccakA).Returns(ArrayMemoryManager.From(expectedRlp));
+        }
+
+        SyncServer syncServer = ctx.CreateSyncServer(blockAccessListStore);
+
+        using MemoryManager<byte>? actualRlp = syncServer.GetBlockAccessListRlp(TestItem.KeccakA);
+        if (expectedRlp is null)
+        {
+            Assert.That(actualRlp, Is.Null);
+        }
+        else
+        {
+            Assert.That(actualRlp!.Memory.ToArray(), Is.EqualTo(expectedRlp));
+        }
+
+        if (shouldReadStore)
+        {
+            blockAccessListStore.Received(1).GetRlp(header.Number, TestItem.KeccakA);
+        }
+        else
+        {
+            blockAccessListStore.DidNotReceive().GetRlp(Arg.Any<ulong>(), Arg.Any<Hash256>());
+        }
+    }
+
+    private static TestCaseData[] BlockAccessListRlpCases =>
+    [
+        new TestCaseData(null, null, false)
+            .SetName("GetBlockAccessListRlp_returns_null_for_pre_sip7928_blocks_without_touching_store"),
+        new TestCaseData(TestItem.KeccakB, new byte[] { 0xc1, 0x80 }, true)
+            .SetName("GetBlockAccessListRlp_reads_store_for_sip7928_blocks")
+    ];
+
+    private static BlockHeader BuildBlockAccessListHeader(Hash256? blockAccessListHash) =>
+        Build.A.BlockHeader
+            .WithHash(TestItem.KeccakA)
+            .WithBlockAccessListHash(blockAccessListHash)
+            .TestObject;
+
+    private static void ApplyFakeTotalDifficulty(Block block, bool sendFakeTd)
+    {
+        if (sendFakeTd)
+        {
+            block.Header.TotalDifficulty = block.Header.TotalDifficulty * 2;
+        }
+    }
+
+    private class Context
+    {
+        public Context()
+        {
+            NodeWhoSentTheBlock = Substitute.For<ISyncPeer>();
+            NodeWhoSentTheBlock.Node.Returns(new Node(TestItem.PublicKeyA, "127.0.0.1", 30303));
+            PeerPool = Substitute.For<ISyncPeerPool>();
+
+            BlockTree = Substitute.For<IBlockTree>();
+            WorldStateManager = Substitute.For<IWorldStateManager>();
+            HistoryPruner = Substitute.For<IHistoryPruner>();
+
+            StaticSelector selector = StaticSelector.Full;
+            SyncServer = new SyncServer(
+                WorldStateManager,
+                new MemDb(),
+                BlockTree,
+                NullReceiptStorage.Instance,
+                Substitute.For<IBlockAccessListStore>(),
+                Always.Valid,
+                Always.Valid,
+                PeerPool,
+                selector,
+                new TestSyncConfig(),
+                Policy.FullGossip,
+                HistoryPruner,
+                MainnetSpecProvider.Instance,
+                LimboLogs.Instance);
+        }
+
+        public IBlockTree BlockTree { get; }
+        public IHistoryPruner HistoryPruner { get; }
+        public IWorldStateManager WorldStateManager { get; }
+        public ISyncPeerPool PeerPool { get; }
+        public SyncServer SyncServer { get; set; }
+        public ISpecProvider SpecProvider { get; set; } = null!;
+
+        public IBlockTree LocalBlockTree { get; set; } = null!;
+        public ISyncPeer NodeWhoSentTheBlock { get; }
+
+        public SyncServer CreateSyncServer(
+            IBlockTree localBlockTree,
+            IBlockValidator? blockValidator = null,
+            ISealValidator? sealValidator = null,
+            ISyncModeSelector? syncModeSelector = null,
+            ISpecProvider? specProvider = null) =>
+            new(
+                WorldStateManager,
+                new MemDb(),
+                localBlockTree,
+                NullReceiptStorage.Instance,
+                Substitute.For<IBlockAccessListStore>(),
+                blockValidator ?? Always.Valid,
+                sealValidator ?? Always.Valid,
+                PeerPool,
+                syncModeSelector ?? StaticSelector.Full,
+                new TestSyncConfig(),
+                Policy.FullGossip,
+                HistoryPruner,
+                specProvider ?? MainnetSpecProvider.Instance,
+                LimboLogs.Instance);
+
+        public SyncServer CreateSyncServer(IBlockAccessListStore blockAccessListStore) =>
+            new(
+                WorldStateManager,
+                new MemDb(),
+                BlockTree,
+                NullReceiptStorage.Instance,
+                blockAccessListStore,
+                Always.Valid,
+                Always.Valid,
+                PeerPool,
+                StaticSelector.Full,
+                new TestSyncConfig(),
+                Policy.FullGossip,
+                HistoryPruner,
+                MainnetSpecProvider.Instance,
+                LimboLogs.Instance);
+    }
+}

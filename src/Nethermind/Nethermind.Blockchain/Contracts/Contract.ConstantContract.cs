@@ -1,0 +1,111 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Abi;
+using Nethermind.Core;
+using Nethermind.Savm.TransactionProcessing;
+
+namespace Nethermind.Blockchain.Contracts
+{
+    public partial class Contract
+    {
+        private const ulong DefaultConstantContractGasLimit = 50_000_000UL;
+
+        /// <summary>
+        /// Gets constant version of the contract. Allowing to call contract methods without state modification.
+        /// </summary>
+        /// <param name="readOnlyTxProcessorSource">Source of readonly <see cref="ITransactionProcessor"/> to call transactions.</param>
+        /// <returns>Constant version of the contract.</returns>
+        protected IConstantContract GetConstant(IReadOnlyTxProcessorSource readOnlyTxProcessorSource) =>
+            new ConstantContract(this, readOnlyTxProcessorSource);
+
+        protected interface IConstantContract
+        {
+            public object[] Call(CallInfo callInfo);
+
+            public T Call<T>(CallInfo callInfo) => (T)Call(callInfo)[0];
+
+            public (T1, T2) Call<T1, T2>(CallInfo callInfo)
+            {
+                object[] objects = Call(callInfo);
+                return ((T1)objects[0], (T2)objects[1]);
+            }
+
+            public T Call<T>(BlockHeader parentHeader, string functionName, Address sender, params object[] arguments) =>
+                Call<T>(new CallInfo(parentHeader, functionName, sender, arguments));
+
+            public (T1, T2) Call<T1, T2>(BlockHeader parentHeader, string functionName, Address sender, params object[] arguments) =>
+                Call<T1, T2>(new CallInfo(parentHeader, functionName, sender, arguments));
+
+            public T Call<T>(BlockHeader parentHeader, Address contractAddress, string functionName, Address sender, params object[] arguments) =>
+                Call<T>(new CallInfo(parentHeader, functionName, sender, arguments) { ContractAddress = contractAddress });
+
+            public (T1, T2) Call<T1, T2>(BlockHeader parentHeader, Address contractAddress, string functionName, Address sender, params object[] arguments) =>
+                Call<T1, T2>(new CallInfo(parentHeader, functionName, sender, arguments) { ContractAddress = contractAddress });
+        }
+
+        protected abstract class ConstantContractBase(Contract contract) : IConstantContract
+        {
+            protected readonly Contract _contract = contract;
+
+            protected Transaction GenerateTransaction(CallInfo callInfo) =>
+                _contract.GenerateTransaction<SystemTransaction>(callInfo.ContractAddress, callInfo.FunctionName, callInfo.Sender, DefaultConstantContractGasLimit, callInfo.ParentHeader, callInfo.Arguments);
+
+            protected byte[] CallCore(CallInfo callInfo, ITransactionProcessor readOnlyTransactionProcessor, Transaction transaction) =>
+                _contract.CallCore(readOnlyTransactionProcessor, callInfo.ParentHeader, callInfo.FunctionName, transaction, true);
+
+            protected object[] DecodeReturnData(string functionName, byte[] data) => _contract.DecodeReturnData(functionName, data);
+
+            public abstract object[] Call(CallInfo callInfo);
+        }
+
+        /// <summary>
+        /// Constant version of the contract. Allows to call contract methods without state modification.
+        /// </summary>
+        protected class ConstantContract(Contract contract, IReadOnlyTxProcessorSource readOnlyTxProcessorSource) : ConstantContractBase(contract)
+        {
+            private readonly IReadOnlyTxProcessorSource _readOnlyTxProcessorSource = readOnlyTxProcessorSource ?? throw new ArgumentNullException(nameof(readOnlyTxProcessorSource));
+
+            public override object[] Call(CallInfo callInfo)
+            {
+                lock (_readOnlyTxProcessorSource)
+                {
+                    using IReadOnlyTxProcessingScope scope = _readOnlyTxProcessorSource.Build(callInfo.ParentHeader);
+                    return CallRaw(callInfo, scope);
+                }
+            }
+
+            protected virtual object[] CallRaw(CallInfo callInfo, IReadOnlyTxProcessingScope scope)
+            {
+                Transaction transaction = GenerateTransaction(callInfo);
+                if (_contract.ContractAddress is not null && scope.WorldState.IsContract(_contract.ContractAddress))
+                {
+                    byte[] result = CallCore(callInfo, scope.TransactionProcessor, transaction);
+                    return callInfo.Result = _contract.DecodeReturnData(callInfo.FunctionName, result);
+                }
+                else if (callInfo.MissingContractResult is not null)
+                {
+                    return callInfo.MissingContractResult;
+                }
+                else
+                {
+                    throw new AbiException($"Missing contract on address {_contract.ContractAddress} when calling function {callInfo.FunctionName}.");
+                }
+            }
+        }
+
+        public class CallInfo(BlockHeader parentHeader, string functionName, Address sender, params object[] arguments)
+        {
+            public BlockHeader ParentHeader { get; } = parentHeader;
+            public string FunctionName { get; } = functionName;
+            public Address Sender { get; } = sender;
+            public object[] Arguments { get; } = arguments;
+            public object[]? Result { get; set; }
+            public object[]? MissingContractResult { get; set; }
+            public Address? ContractAddress { get; set; }
+
+            public bool IsDefaultResult => ReferenceEquals(Result, MissingContractResult);
+        }
+    }
+}

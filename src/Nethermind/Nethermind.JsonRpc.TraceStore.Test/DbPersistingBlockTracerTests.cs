@@ -1,0 +1,157 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using Nethermind.Core;
+using Nethermind.Core.Buffers;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Db;
+using Nethermind.Savm;
+using Nethermind.Savm.Tracing;
+using Nethermind.Blockchain.Tracing.ParityStyle;
+using Nethermind.Logging;
+using Nethermind.Serialization.Json;
+using NUnit.Framework;
+using Newtonsoft.Json.Linq;
+
+namespace Nethermind.JsonRpc.TraceStore.Test;
+
+[Parallelizable(ParallelScope.All)]
+public class DbPersistingBlockTracerTests
+{
+    private class Test
+    {
+        public DbPersistingBlockTracer<ParityLikeTxTrace, ParityLikeTxTracer> DbPersistingTracer { get; }
+        public ParityLikeTraceSerializer Serializer { get; }
+        public MemDb Db { get; }
+
+        public Test()
+        {
+            ParityLikeBlockTracer parityTracer = new(ParityTraceTypes.Trace);
+            Db = new();
+            Serializer = new(LimboLogs.Instance);
+            DbPersistingTracer = new(parityTracer, Db, Serializer, LimboLogs.Instance);
+        }
+
+        public (Hash256 hash, List<ParityLikeTxTrace> traces) Trace(Action<ITxTracer>? customTrace = null)
+        {
+            Transaction transaction = Build.A.Transaction.TestObject;
+            Block block = Build.A.Block.WithTransactions(transaction).TestObject;
+            DbPersistingTracer.StartNewBlockTrace(block);
+            ITxTracer txTracer = DbPersistingTracer.StartNewTxTrace(transaction);
+            customTrace?.Invoke(txTracer);
+            DbPersistingTracer.EndTxTrace();
+            DbPersistingTracer.EndBlockTrace();
+            Hash256 hash = block.Hash!;
+            return (hash, Serializer.Deserialize(Db.Get(hash))!);
+        }
+    }
+
+    [Test]
+    public void saves_traces_to_db()
+    {
+        Test test = new();
+        (Hash256 hash, List<ParityLikeTxTrace> traces) = test.Trace(static tracer =>
+            {
+                tracer.ReportAction(100, 50, TestItem.AddressA, TestItem.AddressB, TestItem.RandomDataA, ExecutionType.CALL);
+                tracer.ReportAction(80, 20, TestItem.AddressB, TestItem.AddressC, TestItem.RandomDataC, ExecutionType.CREATE);
+                tracer.ReportActionEnd(60, TestItem.RandomDataD);
+                tracer.ReportActionEnd(50, TestItem.RandomDataB);
+            }
+        );
+
+        SilaJsonSerializer serializer = new();
+        ParityLikeTxTrace[] expected =
+        [
+            new()
+            {
+                BlockHash = hash,
+                TransactionPosition = 0,
+                Action = new ParityTraceAction
+                {
+                    CallType = "call",
+                    From = TestItem.AddressA,
+                    Gas = 100,
+                    IncludeInTrace = true,
+                    Input = TestItem.RandomDataA,
+                    Result = new ParityTraceResult { GasUsed = 50, Output = TestItem.RandomDataB },
+                    To = TestItem.AddressB,
+                    TraceAddress = CappedArray<int>.Empty,
+                    Type = "call",
+                    Value = 50,
+                    Subtraces =
+                    [
+                        new()
+                        {
+                            CallType = "create",
+                            From = TestItem.AddressB,
+                            Gas = 80,
+                            IncludeInTrace = true,
+                            Input = TestItem.RandomDataC,
+                            Result = new ParityTraceResult { GasUsed = 20, Output = TestItem.RandomDataD },
+                            Subtraces = [],
+                            To = TestItem.AddressC,
+                            TraceAddress = new int[] { 0 },
+                            CreationMethod = "create",
+                            Type = "create",
+                            Value = 20
+                        }
+                    ]
+                }
+            }
+        ];
+
+        Assert.That(JToken.Parse(serializer.Serialize(traces)), Is.EqualTo(JToken.Parse(serializer.Serialize(expected))).Using(JToken.EqualityComparer));
+    }
+
+    [TestCase(510)]
+    [TestCase(1020)]
+    [TestCase(1500)]
+    public void check_depth(int depth)
+    {
+        // ParityTraceActionConverter.Read() recurses per nesting level during STJ deserialization.
+        // Windows default 1MB stack overflows at ~600 depth, so run on a thread with 4MB stack.
+        Exception? caught = null;
+        Thread thread = new(() =>
+        {
+            try
+            {
+                Test test = new();
+                (_, List<ParityLikeTxTrace> traces) = test.Trace(tracer =>
+                    {
+                        for (int i = 0; i < depth; i++)
+                        {
+                            tracer.ReportAction(100, 50, TestItem.AddressA, TestItem.AddressB, TestItem.RandomDataA, ExecutionType.CALL);
+                        }
+
+                        for (int i = 0; i < depth; i++)
+                        {
+                            tracer.ReportActionEnd(60, TestItem.RandomDataD);
+                        }
+                    }
+                );
+
+                ParityTraceAction? action = traces.FirstOrDefault()?.Action;
+                int checkedDepth = 0;
+                while (action is not null)
+                {
+                    checkedDepth += 1;
+                    action = action.Subtraces.FirstOrDefault();
+                }
+
+                Assert.That(checkedDepth, Is.EqualTo(depth));
+            }
+            catch (Exception ex)
+            {
+                caught = ex;
+            }
+        }, maxStackSize: 4 * MemorySizes.MiB);
+        thread.Start();
+        thread.Join();
+        if (caught is not null) throw caught;
+    }
+}

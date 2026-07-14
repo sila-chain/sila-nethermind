@@ -1,0 +1,25 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Int256;
+
+namespace Sila.Test.Base
+{
+    public class GeneralStateTestEnvJson
+    {
+        public Address CurrentCoinbase { get; set; }
+        public UInt256 CurrentDifficulty { get; set; }
+        public ulong CurrentGasLimit { get; set; }
+        public ulong CurrentNumber { get; set; }
+        public ulong CurrentTimestamp { get; set; }
+        public UInt256? CurrentBaseFee { get; set; }
+        public Hash256 PreviousHash { get; set; }
+        public Hash256? CurrentRandom { get; set; }
+        public Hash256? CurrentBeaconRoot { get; set; }
+        public Hash256? CurrentWithdrawalsRoot { get; set; }
+        public ulong? CurrentExcessBlobGas { get; set; }
+        public ulong? SlotNumber { get; set; }
+    }
+}

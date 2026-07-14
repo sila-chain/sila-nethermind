@@ -1,0 +1,37 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using BenchmarkDotNet.Attributes;
+using Nethermind.Consensus.Silash;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Logging;
+
+namespace Nethermind.Benchmarks.Mining
+{
+    public class SilashHashimotoBenchmarks
+    {
+        private Silash _silash = new(LimboLogs.Instance);
+
+        private BlockHeader _header;
+
+        private BlockHeader[] _scenarios =
+        {
+            Build.A.BlockHeader.WithNumber(1).WithDifficulty(100).TestObject,
+            Build.A.BlockHeader.WithNumber(1).WithDifficulty(100).TestObject,
+        };
+
+        [Params(0, 1)]
+        public int ScenarioIndex { get; set; }
+
+        [GlobalSetup]
+        public void Setup() => _header = _scenarios[ScenarioIndex];
+
+        [Benchmark]
+        public (Hash256, ulong) Improved() => _silash.Mine(_header, 0UL);
+
+        [Benchmark]
+        public (Hash256, ulong) Current() => _silash.Mine(_header, 0UL);
+    }
+}

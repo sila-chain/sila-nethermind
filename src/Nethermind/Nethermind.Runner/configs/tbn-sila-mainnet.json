@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindSil/core-scripts/refs/heads/main/schemas/config.json",
+  "Init": {
+    "ChainSpecPath": "chainspec/tbn-sila-mainnet.json.zst",
+    "GenesisHash": "0xe222b4b07ee9c885d13ee341823c92aa449f9769ac68fb5f1e1d4e602a990a4a",
+    "BaseDbPath": "nethermind_db/tbn-sila-mainnet",
+    "LogFileName": "tbn-sila-mainnet.log"
+  },
+  "TxPool": {
+    "BlobsSupport": "Disabled"
+  },
+  "Sync": {
+    "FastSync": true,
+    "SnapSync": true
+  },
+  "Discovery": {
+    "DiscoveryVersion": "V5"
+  },
+  "JsonRpc": {
+    "Enabled": true,
+    "Port": 8545,
+    "EnginePort": 8551
+  },
+  "Pruning": {
+    "PruningBoundary": 256
+  },
+  "Blocks": {
+    "SecondsPerSlot": 2
+  },
+  "Merge": {
+    "Enabled": true
+  },
+  "Optimism": {
+    "SequencerUrl": "https://sequencer.bnry.sila-mainnet.zeeve.net"
+  }
+}

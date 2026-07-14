@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core.Crypto;
+using Nethermind.Int256;
+using Nethermind.Network.P2P.Messages;
+
+namespace Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages
+{
+    public class StatusMessage : P2PMessage
+    {
+        public byte ProtocolVersion { get; set; }
+        public ulong NetworkId { get; set; }
+        public UInt256 TotalDifficulty { get; set; }
+        public Hash256? BestHash { get; set; }
+        public Hash256? GenesisHash { get; set; }
+        public ForkId? ForkId { get; set; }
+
+        public override int PacketType => Sil62MessageCode.Status;
+        public override string Protocol => "sil";
+
+        public override string ToString() => $"{Protocol}.{ProtocolVersion} network: {NetworkId} | diff: {TotalDifficulty} | best: {BestHash?.ToShortString()} | genesis: {GenesisHash?.ToShortString()} | fork: {ForkId}";
+    }
+}

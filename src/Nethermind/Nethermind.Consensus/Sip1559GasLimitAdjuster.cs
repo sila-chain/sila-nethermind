@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core.Specs;
+
+namespace Nethermind.Consensus
+{
+    /// <summary>In the 1559 fork block the new gas limit is gasLimit * Sip1559Constants.ElasticityMultiplier.</summary>
+    public static class Sip1559GasLimitAdjuster
+    {
+        public static ulong AdjustGasLimit(IReleaseSpec releaseSpec, ulong gasLimit, ulong blockNumber)
+        {
+            ulong adjustedGasLimit = gasLimit;
+            if (releaseSpec.Sip1559TransitionBlock == blockNumber)
+            {
+                adjustedGasLimit *= releaseSpec.ElasticityMultiplier;
+            }
+
+            return adjustedGasLimit;
+        }
+    }
+}

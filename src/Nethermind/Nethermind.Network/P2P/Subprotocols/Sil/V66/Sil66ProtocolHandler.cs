@@ -1,0 +1,292 @@
+// SPDX-FileCopyrightText: 2025 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Consensus;
+using Nethermind.Consensus.Scheduler;
+using Nethermind.Core;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Logging;
+using Nethermind.Network.Contract.Messages;
+using Nethermind.Network.Contract.P2P;
+using Nethermind.Network.P2P.Messages;
+using Nethermind.Network.P2P.ProtocolHandlers;
+using Nethermind.Network.P2P.Subprotocols.Sil.V65;
+using Nethermind.Network.P2P.Subprotocols.Sil.V65.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V66.Messages;
+using Nethermind.Network.P2P.Utils;
+using Nethermind.Network.Rlpx;
+using Nethermind.Stats;
+using Nethermind.Synchronization;
+using Nethermind.TxPool;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using GetPooledTransactionsMessage = Nethermind.Network.P2P.Subprotocols.Sil.V66.Messages.GetPooledTransactionsMessage;
+using PooledTransactionsMessage = Nethermind.Network.P2P.Subprotocols.Sil.V66.Messages.PooledTransactionsMessage;
+
+namespace Nethermind.Network.P2P.Subprotocols.Sil.V66
+{
+    /// <summary>
+    /// https://github.com/sila-chain/SIPs/blob/master/SIPS/sip-2481.md
+    /// </summary>
+    public class Sil66ProtocolHandler : Sil65ProtocolHandler, IStaticProtocolInfo
+    {
+        private readonly MessageDictionary<GetBlockHeadersMessage, IOwnedReadOnlyList<BlockHeader>> _headersRequests66;
+        private readonly MessageDictionary<GetBlockBodiesMessage, (OwnedBlockBodies, long)> _bodiesRequests66;
+        private readonly MessageDictionary<GetNodeDataMessage, IByteArrayList> _nodeDataRequests66;
+        private readonly MessageDictionary<GetReceiptsMessage, (IOwnedReadOnlyList<TxReceipt[]>, long)> _receiptsRequests66;
+
+        public Sil66ProtocolHandler(ISession session,
+            IMessageSerializationService serializer,
+            INodeStatsManager nodeStatsManager,
+            ISyncServer syncServer,
+            IBackgroundTaskScheduler backgroundTaskScheduler,
+            ITxPool txPool,
+            IGossipPolicy gossipPolicy,
+            IForkInfo forkInfo,
+            ILogManager logManager,
+            ITxGossipPolicy? transactionsGossipPolicy = null)
+            : base(session, serializer, nodeStatsManager, syncServer, backgroundTaskScheduler, txPool, gossipPolicy, forkInfo, logManager, transactionsGossipPolicy)
+        {
+            _headersRequests66 = new MessageDictionary<GetBlockHeadersMessage, IOwnedReadOnlyList<BlockHeader>>(this);
+            _bodiesRequests66 = new MessageDictionary<GetBlockBodiesMessage, (OwnedBlockBodies, long)>(this);
+            _nodeDataRequests66 = new MessageDictionary<GetNodeDataMessage, IByteArrayList>(this);
+            _receiptsRequests66 = new MessageDictionary<GetReceiptsMessage, (IOwnedReadOnlyList<TxReceipt[]>, long)>(this);
+        }
+
+        public override string Name => "sil66";
+
+        public static byte Version => SilVersions.Sil66;
+        public override byte ProtocolVersion => Version;
+
+        protected override bool HandleMessageCore(ZeroPacket message)
+        {
+            int size = message.Content.ReadableBytes;
+
+            switch (message.PacketType)
+            {
+                case Sil66MessageCode.GetBlockHeaders:
+                    HandleInBackground<Sil66ProtocolHandler, GetBlockHeadersMessage, BlockHeadersMessage, GetBlockHeadersHandler>(message);
+                    return true;
+                case Sil66MessageCode.BlockHeaders:
+                    BlockHeadersMessage headersMsg = Deserialize<BlockHeadersMessage>(message.Content);
+                    ReportIn(headersMsg, size);
+                    Handle(headersMsg, size);
+                    return true;
+                case Sil66MessageCode.GetBlockBodies:
+                    HandleInBackground<Sil66ProtocolHandler, GetBlockBodiesMessage, BlockBodiesMessage, GetBlockBodiesHandler>(message);
+                    return true;
+                case Sil66MessageCode.BlockBodies:
+                    BlockBodiesMessage bodiesMsg = Deserialize<BlockBodiesMessage>(message.Content);
+                    ReportIn(bodiesMsg, size);
+                    HandleBodies(bodiesMsg, size);
+                    return true;
+                case Sil66MessageCode.GetPooledTransactions:
+                    HandleInBackground<Sil66ProtocolHandler, GetPooledTransactionsMessage, PooledTransactionsMessage, GetPooledTransactionsHandler>(message);
+                    return true;
+                case Sil66MessageCode.PooledTransactions:
+                    if (CanReceiveTransactions)
+                    {
+                        PooledTransactionsMessage pooledTxMsg = Deserialize<PooledTransactionsMessage>(message.Content);
+                        ReportIn(pooledTxMsg, size);
+                        Handle(pooledTxMsg.SilMessage);
+                    }
+                    else
+                    {
+                        const string ignored = $"{nameof(PooledTransactionsMessage)} ignored, syncing";
+                        ReportIn(ignored, size);
+                    }
+
+                    return true;
+                case Sil66MessageCode.GetReceipts:
+                    HandleInBackground<Sil66ProtocolHandler, GetReceiptsMessage, ReceiptsMessage, GetReceiptsHandler>(message);
+                    return true;
+                case Sil66MessageCode.Receipts:
+                    ReceiptsMessage receiptsMessage = Deserialize<ReceiptsMessage>(message.Content);
+                    ReportIn(receiptsMessage, size);
+                    Handle(receiptsMessage, size);
+                    return true;
+                case Sil66MessageCode.GetNodeData:
+                    HandleInBackground<Sil66ProtocolHandler, GetNodeDataMessage, NodeDataMessage, GetNodeDataHandler>(message);
+                    return true;
+                case Sil66MessageCode.NodeData:
+                    NodeDataMessage nodeDataMessage = Deserialize<NodeDataMessage>(message.Content);
+                    ReportIn(nodeDataMessage, size);
+                    Handle(nodeDataMessage, size);
+                    return true;
+                default:
+                    return base.HandleMessageCore(message);
+            }
+        }
+
+        private async Task<BlockHeadersMessage> Handle(GetBlockHeadersMessage getBlockHeaders, CancellationToken cancellationToken)
+        {
+            using GetBlockHeadersMessage message = getBlockHeaders;
+            V62.Messages.BlockHeadersMessage silBlockHeadersMessage = await FulfillBlockHeadersRequest(message.SilMessage, cancellationToken);
+            return new BlockHeadersMessage(message.RequestId, silBlockHeadersMessage);
+        }
+
+        private async Task<BlockBodiesMessage> Handle(GetBlockBodiesMessage getBlockBodies, CancellationToken cancellationToken)
+        {
+            using GetBlockBodiesMessage message = getBlockBodies;
+            V62.Messages.BlockBodiesMessage silBlockBodiesMessage = await FulfillBlockBodiesRequest(message.SilMessage, cancellationToken);
+            return new BlockBodiesMessage(message.RequestId, silBlockBodiesMessage);
+        }
+
+        private async Task<PooledTransactionsMessage> Handle(GetPooledTransactionsMessage getPooledTransactions, CancellationToken cancellationToken)
+        {
+            using GetPooledTransactionsMessage message = getPooledTransactions;
+            return new PooledTransactionsMessage(message.RequestId,
+                await FulfillPooledTransactionsRequest(message.SilMessage, cancellationToken));
+        }
+
+        protected async Task<ReceiptsMessage> Handle(GetReceiptsMessage getReceiptsMessage, CancellationToken cancellationToken)
+        {
+            using GetReceiptsMessage message = getReceiptsMessage;
+            V63.Messages.ReceiptsMessage receiptsMessage = await FulfillReceiptsRequest(message.SilMessage, cancellationToken);
+            return new ReceiptsMessage(message.RequestId, receiptsMessage);
+        }
+
+        private async Task<NodeDataMessage> Handle(GetNodeDataMessage getNodeDataMessage, CancellationToken cancellationToken)
+        {
+            using GetNodeDataMessage message = getNodeDataMessage;
+            V63.Messages.NodeDataMessage nodeDataMessage = await FulfillNodeDataRequest(message.SilMessage, cancellationToken);
+            return new NodeDataMessage(message.RequestId, nodeDataMessage);
+        }
+
+        private void Handle(BlockHeadersMessage message, long size) => _headersRequests66.Handle(message.RequestId, message.SilMessage.BlockHeaders, size);
+
+        private void HandleBodies(BlockBodiesMessage blockBodiesMessage, long size) => _bodiesRequests66.Handle(blockBodiesMessage.RequestId, (blockBodiesMessage.SilMessage.Bodies, size), size);
+
+        private void Handle(NodeDataMessage msg, int size) => _nodeDataRequests66.Handle(msg.RequestId, msg.SilMessage.Data, size);
+
+        protected void Handle(ReceiptsMessage msg, long size) => _receiptsRequests66.Handle(msg.RequestId, (msg.SilMessage.TxReceipts, size), size);
+
+        protected override void Handle(NewPooledTransactionHashesMessage message) => RequestPooledTransactions<GetPooledTransactionsMessage>(message.Hashes);
+
+
+        protected override async Task<IOwnedReadOnlyList<BlockHeader>> SendRequest(V62.Messages.GetBlockHeadersMessage message, CancellationToken token)
+        {
+            if (Logger.IsTrace)
+            {
+                Logger.Trace($"Sending headers request to {Session.Node:c}:");
+                Logger.Trace($"  Starting blockhash: {message.StartBlockHash}");
+                Logger.Trace($"  Starting number: {message.StartBlockNumber}");
+                Logger.Trace($"  Skip: {message.Skip}");
+                Logger.Trace($"  Reverse: {message.Reverse}");
+                Logger.Trace($"  Max headers: {message.MaxHeaders}");
+            }
+
+            using GetBlockHeadersMessage msg66 = new();
+            msg66.SilMessage = message;
+
+            return await SendRequestGenericEth66(
+                _headersRequests66,
+                msg66,
+                TransferSpeedType.Headers,
+                static (message) => $"{nameof(GetBlockHeadersMessage)} with {message.SilMessage.MaxHeaders} max headers",
+                token);
+        }
+
+        protected override async Task<(OwnedBlockBodies, long)> SendRequest(V62.Messages.GetBlockBodiesMessage message, CancellationToken token)
+        {
+            if (Logger.IsTrace)
+            {
+                Logger.Trace("Sending bodies request:");
+                Logger.Trace($"Blockhashes count: {message.BlockHashes.Count}");
+            }
+
+            using GetBlockBodiesMessage msg66 = new();
+            msg66.SilMessage = message;
+            return await SendRequestGenericEth66(
+                _bodiesRequests66,
+                msg66,
+                TransferSpeedType.Bodies,
+                static (message) => $"{nameof(GetBlockBodiesMessage)} with {message.SilMessage.BlockHashes.Count} block hashes",
+                token);
+        }
+
+        protected override async Task<IByteArrayList> SendRequest(V63.Messages.GetNodeDataMessage message, CancellationToken token)
+        {
+            if (Logger.IsTrace)
+            {
+                Logger.Trace("Sending node data request:");
+                Logger.Trace($"Keys count: {message.Hashes.Count}");
+            }
+
+            using GetNodeDataMessage msg66 = new();
+            msg66.SilMessage = message;
+            return await SendRequestGenericEth66(
+                _nodeDataRequests66,
+                msg66,
+                TransferSpeedType.NodeData,
+                static (_) => $"{nameof(GetNodeDataMessage)}",
+                token);
+        }
+
+        protected override async Task<(IOwnedReadOnlyList<TxReceipt[]>, long)> SendRequest(V63.Messages.GetReceiptsMessage message, CancellationToken token)
+        {
+            if (Logger.IsTrace)
+            {
+                Logger.Trace("Sending receipts request:");
+                Logger.Trace($"Hashes count: {message.Hashes.Count}");
+            }
+
+            using GetReceiptsMessage msg66 = new();
+            msg66.SilMessage = message;
+            return await SendRequestGenericEth66(
+                _receiptsRequests66,
+                msg66,
+                TransferSpeedType.Receipts,
+                static (_) => $"{nameof(GetReceiptsMessage)}",
+                token);
+        }
+
+        private Task<TResponse> SendRequestGenericEth66<T66, TResponse>(
+            MessageDictionary<T66, TResponse> messageQueue,
+            T66 message,
+            TransferSpeedType speedType,
+            Func<T66, string> describeRequestFunc,
+            CancellationToken token
+        )
+            where T66 : P2PMessage, ISil66Message
+        {
+            Request<T66, TResponse> request = new(message);
+            messageQueue.Send(request);
+
+            return HandleResponse(request, speedType, describeRequestFunc, token);
+        }
+
+        public override void HandleMessage(PooledTransactionRequestMessage message)
+        {
+            using ArrayPoolList<Hash256> hashesToRetry = new(1) { new Hash256(message.TxHash) };
+            RequestPooledTransactions<GetPooledTransactionsMessage>(hashesToRetry);
+        }
+
+        private readonly struct GetBlockHeadersHandler : ISyncServeRequestHandler<Sil66ProtocolHandler, GetBlockHeadersMessage, BlockHeadersMessage>
+        {
+            public static Task<BlockHeadersMessage> Execute(Sil66ProtocolHandler handler, GetBlockHeadersMessage request, CancellationToken cancellationToken) => handler.Handle(request, cancellationToken);
+        }
+
+        private readonly struct GetBlockBodiesHandler : ISyncServeRequestHandler<Sil66ProtocolHandler, GetBlockBodiesMessage, BlockBodiesMessage>
+        {
+            public static Task<BlockBodiesMessage> Execute(Sil66ProtocolHandler handler, GetBlockBodiesMessage request, CancellationToken cancellationToken) => handler.Handle(request, cancellationToken);
+        }
+
+        private readonly struct GetPooledTransactionsHandler : ISyncServeRequestHandler<Sil66ProtocolHandler, GetPooledTransactionsMessage, PooledTransactionsMessage>
+        {
+            public static Task<PooledTransactionsMessage> Execute(Sil66ProtocolHandler handler, GetPooledTransactionsMessage request, CancellationToken cancellationToken) => handler.Handle(request, cancellationToken);
+        }
+
+        private readonly struct GetReceiptsHandler : ISyncServeRequestHandler<Sil66ProtocolHandler, GetReceiptsMessage, ReceiptsMessage>
+        {
+            public static Task<ReceiptsMessage> Execute(Sil66ProtocolHandler handler, GetReceiptsMessage request, CancellationToken cancellationToken) => handler.Handle(request, cancellationToken);
+        }
+
+        private readonly struct GetNodeDataHandler : ISyncServeRequestHandler<Sil66ProtocolHandler, GetNodeDataMessage, NodeDataMessage>
+        {
+            public static Task<NodeDataMessage> Execute(Sil66ProtocolHandler handler, GetNodeDataMessage request, CancellationToken cancellationToken) => handler.Handle(request, cancellationToken);
+        }
+    }
+}

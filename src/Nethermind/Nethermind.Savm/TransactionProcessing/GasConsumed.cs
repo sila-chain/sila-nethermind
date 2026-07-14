@@ -1,0 +1,29 @@
+// SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+namespace Nethermind.Savm.TransactionProcessing;
+
+/// <summary>
+/// Represents gas consumption information for a transaction.
+/// </summary>
+/// <param name="SpentGas">Gas after refunds (what user pays).</param>
+/// <param name="OperationGas">Gas used for SAVM operations.</param>
+/// <param name="BlockGas">SIP-7778/SIP-8037 regular gas for block accounting (pre-refund). When 0 without state gas, use SpentGas.</param>
+/// <param name="BlockStateGas">SIP-8037: State gas for block accounting. Block gasUsed = max(sum_regular, sum_state).</param>
+/// <param name="MaxUsedGas">Maximum gas consumed before refunds; if 0, use SpentGas.</param>
+public readonly record struct GasConsumed(ulong SpentGas, ulong OperationGas, ulong BlockGas = 0, ulong BlockStateGas = 0, ulong MaxUsedGas = 0)
+{
+    /// <summary>
+    /// Gets the effective regular gas for block accounting. When SIP-7778 is enabled,
+    /// this returns BlockGas (pre-refund), otherwise returns SpentGas. SIP-8037 can explicitly report zero regular gas when state gas is nonzero.
+    /// </summary>
+    public ulong EffectiveBlockGas => BlockGas > 0 || BlockStateGas > 0 ? BlockGas : SpentGas;
+
+    /// <summary>
+    /// Gets gas consumed before refunds (and floor adjusted), used by sil_simulate maxUsedGas.
+    /// </summary>
+    public ulong EffectiveMaxUsedGas => MaxUsedGas > 0 ? MaxUsedGas : SpentGas;
+
+    public static implicit operator ulong(GasConsumed gas) => gas.SpentGas;
+    public static implicit operator GasConsumed(ulong spentGas) => new(spentGas, spentGas, 0, 0, spentGas);
+}

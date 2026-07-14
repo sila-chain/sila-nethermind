@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="../tests.props" />
+  
+  <ItemGroup>
+    <ProjectReference Include="..\Sila.Test.Base\Sila.Test.Base.csproj" />
+    <EmbeddedResource Include="..\..\tests\BasicTests\hexencodetest.json">
+      <Link>hexencodetest.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </EmbeddedResource>
+  </ItemGroup>
+</Project>

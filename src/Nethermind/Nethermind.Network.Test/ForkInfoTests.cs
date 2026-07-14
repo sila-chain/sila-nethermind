@@ -1,0 +1,494 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Blockchain;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Logging;
+using Nethermind.Network.Enr;
+using Nethermind.Serialization.Json;
+using Nethermind.Specs;
+using Nethermind.Specs.ChainSpecStyle;
+using Nethermind.Specs.ChainSpecStyle.Json;
+using Nethermind.Specs.Test;
+using Nethermind.Synchronization;
+using NSubstitute;
+using NUnit.Framework;
+using System.IO;
+using System.Reflection;
+using System.Text;
+
+namespace Nethermind.Network.Test;
+
+[Parallelizable(ParallelScope.Self)]
+[TestFixture]
+public class ForkInfoTests
+{
+    [TestCase(0ul, 0ul, "0xfc64ec04", 1_150_000ul, "Unsynced")]
+    [TestCase(1_149_999ul, 0ul, "0xfc64ec04", 1_150_000ul, "Last Frontier block")]
+    [TestCase(1_150_000ul, 0ul, "0x97c2c34c", 1_920_000ul, "First Homestead block")]
+    [TestCase(1_919_999ul, 0ul, "0x97c2c34c", 1_920_000ul, "Last Homestead block")]
+    [TestCase(1_920_000ul, 0ul, "0x91d1f948", 2_463_000ul, "First DAO block")]
+    [TestCase(2_462_999ul, 0ul, "0x91d1f948", 2_463_000ul, "Last DAO block")]
+    [TestCase(2_463_000ul, 0ul, "0x7a64da13", 2_675_000ul, "First Tangerine block")]
+    [TestCase(2_674_999ul, 0ul, "0x7a64da13", 2_675_000ul, "Last Tangerine block")]
+    [TestCase(2_675_000ul, 0ul, "0x3edd5b10", 4_370_000ul, "First Spurious block")]
+    [TestCase(4_369_999ul, 0ul, "0x3edd5b10", 4_370_000ul, "Last Spurious block")]
+    [TestCase(4_370_000ul, 0ul, "0xa00bc324", 7_280_000ul, "First Byzantium block")]
+    [TestCase(7_279_999ul, 0ul, "0xa00bc324", 7_280_000ul, "Last Byzantium block")]
+    [TestCase(7_280_000ul, 0ul, "0x668db0af", 9_069_000ul, "First Constantinople block")]
+    [TestCase(9_068_999ul, 0ul, "0x668db0af", 9_069_000ul, "Last Constantinople block")]
+    [TestCase(9_069_000ul, 0ul, "0x879d6e30", 9_200_000ul, "First Istanbul block")]
+    [TestCase(9_199_999ul, 0ul, "0x879d6e30", 9_200_000ul, "Last Istanbul block")]
+    [TestCase(9_200_000ul, 0ul, "0xe029e991", 12_244_000ul, "Last Muir Glacier")]
+    [TestCase(12_244_000ul, 0ul, "0x0eb440f6", 12_965_000ul, "First Berlin")]
+    [TestCase(12_964_999ul, 0ul, "0x0eb440f6", 12_965_000ul, "Last Berlin")]
+    [TestCase(12_965_000ul, 0ul, "0xb715077d", 13_773_000ul, "First London")]
+    [TestCase(13_772_999ul, 0ul, "0xb715077d", 13_773_000ul, "Last London")]
+    [TestCase(13_773_000ul, 0ul, "0x20c327fc", 15_050_000ul, "First Arrow Glacier")]
+    [TestCase(15_049_999ul, 0ul, "0x20c327fc", 15_050_000ul, "Last Arrow Glacier")]
+    [TestCase(15_050_000ul, 0ul, "0xf0afd0e3", 1_681_338_455ul, "First Gray Glacier")]
+    [TestCase(15_051_000ul, 0ul, "0xf0afd0e3", 1_681_338_455ul, "Future Gray Glacier")]
+    [TestCase(15_051_000ul, 1_681_338_455ul, "0xdce96c2d", 1_710_338_135ul, "First SilaShanghai timestamp")]
+    [TestCase(15_051_000ul, 1_710_338_134ul, "0xdce96c2d", 1_710_338_135ul, "Future SilaShanghai timestamp")]
+    [TestCase(15_051_000ul, 1_710_338_135ul, "0x9f3d2254", 1_746_612_311ul, "First SilaCancun timestamp")]
+    [TestCase(15_051_000ul, 1_746_612_310ul, "0x9f3d2254", 1_746_612_311ul, "Future SilaCancun timestamp")]
+    [TestCase(15_051_000ul, 1_746_612_311ul, "0xc376cf8b", 1_764_798_551ul, "First SilaPrague timestamp")]
+    [TestCase(15_051_000ul, 1_764_798_550ul, "0xc376cf8b", 1_764_798_551ul, "Future SilaPrague timestamp")]
+    [TestCase(15_051_000ul, 1_764_798_551ul, "0x5167e2a6", 1_765_290_071ul, "First SilaOsaka timestamp")]
+    [TestCase(15_051_000ul, 1_765_290_070ul, "0x5167e2a6", 1_765_290_071ul, "Future SilaOsaka timestamp")]
+    [TestCase(15_051_000ul, 1_765_290_071ul, "0xcba2a1c0", 1_767_747_671ul, "First BPO1 timestamp")]
+    [TestCase(15_051_000ul, 1_767_747_670ul, "0xcba2a1c0", 1_767_747_671ul, "Future BPO1 timestamp")]
+    [TestCase(15_051_000ul, 1_767_747_671ul, "0x07c9462e", 0ul, "First BPO2 timestamp")]
+    [TestCase(15_051_000ul, 1_867_747_671ul, "0x07c9462e", 0ul, "Future BPO2 timestamp")]
+    public void Fork_id_and_hash_as_expected(ulong head, ulong headTimestamp, string forkHashHex, ulong next, string description) => Test(head, headTimestamp, KnownHashes.MainnetGenesis, forkHashHex, next, description, MainnetSpecProvider.Instance, "foundation.json");
+
+    [TestCase(0ul, 0ul, "0xfc64ec04", 1_150_000ul, "Unsynced")]
+    [TestCase(1_149_999ul, 0ul, "0xfc64ec04", 1_150_000ul, "Last Frontier block")]
+    [TestCase(1_150_000ul, 0ul, "0x97c2c34c", 1_920_000ul, "First Homestead block")]
+    [TestCase(1_919_999ul, 0ul, "0x97c2c34c", 1_920_000ul, "Last Homestead block")]
+    [TestCase(1_920_000ul, 0ul, "0x91d1f948", 2_463_000ul, "First DAO block")]
+    [TestCase(2_462_999ul, 0ul, "0x91d1f948", 2_463_000ul, "Last DAO block")]
+    [TestCase(2_463_000ul, 0ul, "0x7a64da13", 2_675_000ul, "First Tangerine block")]
+    [TestCase(2_674_999ul, 0ul, "0x7a64da13", 2_675_000ul, "Last Tangerine block")]
+    [TestCase(2_675_000ul, 0ul, "0x3edd5b10", 4_370_000ul, "First Spurious block")]
+    [TestCase(4_369_999ul, 0ul, "0x3edd5b10", 4_370_000ul, "Last Spurious block")]
+    [TestCase(4_370_000ul, 0ul, "0xa00bc324", 7_280_000ul, "First Byzantium block")]
+    [TestCase(7_279_999ul, 0ul, "0xa00bc324", 7_280_000ul, "Last Byzantium block")]
+    [TestCase(7_280_000ul, 0ul, "0x668db0af", 9_069_000ul, "First Constantinople block")]
+    [TestCase(9_068_999ul, 0ul, "0x668db0af", 9_069_000ul, "Last Constantinople block")]
+    [TestCase(9_069_000ul, 0ul, "0x879d6e30", 9_200_000ul, "First Istanbul block")]
+    [TestCase(9_199_999ul, 0ul, "0x879d6e30", 9_200_000ul, "Last Istanbul block")]
+    [TestCase(9_200_000ul, 0ul, "0xe029e991", 12_244_000ul, "Last Muir Glacier")]
+    [TestCase(12_244_000ul, 0ul, "0x0eb440f6", 12_965_000ul, "First Berlin")]
+    [TestCase(12_964_999ul, 0ul, "0x0eb440f6", 12_965_000ul, "Last Berlin")]
+    [TestCase(12_965_000ul, 0ul, "0xb715077d", 13_773_000ul, "First London")]
+    [TestCase(13_772_999ul, 0ul, "0xb715077d", 13_773_000ul, "Last London")]
+    [TestCase(13_773_000ul, 0ul, "0x20c327fc", 15_050_000ul, "First Arrow Glacier")]
+    [TestCase(15_049_999ul, 0ul, "0x20c327fc", 15_050_000ul, "Last Arrow Glacier")]
+    [TestCase(15_050_000ul, 0ul, "0xf0afd0e3", 1_668_000_000ul, "First Gray Glacier")]
+    [TestCase(17_999_999ul, 0ul, "0xf0afd0e3", 1_668_000_000ul, "Last Gray Glacier")]
+    [TestCase(20_000_000ul, 1_668_000_000ul, "0x71147644", 0ul, "First SilaShanghai")]
+    [TestCase(21_000_000ul, 1_768_000_000ul, "0x71147644", 0ul, "Future SilaShanghai")]
+    public void Fork_id_and_hash_as_expected_with_timestamps(ulong head, ulong headTimestamp, string forkHashHex, ulong next, string description) => Test(head, headTimestamp, KnownHashes.MainnetGenesis, forkHashHex, next, description, "TimestampForkIdTest.json",
+            $"../../../../{Assembly.GetExecutingAssembly().GetName().Name}");
+
+    [TestCase(15_050_000ul, 0ul, "0xf0afd0e3", 21_000_000ul, "First Gray Glacier")]
+    [TestCase(21_000_000ul, 0ul, "0x3f5fd195", 1681338455UL, "First Merge Fork Id test")]
+    [TestCase(21_811_000ul, 0ul, "0x3f5fd195", 1681338455UL, "Future Merge Fork Id test")]
+    public void Fork_id_and_hash_as_expected_with_merge_fork_id(ulong head, ulong headTimestamp, string forkHashHex, ulong next, string description)
+    {
+        ChainSpecFileLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+        ChainSpec spec = loader.LoadEmbeddedOrFromFile("../../../../Chains/foundation.json");
+        spec.Parameters.MergeForkIdTransition = 21_000_000L;
+        spec.MergeForkIdBlockNumber = 21_000_000L;
+        ChainSpecBasedSpecProvider provider = new(spec);
+        Test(head, headTimestamp, KnownHashes.MainnetGenesis, forkHashHex, next, description, provider);
+    }
+
+    [TestCase(0ul, 0ul, "0xFE3366E7", 1735371ul, "SilaSepolia genesis")]
+    [TestCase(1735370ul, 0ul, "0xFE3366E7", 1_735_371ul, "SilaSepolia Last block before MergeForkIdTransition")]
+    [TestCase(1735371ul, 0ul, "0xb96cbd13", 1_677_557_088ul, "First block - SilaSepolia MergeForkIdTransition")]
+    [TestCase(1735372ul, 1_677_557_088ul, "0xf7f9bc08", 1_706_655_072ul, "SilaShanghai")]
+    [TestCase(1735372ul, 1_706_655_071ul, "0xf7f9bc08", 1_706_655_072ul, "Future SilaShanghai")]
+    [TestCase(1735373ul, 1_706_655_072ul, "0x88cf81d9", 1_741_159_776ul, "First SilaCancun timestamp")]
+    [TestCase(1735374ul, 1_716_655_072ul, "0x88cf81d9", 1_741_159_776ul, "Future SilaCancun timestamp")]
+    [TestCase(1735373ul, 1_741_159_776ul, "0xed88b5fd", 1_760_427_360ul, "First SilaPrague timestamp")]
+    [TestCase(1735374ul, 1_751_159_776ul, "0xed88b5fd", 1_760_427_360ul, "Future SilaPrague timestamp")]
+    [TestCase(1735373ul, 1_760_427_360ul, "0xe2ae4999", 1_761_017_184ul, "First SilaOsaka timestamp")]
+    [TestCase(1735374ul, 1_760_428_360ul, "0xe2ae4999", 1_761_017_184ul, "Future SilaOsaka timestamp")]
+    [TestCase(1735373ul, 1_761_017_184ul, "0x56078a1e", 1_761_607_008ul, "First BPO1 timestamp")]
+    [TestCase(1735374ul, 1_761_018_184ul, "0x56078a1e", 1_761_607_008ul, "Future BPO1 timestamp")]
+    [TestCase(1735373ul, 1_761_607_008ul, "0x268956b6", 0ul, "First BPO2 timestamp")]
+    [TestCase(1735374ul, 1_761_608_008ul, "0x268956b6", 0ul, "Future BPO2 timestamp")]
+    public void Fork_id_and_hash_as_expected_on_sepolia(ulong head, ulong headTimestamp, string forkHashHex, ulong next, string description) => Test(head, headTimestamp, KnownHashes.SepoliaGenesis, forkHashHex, next, description, SepoliaSpecProvider.Instance, "sepolia.json");
+
+    [TestCase(0ul, 0ul, "0xf64909b1", 1604400ul, "Unsynced, last Frontier, Homestead, Tangerine, Spurious, Byzantium")]
+    [TestCase(1604399ul, 0ul, "0xf64909b1", 1604400ul, "Last Byzantium block")]
+    [TestCase(1604400ul, 0ul, "0xfde2d083", 2508800ul, "First Constantinople block")]
+    [TestCase(2508799ul, 0ul, "0xfde2d083", 2508800ul, "Last Constantinople block")]
+    [TestCase(2508800ul, 0ul, "0xfc1d8f2f", 7298030ul, "First Petersburg block")]
+    [TestCase(7298029ul, 0ul, "0xfc1d8f2f", 7298030ul, "Last Petersburg block")]
+    [TestCase(7298030ul, 0ul, "0x54d05e6c", 9186425ul, "First Istanbul block")]
+    [TestCase(9186424ul, 0ul, "0x54d05e6c", 9186425ul, "Last Istanbul block")]
+    [TestCase(9186425ul, 0ul, "0xb6e6cd81", 16101500ul, "First POSDAO Activation block")]
+    [TestCase(16101499ul, 0ul, "0xb6e6cd81", 16101500ul, "Last POSDAO Activation block")]
+    [TestCase(16101500ul, 0ul, "0x069a83d9", 19040000ul, "First Berlin block")]
+    [TestCase(19039999ul, 0ul, "0x069a83d9", 19040000ul, "Last Berlin block")]
+    [TestCase(19040000ul, 0ul, "0x018479d3", GnosisSpecProvider.ShanghaiTimestamp, "First London block")]
+    [TestCase(21735000ul, 0ul, "0x018479d3", GnosisSpecProvider.ShanghaiTimestamp, "First GIP-31 block")]
+    [TestCase(31735000ul, GnosisSpecProvider.ShanghaiTimestamp, "0x2efe91ba", GnosisSpecProvider.CancunTimestamp, "First SilaShanghai timestamp")]
+    [TestCase(41735000ul, GnosisSpecProvider.CancunTimestamp, "0x1384dfc1", GnosisSpecProvider.PragueTimestamp, "First SilaCancun timestamp")]
+    [TestCase(91735000ul, GnosisSpecProvider.PragueTimestamp - 1, "0x1384dfc1", GnosisSpecProvider.PragueTimestamp, "Future SilaCancun timestamp")]
+    [TestCase(101735000ul, GnosisSpecProvider.PragueTimestamp, "0x2f095d4a", GnosisSpecProvider.BalancerTimestamp, "First SilaPrague timestamp")]
+    [TestCase(101735000ul, GnosisSpecProvider.BalancerTimestamp - 1, "0x2f095d4a", GnosisSpecProvider.BalancerTimestamp, "Future SilaPrague timestamp")]
+    [TestCase(111735000ul, GnosisSpecProvider.BalancerTimestamp, "0xd00284ad", GnosisSpecProvider.OsakaTimestamp, "First Balancer timestamp")]
+    [TestCase(111735000ul, GnosisSpecProvider.OsakaTimestamp - 1, "0xd00284ad", GnosisSpecProvider.OsakaTimestamp, "Future Balancer timestamp")]
+    [TestCase(121735000ul, GnosisSpecProvider.OsakaTimestamp, "0xcfca387c", 0ul, "First SilaOsaka timestamp")]
+    [TestCase(121735000ul, GnosisSpecProvider.OsakaTimestamp + 100, "0xcfca387c", 0ul, "Future SilaOsaka timestamp")]
+    public void Fork_id_and_hash_as_expected_on_gnosis(ulong head, ulong headTimestamp, string forkHashHex, ulong next, string description) =>
+        Test(head, headTimestamp, KnownHashes.GnosisGenesis, forkHashHex, next, description, GnosisSpecProvider.Instance, "gnosis.json");
+
+    [TestCase(0ul, 0UL, "0x50d39d7b", ChiadoSpecProvider.ShanghaiTimestamp, "Chiado genesis")]
+    [TestCase(3945317ul, ChiadoSpecProvider.ShanghaiTimestamp, "0xa15a4252", ChiadoSpecProvider.CancunTimestamp, "First SilaShanghai timestamp")]
+    [TestCase(4_000_000ul, ChiadoSpecProvider.CancunTimestamp, "0x5fbc16bc", ChiadoSpecProvider.PragueTimestamp, "First SilaCancun timestamp")]
+    [TestCase(5_000_000ul, ChiadoSpecProvider.PragueTimestamp - 1, "0x5fbc16bc", ChiadoSpecProvider.PragueTimestamp, "Future SilaCancun timestamp")]
+    [TestCase(5_000_000ul, ChiadoSpecProvider.PragueTimestamp, "0x8ba51786", ChiadoSpecProvider.OsakaTimestamp, "First SilaPrague timestamp")]
+    [TestCase(5_000_000ul, ChiadoSpecProvider.OsakaTimestamp - 1, "0x8ba51786", ChiadoSpecProvider.OsakaTimestamp, "Future SilaPrague timestamp")]
+    [TestCase(5_000_000ul, ChiadoSpecProvider.OsakaTimestamp, "0x71c457cd", 0ul, "First SilaOsaka timestamp")]
+    [TestCase(5_000_000ul, ChiadoSpecProvider.OsakaTimestamp + 100, "0x71c457cd", 0ul, "Future SilaOsaka timestamp")]
+    public void Fork_id_and_hash_as_expected_on_chiado(ulong head, ulong headTimestamp, string forkHashHex, ulong next, string description) =>
+        Test(head, headTimestamp, KnownHashes.ChiadoGenesis, forkHashHex, next, description, ChiadoSpecProvider.Instance, "chiado.json");
+
+    [TestCase(0ul, HoodiSpecProvider.CancunTimestamp, "0xbef71d30", HoodiSpecProvider.PragueTimestamp, "First SilaCancun timestamp")]
+    [TestCase(5_000_000ul, HoodiSpecProvider.PragueTimestamp - 1, "0xbef71d30", HoodiSpecProvider.PragueTimestamp, "Future SilaCancun timestamp")]
+    [TestCase(5_000_000ul, HoodiSpecProvider.PragueTimestamp, "0x929e24e", HoodiSpecProvider.OsakaTimestamp, "First SilaPrague timestamp")]
+    [TestCase(5_000_000ul, HoodiSpecProvider.OsakaTimestamp - 1, "0x929e24e", HoodiSpecProvider.OsakaTimestamp, "Future SilaPrague timestamp")]
+    [TestCase(6_000_000ul, HoodiSpecProvider.OsakaTimestamp, "0xe7e0e7ff", HoodiSpecProvider.BPO1Timestamp, "First SilaOsaka timestamp")]
+    [TestCase(6_000_000ul, HoodiSpecProvider.BPO1Timestamp - 1, "0xe7e0e7ff", HoodiSpecProvider.BPO1Timestamp, "Future SilaOsaka timestamp")]
+    [TestCase(7_000_000ul, HoodiSpecProvider.BPO1Timestamp, "0x3893353e", HoodiSpecProvider.BPO2Timestamp, "First BPO1 timestamp")]
+    [TestCase(7_000_000ul, HoodiSpecProvider.BPO2Timestamp - 1, "0x3893353e", HoodiSpecProvider.BPO2Timestamp, "Future BPO1 timestamp")]
+    [TestCase(8_000_000ul, HoodiSpecProvider.BPO2Timestamp, "0x23aa1351", 0ul, "First BPO2 timestamp")]
+    [TestCase(8_000_000ul, HoodiSpecProvider.BPO2Timestamp + 100000, "0x23aa1351", 0ul, "Future BPO2 timestamp")]
+    public void Fork_id_and_hash_as_expected_on_hoodi(ulong head, ulong headTimestamp, string forkHashHex, ulong next, string description)
+    {
+        ChainSpecFileLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+        ChainSpec spec = loader.LoadEmbeddedOrFromFile("../../../../Chains/hoodi.json");
+        ChainSpecBasedSpecProvider provider = new(spec);
+        Test(head, headTimestamp, KnownHashes.HoodiGenesis, forkHashHex, next, description, provider);
+    }
+
+    // Local is sila-mainnet Gray Glacier, remote announces the same. No future fork is announced.
+    [TestCase(MainnetSpecProvider.GrayGlacierBlockNumber, 0ul, "0xf0afd0e3", 0ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet Petersburg, remote announces the same. No future fork is announced.
+    [TestCase(7987396ul, 0ul, "0x668db0af", 0ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet Petersburg, remote announces the same. Remote also announces a next fork
+    // at block 0xffffffff, but that is uncertain.
+    [TestCase(7987396ul, 0ul, "0x668db0af", ulong.MaxValue, ValidationResult.Valid)]
+
+    // Local is sila-mainnet currently in Byzantium only (so it's aware of Petersburg), remote announces
+    // also Byzantium, but it's not yet aware of Petersburg (e.g. non updated node before the fork).
+    // In this case we don't know if Petersburg passed yet or not.
+    [TestCase(7279999ul, 0ul, "0xa00bc324", 0ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet currently in Byzantium only (so it's aware of Petersburg), remote announces
+    // also Byzantium, and it's also aware of Petersburg (e.g. updated node before the fork). We
+    // don't know if Petersburg passed yet (will pass) or not.
+    [TestCase(7279999ul, 0ul, "0xa00bc324", 7280000ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet currently in Byzantium only (so it's aware of Petersburg), remote announces
+    // also Byzantium, and it's also aware of some random fork (e.g. misconfigured Petersburg). As
+    // neither forks passed at neither nodes, they may mismatch, but we still connect for now.
+    [TestCase(7279999ul, 0ul, "0xa00bc324", ulong.MaxValue, ValidationResult.Valid)]
+
+    // Local is sila-mainnet exactly on Petersburg, remote announces Byzantium + knowledge about Petersburg. Remote
+    // is simply out of sync, accept.
+    [TestCase(7280000ul, 0ul, "0xa00bc324", 7280000ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet Petersburg, remote announces Byzantium + knowledge about Petersburg. Remote
+    // is simply out of sync, accept.
+    [TestCase(7987396ul, 0ul, "0xa00bc324", 7280000ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet Petersburg, remote announces Spurious + knowledge about Byzantium. Remote
+    // is definitely out of sync. It may or may not need the Petersburg update, we don't know yet.
+    [TestCase(7987396ul, 0ul, "0x3edd5b10", 4370000ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet Byzantium, remote announces Petersburg. Local is out of sync, accept.
+    [TestCase(7279999ul, 0ul, "0x668db0af", 0ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet Spurious, remote announces Byzantium, but is not aware of Petersburg. Local
+    // out of sync. Local also knows about a future fork, but that is uncertain yet.
+    [TestCase(4369999ul, 0ul, "0xa00bc324", 0ul, ValidationResult.Valid)]
+
+    // Local is sila-mainnet Petersburg. remote announces Byzantium but is not aware of further forks.
+    // Remote needs software update.
+    [TestCase(7987396ul, 0ul, "0xa00bc324", 0ul, ValidationResult.RemoteStale)]
+
+    // Local is sila-mainnet Petersburg, and isn't aware of more forks. Remote announces Petersburg +
+    // 0xffffffff. Local needs software update, reject.
+    [TestCase(7987396ul, 0ul, "0x5cddc0e1", 0ul, ValidationResult.IncompatibleOrStale)]
+
+    // Local is sila-mainnet Byzantium, and is aware of Petersburg. Remote announces Petersburg +
+    // 0xffffffff. Local needs software update, reject.
+    [TestCase(7279999ul, 0ul, "0x5cddc0e1", 0ul, ValidationResult.IncompatibleOrStale)]
+
+    // Local is sila-mainnet Byzantium. Remote is also in Byzantium, but announces Gopherium (non existing
+    // fork) at block 7279999, before Petersburg. Local is incompatible.
+    [TestCase(7279999ul, 0ul, "0xa00bc324", 7279999ul, ValidationResult.IncompatibleOrStale)]
+
+    //------------------------------------
+    // Block to timestamp transition tests
+    //------------------------------------
+
+    // Local is sila-mainnet currently in Gray Glacier only (so it's aware of SilaShanghai), remote announces
+    // also Gray Glacier, but it's not yet aware of SilaShanghai (e.g. non updated node before the fork).
+    // In this case we don't know if SilaShanghai passed yet or not.
+    [TestCase(15050000ul, 0ul, "0xf0afd0e3", 0ul, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet currently in Gray Glacier only (so it's aware of SilaShanghai), remote announces
+    // also Gray Glacier, and it's also aware of SilaShanghai (e.g. updated node before the fork). We
+    // don't know if SilaShanghai passed yet (will pass) or not.
+    [TestCase(15050000ul, 0ul, "0xf0afd0e3", 1_668_000_000ul, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet currently in Gray Glacier only (so it's aware of SilaShanghai), remote announces
+    // also Gray Glacier, and it's also aware of some random fork (e.g. misconfigured SilaShanghai). As
+    // neither forks passed at neither nodes, they may mismatch, but we still connect for now.
+    [TestCase(15050000ul, 0ul, "0xf0afd0e3", ulong.MaxValue, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet exactly on SilaShanghai, remote announces Gray Glacier + knowledge about SilaShanghai. Remote
+    // is simply out of sync, accept.
+    [TestCase(20000000ul, 1_668_000_000ul, "0xf0afd0e3", 1_668_000_000ul, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet SilaShanghai, remote announces Gray Glacier + knowledge about SilaShanghai. Remote
+    // is simply out of sync, accept.
+    [TestCase(20123456ul, 1_668_111_111ul, "0xf0afd0e3", 1_668_000_000ul, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet SilaShanghai, remote announces Arrow Glacier + knowledge about Gray Glacier. Remote
+    // is definitely out of sync. It may or may not need the SilaShanghai update, we don't know yet.
+    [TestCase(20000000ul, 1_668_000_000ul, "0x20c327fc", 15_050_000ul, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet Gray Glacier, remote announces SilaShanghai. Local is out of sync, accept.
+    [TestCase(15_050_000ul, 0ul, "0x71147644", 0ul, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet Arrow Glacier, remote announces Gray Glacier, but is not aware of SilaShanghai. Local
+    // out of sync. Local also knows about a future fork, but that is uncertain yet.
+    [TestCase(13_773_000ul, 0ul, "0xf0afd0e3", 0ul, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet SilaShanghai. remote announces Gray Glacier but is not aware of further forks.
+    // Remote needs software update.
+    [TestCase(20000000ul, 1_668_000_000ul, "0xf0afd0e3", 0ul, ValidationResult.RemoteStale, true)]
+
+    // Local is sila-mainnet Gray Glacier, and isn't aware of more forks. Remote announces Gray Glacier +
+    // 0xffffffff. Local needs software update, reject.
+    [TestCase(15_050_000ul, 0ul, "0x87654321", ulong.MaxValue, ValidationResult.IncompatibleOrStale)]
+
+    // Local is sila-mainnet Gray Glacier, and is aware of SilaShanghai. Remote announces SilaShanghai +
+    // 0xffffffff. Local needs software update, reject.
+    [TestCase(15_050_000ul, 0ul, "0x98765432", ulong.MaxValue, ValidationResult.IncompatibleOrStale, true)]
+
+    // Local is sila-mainnet Gray Glacier. Remote is also in Gray Glacier, but announces Gopherium (non existing
+    // fork) at block 7279999, before SilaShanghai. Local is incompatible.
+    [TestCase(19999999ul, 1667999999ul, "0xf0afd0e3", 1667999999ul, ValidationResult.IncompatibleOrStale, true)]
+
+    //----------------------
+    // Timestamp based tests
+    //----------------------
+
+    // Local is sila-mainnet SilaShanghai, remote announces the same. No future fork is announced.
+    [TestCase(20000000ul, 1_668_000_000ul, "0x71147644", 0ul, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet SilaShanghai, remote announces the same. Remote also announces a next fork
+    // at time 0xffffffff, but that is uncertain.
+    [TestCase(20000000ul, 1_668_000_000ul, "0x71147644", ulong.MaxValue, ValidationResult.Valid, true)]
+
+    // Local is sila-mainnet SilaShanghai, and isn't aware of more forks. Remote announces SilaShanghai +
+    // 0xffffffff. Local needs software update, reject.
+    [TestCase(20000000ul, 1_668_000_000ul, "0x846271649", 0ul, ValidationResult.IncompatibleOrStale, true)]
+
+    // Local is sila-mainnet SilaShanghai, remote is random SilaShanghai.
+    [TestCase(20000000ul, 1_668_000_000ul, "0x12345678", 0ul, ValidationResult.IncompatibleOrStale, true)]
+
+    public void Test_fork_id_validation_mainnet(ulong headNumber, ulong headTimestamp, string hash, ulong next, ValidationResult result, bool UseTimestampSpec = false)
+    {
+        IBlockTree blockTree = Substitute.For<IBlockTree>();
+        Block head = Build.A.Block.WithNumber(headNumber).WithTimestamp(headTimestamp).TestObject;
+        blockTree.Head.Returns(head);
+
+        ISpecProvider specProvider = MainnetSpecProvider.Instance;
+        if (UseTimestampSpec)
+        {
+            ChainSpecFileLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+            ChainSpec spec = loader.LoadEmbeddedOrFromFile($"../../../../{Assembly.GetExecutingAssembly().GetName().Name}/TimestampForkIdTest.json");
+            specProvider = new ChainSpecBasedSpecProvider(spec);
+        }
+
+        ISyncServer syncServer = Substitute.For<ISyncServer>();
+        syncServer.Genesis.Returns(Build.A.BlockHeader.WithHash(KnownHashes.MainnetGenesis).TestObject);
+        ForkInfo forkInfo = new(specProvider, syncServer);
+
+        Assert.That(forkInfo.ValidateForkId(new ForkId(Bytes.ReadEthUInt32(Bytes.FromHexString(hash)), next), head.Header), Is.EqualTo(result));
+    }
+
+    [TestCase("0xfc64ec04", 1_150_000ul, true, "Frontier with correct Homestead next")]
+    [TestCase("0xfc64ec04", 0ul, true, "Frontier, remote does not know the next fork yet")]
+    [TestCase("0xfc64ec04", 42ul, false, "Frontier with mismatched next")]
+    [TestCase("0x9f3d2254", 1_746_612_311ul, true, "SilaCancun with correct SilaPrague next")]
+    [TestCase("0x12345678", 0ul, false, "Unknown fork hash")]
+    [TestCase("0x12345678", 1_150_000ul, false, "Unknown fork hash with known next")]
+    public void Test_fork_id_compatibility_mainnet(string hash, ulong next, bool expected, string description) =>
+        Assert.That(
+            CreateMainnetForkInfo().IsForkIdCompatible(new ForkId(Bytes.ReadEthUInt32(Bytes.FromHexString(hash)), next)),
+            Is.EqualTo(expected),
+            description);
+
+    [TestCase(0ul)]
+    [TestCase(9_999_999_999ul)]
+    public void Test_last_known_fork_id_compatibility_mainnet(ulong next)
+    {
+        ForkInfo forkInfo = CreateMainnetForkInfo();
+        Fork lastFork = forkInfo.GetForkActivationsSummary(null).Last!.Value;
+
+        Assert.That(forkInfo.IsForkIdCompatible(new ForkId(lastFork.Id.ForkHash, next)), Is.True);
+    }
+
+    [Test]
+    public void Node_record_without_eth_entry_is_fork_compatible()
+    {
+        ForkInfo forkInfo = CreateMainnetForkInfo();
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(forkInfo.IsNodeRecordForkCompatible(null), Is.True);
+            Assert.That(forkInfo.IsNodeRecordForkCompatible(new NodeRecord()), Is.True);
+        }
+    }
+
+    [TestCase("0xfc64ec04", 1_150_000ul, true)]
+    [TestCase("0xfc64ec04", 42ul, false)]
+    [TestCase("0x12345678", 0ul, false)]
+    public void Node_record_eth_entry_is_validated_against_fork_schedule(string hash, ulong next, bool expected)
+    {
+        NodeRecord record = new();
+        record.SetEntry(new SilEntry(Bytes.FromHexString(hash), next));
+
+        Assert.That(CreateMainnetForkInfo().IsNodeRecordForkCompatible(record), Is.EqualTo(expected));
+    }
+
+    private static ForkInfo CreateMainnetForkInfo()
+    {
+        ISyncServer syncServer = Substitute.For<ISyncServer>();
+        syncServer.Genesis.Returns(Build.A.BlockHeader.WithHash(KnownHashes.MainnetGenesis).TestObject);
+        return new ForkInfo(MainnetSpecProvider.Instance, syncServer);
+    }
+
+    [TestCase(2ul, 3ul, 2ul, 3ul)]
+    [TestCase(2ul, null, 2ul, 2ul)]
+    [TestCase(null, 3ul, 3ul, 3ul)]
+    [TestCase(null, null, 1ul, 1ul)]
+    public void Chain_id_and_network_id_have_proper_default_values(ulong? specNetworkId, ulong? specChainId, ulong expectedNetworkId, ulong expectedChainId)
+    {
+        ChainSpecLoader loader = new(new SilaJsonSerializer(), NullLogManager.Instance);
+
+        string chainspec = $"{{\"params\":{{\"networkID\":{specNetworkId?.ToString() ?? "null"},\"chainId\":{specChainId?.ToString() ?? "null"}}},\"engine\":{{\"NethDev\":{{}}}}}}";
+        using MemoryStream memoryStream = new(Encoding.UTF8.GetBytes(chainspec));
+        ChainSpec spec = loader.Load(memoryStream);
+        ChainSpecBasedSpecProvider provider = new(spec);
+
+        Assert.That(spec.ChainId, Is.EqualTo(expectedChainId));
+        Assert.That(spec.NetworkId, Is.EqualTo(expectedNetworkId));
+        Assert.That(provider.ChainId, Is.EqualTo(expectedChainId));
+        Assert.That(provider.NetworkId, Is.EqualTo(expectedNetworkId));
+    }
+
+    public static void Test(ulong head, ulong headTimestamp, Hash256 genesisHash, string forkHashHex, ulong next, string description, ISpecProvider specProvider, string chainSpec, string path = "../../../../Chains")
+    {
+        Test(head, headTimestamp, genesisHash, forkHashHex, next, description, specProvider);
+        Test(head, headTimestamp, genesisHash, forkHashHex, next, description, chainSpec, path);
+    }
+
+    public static void Test(ulong head, ulong headTimestamp, Hash256 genesisHash, string forkHashHex, ulong next, string description, string chainSpec, string path = "../../../../Chains")
+    {
+        ChainSpecFileLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+        ChainSpec spec = loader.LoadEmbeddedOrFromFile(Path.Combine(path, chainSpec));
+        ChainSpecBasedSpecProvider provider = new(spec);
+        Test(head, headTimestamp, genesisHash, forkHashHex, next, description, provider);
+    }
+
+    private static void Test(ulong head, ulong headTimestamp, Hash256 genesisHash, string forkHashHex, ulong next, string description, ISpecProvider specProvider)
+    {
+        uint expectedForkHash = Bytes.FromHexString(forkHashHex).ReadEthUInt32();
+
+        ISyncServer syncServer = Substitute.For<ISyncServer>();
+        syncServer.Genesis.Returns(Build.A.BlockHeader.WithHash(genesisHash).TestObject);
+
+        ForkInfo forkInfo = new(specProvider, syncServer);
+        ForkId forkId = forkInfo.GetForkId(head, headTimestamp);
+
+        Assert.That(forkId.Next, Is.EqualTo(next));
+        Assert.That(forkId.ForkHash, Is.EqualTo(expectedForkHash));
+
+        // Validate fork info summary
+        BlockHeader header = Build.A.BlockHeader.WithNumber(head).WithTimestamp(headTimestamp).TestObject;
+        ForkActivationsSummary forkActivationsSummary = forkInfo.GetForkActivationsSummary(header);
+
+        Assert.That(forkActivationsSummary.Current.Id.ForkHash, Is.EqualTo(expectedForkHash));
+        Assert.That(forkActivationsSummary.Current.Id.Next, Is.EqualTo(next));
+
+        if (next is 0)
+        {
+            Assert.That(forkActivationsSummary.Next, Is.Null);
+            Assert.That(forkActivationsSummary.Last, Is.Null);
+            return;
+        }
+
+        ForkActivation nextActivation = forkActivationsSummary.Next!.Value.Activation;
+
+        if (nextActivation.Timestamp is not null)
+        {
+            Assert.That(nextActivation.Timestamp, Is.EqualTo(next));
+        }
+        else
+        {
+            Assert.That(nextActivation.BlockNumber, Is.EqualTo((long)next));
+        }
+    }
+
+    [Test]
+    public void Test_no_fork_is_created_before_genesis_time()
+    {
+        (ChainSpecBasedSpecProvider provider, _) = TestSpecHelper.LoadChainSpec(new ChainSpecJson
+        {
+            Params = new ChainSpecParamsJson
+            {
+                Sip4844TransitionTimestamp = 0,
+                BlobSchedule =
+                [
+                    new BlobScheduleSettings
+                    {
+                        Timestamp = 0,
+                        Max = 12,
+                        Target = 6,
+                        BaseFeeUpdateFraction = 1,
+                    }
+                ]
+            },
+            Genesis = new ChainSpecGenesisJson()
+            {
+                Timestamp = 1
+            }
+        });
+
+        ISyncServer syncServer = Substitute.For<ISyncServer>();
+        syncServer.Genesis.Returns(Build.A.BlockHeader.WithHash(Hash256.Zero).TestObject);
+
+        ForkInfo fi = new(provider, syncServer);
+        fi.EnsureInitialized();
+
+        Assert.That(fi.Forks, Has.Length.EqualTo(1));
+    }
+}

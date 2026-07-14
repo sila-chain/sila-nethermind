@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using DotNetty.Buffers;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages;
+using Nethermind.Serialization.Rlp;
+
+namespace Nethermind.Network.P2P.Subprotocols.Sil.V65.Messages
+{
+    public class PooledTransactionsMessageSerializer : IZeroInnerMessageSerializer<PooledTransactionsMessage>
+    {
+        private readonly TransactionsMessageSerializer _txsMessageDeserializer = new();
+
+        public void Serialize(IByteBuffer byteBuffer, PooledTransactionsMessage message) => _txsMessageDeserializer.Serialize(byteBuffer, message);
+
+        public PooledTransactionsMessage Deserialize(IByteBuffer byteBuffer) =>
+            byteBuffer.DeserializeRlp(Deserialize);
+
+        private static PooledTransactionsMessage Deserialize(ref RlpReader ctx) =>
+            new(TransactionsMessageSerializer.DeserializeTxs(ref ctx));
+
+        public int GetLength(PooledTransactionsMessage message, out int contentLength) => _txsMessageDeserializer.GetLength(message, out contentLength);
+    }
+}

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="../tests.props" />
+
+  <ItemGroup>
+    <Content Include="..\..\tests\LegacyTests\SilaCancun\BlockchainTests\TransitionTests\**\*.*">
+      <Link>Tests\%(RecursiveDir)%(FileName)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Sila.Test.Base\Sila.Test.Base.csproj" />
+  </ItemGroup>
+</Project>

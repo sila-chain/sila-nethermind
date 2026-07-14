@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+namespace Nethermind.Specs.Forks;
+
+public class London() : NamedReleaseSpec<London>(Berlin.Instance)
+{
+    public override void Apply(NamedReleaseSpec spec)
+    {
+        spec.Name = "London";
+        spec.DifficultyBombDelay = 9700000L;
+        spec.IsSip1559Enabled = true;
+        spec.IsSip3198Enabled = true;
+        spec.IsSip3529Enabled = true;
+        spec.IsSip3541Enabled = true;
+        spec.Sip1559TransitionBlock = 12965000;
+    }
+}

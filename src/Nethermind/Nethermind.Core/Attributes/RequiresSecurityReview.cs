@@ -1,0 +1,13 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+
+namespace Nethermind.Core.Attributes
+{
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Method | AttributeTargets.Property)]
+    public class RequiresSecurityReviewAttribute(string comment) : Attribute
+    {
+        private readonly string _comment = comment;
+    }
+}

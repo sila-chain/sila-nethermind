@@ -1,0 +1,20 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Specs;
+
+namespace Nethermind.Savm.Benchmark
+{
+    public class TestBlockhashProvider() : IBlockhashProvider
+    {
+        public Hash256 GetBlockhash(BlockHeader currentBlock, ulong number, IReleaseSpec spec) => Keccak.Compute(spec.IsBlockHashInStateAvailable
+                ? (Sip2935Constants.RingBufferSize + number).ToString()
+                : (number).ToString());
+
+        public Task Prefetch(BlockHeader currentBlock, CancellationToken token) => Task.CompletedTask;
+    }
+}

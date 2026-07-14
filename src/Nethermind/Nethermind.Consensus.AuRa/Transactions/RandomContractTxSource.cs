@@ -1,0 +1,138 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+extern alias BouncyCastle;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using Nethermind.Abi;
+using Nethermind.Consensus.AuRa.Contracts;
+using Nethermind.Consensus.Producers;
+using Nethermind.Consensus.Transactions;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Crypto;
+using Nethermind.Int256;
+using Nethermind.Logging;
+using BouncyCastle::Org.BouncyCastle.Crypto;
+
+namespace Nethermind.Consensus.AuRa.Transactions
+{
+    /// <summary>
+    /// A production implementation of a randomness contract can be found here:
+    /// https://github.com/poanetwork/posdao-contracts/blob/master/contracts/RandomAuRa.sol
+    /// </summary>
+    public class RandomContractTxSource(
+        IList<IRandomContract> contracts,
+        IEciesCipher eciesCipher,
+        ISigner signer,
+        IProtectedPrivateKey previousCryptoKey, // this is for backwards-compatibility when upgrading validator node
+        ICryptoRandom cryptoRandom,
+        ILogManager logManager) : ITxSource
+    {
+        private readonly IEciesCipher _eciesCipher = eciesCipher ?? throw new ArgumentNullException(nameof(eciesCipher));
+        private readonly ISigner _signer = signer ?? throw new ArgumentNullException(nameof(signer));
+        private readonly IProtectedPrivateKey _previousCryptoKey = previousCryptoKey ?? throw new ArgumentNullException(nameof(previousCryptoKey));
+        private readonly IList<IRandomContract> _contracts = contracts ?? throw new ArgumentNullException(nameof(contracts));
+        private readonly ICryptoRandom _random = cryptoRandom ?? throw new ArgumentNullException(nameof(cryptoRandom));
+        private readonly ILogger _logger = logManager?.GetClassLogger<RandomContractTxSource>() ?? throw new ArgumentNullException(nameof(logManager));
+
+        public bool SupportsBlobs => false;
+
+        public IEnumerable<Transaction> GetTransactions(BlockHeader parent, ulong gasLimit, PayloadAttributes? payloadAttribute, bool filterSources)
+        {
+            if (_contracts.TryGetForBlock(parent.Number + 1, out IRandomContract contract))
+            {
+                Transaction? tx = GetTransaction(contract, parent);
+                if (tx is not null)
+                {
+                    yield return tx;
+                }
+            }
+        }
+
+        private Transaction? GetTransaction(in IRandomContract contract, in BlockHeader parent)
+        {
+            try
+            {
+                (IRandomContract.Phase phase, UInt256 round) = contract.GetPhase(parent);
+                switch (phase)
+                {
+                    case IRandomContract.Phase.BeforeCommit:
+                        {
+                            byte[] bytes = new byte[32];
+                            _random.GenerateRandomBytes(bytes);
+                            Hash256 hash = Keccak.Compute(bytes);
+                            PrivateKey? privateKey = _signer.Key;
+                            if (privateKey is not null)
+                            {
+                                byte[] cipher = _eciesCipher.Encrypt(privateKey.PublicKey, bytes);
+                                Metrics.CommitHashTransaction++;
+                                return contract.CommitHash(hash, cipher);
+                            }
+
+                            return null;
+                        }
+                    case IRandomContract.Phase.Reveal:
+                        {
+                            (Hash256 hash, byte[] cipher) = contract.GetCommitAndCipher(parent, round);
+                            byte[] bytes;
+                            try
+                            {
+                                PrivateKey privateKey = _signer.Key;
+                                if (privateKey is not null)
+                                {
+                                    using (privateKey)
+                                    {
+                                        bytes = _eciesCipher.Decrypt(privateKey, cipher).PlainText;
+                                    }
+                                }
+                                else
+                                {
+                                    return null;
+                                }
+                            }
+                            catch (InvalidCipherTextException)
+                            {
+                                // Before we used node key here, now we want to use signer key. So we can move signer to other node.
+                                // But we need to fallback to node key here when we upgrade version.
+                                // This is temporary code after all validators are upgraded we can remove it.
+                                using PrivateKey privateKey = _previousCryptoKey.Unprotect();
+                                bytes = _eciesCipher.Decrypt(privateKey, cipher).PlainText;
+                            }
+
+                            if (bytes?.Length != 32)
+                            {
+                                // This can only happen if there is a bug in the smart contract, or if the entire network goes awry.
+                                throw new AuRaException("Decrypted random number has the wrong length.");
+                            }
+
+                            ValueHash256 computedHash = ValueKeccak.Compute(bytes);
+                            if (!Bytes.AreEqual(hash.Bytes, computedHash.BytesAsSpan))
+                            {
+                                throw new AuRaException("Decrypted random number doesn't agree with the hash.");
+                            }
+
+                            UInt256 number = new(bytes, true);
+
+                            Metrics.RevealNumber++;
+                            return contract.RevealNumber(number);
+                        }
+                }
+            }
+            catch (AuRaException e)
+            {
+                if (_logger.IsError) _logger.Error($"RANDAO Failed on block {parent.ToString(BlockHeader.Format.FullHashAndNumber)} {new StackTrace()}", e);
+            }
+            catch (AbiException e)
+            {
+                if (_logger.IsError) _logger.Error($"RANDAO Failed on block {parent.ToString(BlockHeader.Format.FullHashAndNumber)} {new StackTrace()}", e);
+            }
+
+            return null;
+        }
+
+        public override string ToString() => $"{nameof(RandomContractTxSource)}";
+    }
+}

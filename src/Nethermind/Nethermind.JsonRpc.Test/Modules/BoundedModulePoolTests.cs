@@ -1,0 +1,164 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Threading.Tasks;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Receipts;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Config;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Db.LogIndex;
+using Nethermind.History;
+using Nethermind.JsonRpc.Modules;
+using Nethermind.JsonRpc.Modules.Sil;
+using Nethermind.Logging;
+using Nethermind.Facade;
+using Nethermind.Facade.Sil;
+using Nethermind.JsonRpc.Exceptions;
+using Nethermind.JsonRpc.Modules.Sil.FeeHistory;
+using Nethermind.JsonRpc.Modules.Sil.GasPrice;
+using Nethermind.Network;
+using Nethermind.State;
+using Nethermind.Synchronization;
+using Nethermind.TxPool;
+using Nethermind.Wallet;
+using NSubstitute;
+using NUnit.Framework;
+using BlockTree = Nethermind.Blockchain.BlockTree;
+
+namespace Nethermind.JsonRpc.Test.Modules;
+
+[Parallelizable(ParallelScope.Self)]
+[TestFixture]
+public class BoundedModulePoolTests
+{
+    private BoundedModulePool<ISilRpcModule> _modulePool = null!;
+
+    [SetUp]
+    public Task Initialize()
+    {
+        ITxPool txPool = NullTxPool.Instance;
+
+        BlockTree blockTree = Build.A
+            .BlockTree()
+            .TestObject;
+
+        _modulePool = new BoundedModulePool<ISilRpcModule>(new SilModuleFactory(
+            txPool,
+            Substitute.For<ITxSender>(),
+            NullWallet.Instance,
+            blockTree,
+            new JsonRpcConfig(),
+            LimboLogs.Instance,
+            Substitute.For<IStateReader>(),
+            Substitute.For<IBlockchainBridgeFactory>(),
+            Substitute.For<ISpecProvider>(),
+            Substitute.For<IReceiptStorage>(),
+            Substitute.For<IGasPriceOracle>(),
+            Substitute.For<ISilSyncingInfo>(),
+            Substitute.For<IFeeHistoryOracle>(),
+            Substitute.For<IProtocolsManager>(),
+            new BlocksConfig(),
+            Substitute.For<IForkInfo>(),
+            Substitute.For<ILogIndexConfig>(),
+            new ReceiptConfig(),
+            new SilCapabilitiesProvider(
+                blockTree.AsReadOnly(),
+                Substitute.For<IStateBoundary>(),
+                new SyncConfig(),
+                Substitute.For<ISyncPointers>(),
+                Substitute.For<IHistoryConfig>(),
+                Substitute.For<IHistoryPruner>()),
+            new BlockForRpcFactory()),
+             1, 1000);
+
+        return Task.CompletedTask;
+    }
+
+    [Test]
+    public async Task Ensure_concurrency() => await _modulePool.GetModule(false);
+
+    [Test]
+    public async Task Ensure_limited_exclusive()
+    {
+        await _modulePool.GetModule(false);
+        Assert.ThrowsAsync<ModuleRentalTimeoutException>(() => _modulePool.GetModule(false));
+    }
+
+    [Test]
+    public async Task Ensure_returning_shared_does_not_change_concurrency()
+    {
+        ISilRpcModule shared = await _modulePool.GetModule(true);
+        _modulePool.ReturnModule(shared);
+        await _modulePool.GetModule(false);
+        Assert.ThrowsAsync<ModuleRentalTimeoutException>(() => _modulePool.GetModule(false));
+    }
+
+    [Test]
+    public async Task Ensure_unlimited_shared()
+    {
+        for (int i = 0; i < 1000; i++)
+        {
+            await _modulePool.GetModule(true);
+        }
+    }
+
+    [Test]
+    public async Task Ensure_that_shared_is_never_returned_as_exclusive()
+    {
+        ISilRpcModule sharedRpcModule = await _modulePool.GetModule(true);
+        _modulePool.ReturnModule(sharedRpcModule);
+
+        const int iterations = 1000;
+        async Task rentReturnShared()
+        {
+            for (int i = 0; i < iterations; i++)
+            {
+                // TestContext.Out.WriteLine($"Rent shared {i}");
+                ISilRpcModule silRpcModule = await _modulePool.GetModule(true);
+                Assert.That(silRpcModule, Is.SameAs(sharedRpcModule));
+                _modulePool.ReturnModule(silRpcModule);
+                // TestContext.Out.WriteLine($"Return shared {i}");
+            }
+        }
+
+        async Task rentReturnExclusive()
+        {
+            for (int i = 0; i < iterations; i++)
+            {
+                // TestContext.Out.WriteLine($"Rent exclusive {i}");
+                ISilRpcModule silRpcModule = await _modulePool.GetModule(false);
+                Assert.That(silRpcModule, Is.Not.SameAs(sharedRpcModule));
+                _modulePool.ReturnModule(silRpcModule);
+                // TestContext.Out.WriteLine($"Return exclusive {i}");
+            }
+        }
+
+        Task a = Task.Run(rentReturnExclusive);
+        Task b = Task.Run(rentReturnExclusive);
+        Task c = Task.Run(rentReturnShared);
+        Task d = Task.Run(rentReturnShared);
+
+        await Task.WhenAll(a, b, c, d);
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task Can_rent_and_return(bool canBeShared)
+    {
+        ISilRpcModule silRpcModule = await _modulePool.GetModule(canBeShared);
+        _modulePool.ReturnModule(silRpcModule);
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public async Task Can_rent_and_return_in_a_loop(bool canBeShared)
+    {
+        for (int i = 0; i < 1000; i++)
+        {
+            ISilRpcModule silRpcModule = await _modulePool.GetModule(canBeShared);
+            _modulePool.ReturnModule(silRpcModule);
+        }
+    }
+}

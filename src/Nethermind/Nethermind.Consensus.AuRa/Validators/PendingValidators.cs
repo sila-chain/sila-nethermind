@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Serialization.Rlp;
+
+namespace Nethermind.Consensus.AuRa.Validators
+{
+    public class PendingValidators(ulong blockNumber, Hash256 blockHash, Address[] addresses)
+    {
+        static PendingValidators() => Rlp.RegisterDecoder(typeof(PendingValidators), new PendingValidatorsDecoder());
+
+        public Address[] Addresses { get; } = addresses;
+        public ulong BlockNumber { get; } = blockNumber;
+        public Hash256 BlockHash { get; } = blockHash;
+        public bool AreFinalized { get; set; }
+    }
+}

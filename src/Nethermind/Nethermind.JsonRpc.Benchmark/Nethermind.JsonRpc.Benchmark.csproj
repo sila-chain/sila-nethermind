@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Nullable>annotations</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Nethermind.Core.Test\Nethermind.Core.Test.csproj" />
+    <ProjectReference Include="..\Nethermind.JsonRpc\Nethermind.JsonRpc.csproj" />
+  </ItemGroup>
+
+</Project>

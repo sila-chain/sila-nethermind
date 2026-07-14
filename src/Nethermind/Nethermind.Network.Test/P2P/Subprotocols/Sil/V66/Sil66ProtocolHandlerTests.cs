@@ -1,0 +1,442 @@
+// SPDX-FileCopyrightText: 2025 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Consensus;
+using Nethermind.Consensus.Scheduler;
+using Nethermind.Core;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Core.Timers;
+using Nethermind.Crypto;
+using Nethermind.Logging;
+using Nethermind.Network.P2P;
+using Nethermind.Network.P2P.Messages;
+using Nethermind.Network.P2P.Subprotocols;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V65;
+using Nethermind.Network.P2P.Subprotocols.Sil.V65.Messages;
+using Nethermind.Network.P2P.Subprotocols.Sil.V66;
+using Nethermind.Network.P2P.Subprotocols.Sil.V66.Messages;
+using Nethermind.Network.Rlpx;
+using Nethermind.Network.Test.Builders;
+using Nethermind.Stats;
+using Nethermind.Stats.Model;
+using Nethermind.Synchronization;
+using Nethermind.TxPool;
+using NSubstitute;
+using NUnit.Framework;
+using BlockBodiesMessage = Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages.BlockBodiesMessage;
+using BlockHeadersMessage = Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages.BlockHeadersMessage;
+using GetBlockBodiesMessage = Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages.GetBlockBodiesMessage;
+using GetBlockHeadersMessage = Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages.GetBlockHeadersMessage;
+using GetPooledTransactionsMessage66 = Nethermind.Network.P2P.Subprotocols.Sil.V66.Messages.GetPooledTransactionsMessage;
+using GetNodeDataMessage = Nethermind.Network.P2P.Subprotocols.Sil.V63.Messages.GetNodeDataMessage;
+using GetReceiptsMessage = Nethermind.Network.P2P.Subprotocols.Sil.V63.Messages.GetReceiptsMessage;
+using NodeDataMessage = Nethermind.Network.P2P.Subprotocols.Sil.V63.Messages.NodeDataMessage;
+using PooledTransactionsMessage = Nethermind.Network.P2P.Subprotocols.Sil.V65.Messages.PooledTransactionsMessage;
+using ReceiptsMessage = Nethermind.Network.P2P.Subprotocols.Sil.V63.Messages.ReceiptsMessage;
+
+namespace Nethermind.Network.Test.P2P.Subprotocols.Sil.V66
+{
+    [TestFixture, Parallelizable(ParallelScope.Self)]
+    public class Sil66ProtocolHandlerTests
+    {
+        private ISession _session = null!;
+        private IMessageSerializationService _svc = null!;
+        private ISyncServer _syncManager = null!;
+        private ITxPool _transactionPool = null!;
+        private IGossipPolicy _gossipPolicy = null!;
+        private ITimerFactory _timerFactory = null!;
+        private ISpecProvider _specProvider = null!;
+        private Block _genesisBlock = null!;
+        private Sil66ProtocolHandler _handler = null!;
+        private CompositeDisposable _disposables = null!;
+
+        [SetUp]
+        public void Setup()
+        {
+            _svc = Build.A.SerializationService().WithEth66().TestObject;
+
+            NetworkDiagTracer.IsEnabled = true;
+
+            _disposables = [];
+            _session = Substitute.For<ISession>();
+            Node node = new(TestItem.PublicKeyA, new IPEndPoint(IPAddress.Broadcast, 30303));
+            _session.Node.Returns(node);
+            _session.When(s => s.DeliverMessage(Arg.Any<P2PMessage>())).Do(c => c.Arg<P2PMessage>().AddTo(_disposables));
+            _syncManager = Substitute.For<ISyncServer>();
+            _transactionPool = Substitute.For<ITxPool>();
+            _specProvider = Substitute.For<ISpecProvider>();
+            _gossipPolicy = Substitute.For<IGossipPolicy>();
+            _genesisBlock = Build.A.Block.Genesis.TestObject;
+            _syncManager.Head.Returns(_genesisBlock.Header);
+            _syncManager.Genesis.Returns(_genesisBlock.Header);
+            _timerFactory = Substitute.For<ITimerFactory>();
+            _handler = CreateHandler(RunImmediatelyScheduler.Instance);
+            _handler.Init();
+        }
+
+        private Sil66ProtocolHandler CreateHandler(IBackgroundTaskScheduler backgroundTaskScheduler) =>
+            new(
+                _session,
+                _svc,
+                new NodeStatsManager(_timerFactory, LimboLogs.Instance),
+                _syncManager,
+                backgroundTaskScheduler,
+                _transactionPool,
+                _gossipPolicy,
+                new ForkInfo(_specProvider, _syncManager),
+                LimboLogs.Instance);
+
+        [TearDown]
+        public void TearDown()
+        {
+            _handler?.Dispose();
+            _session?.Dispose();
+            _syncManager?.Dispose();
+            _disposables?.Dispose();
+        }
+
+        [Test]
+        public void Metadata_correct()
+        {
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(_handler.ProtocolCode, Is.EqualTo("sil"));
+                Assert.That(_handler.Name, Is.EqualTo("sil66"));
+                Assert.That(_handler.ProtocolVersion, Is.EqualTo(66));
+                Assert.That(_handler.MessageIdSpaceSize, Is.EqualTo(17));
+                Assert.That(_handler.IncludeInTxPool, Is.True);
+                Assert.That(_handler.ClientId, Is.EqualTo(_session.Node?.ClientId));
+                Assert.That(_handler.HeadHash, Is.Null);
+                Assert.That(_handler.HeadNumber, Is.EqualTo(0));
+            }
+        }
+
+        [Test]
+        public void Can_handle_get_block_headers()
+        {
+            using GetBlockHeadersMessage msg62 = new();
+            using Network.P2P.Subprotocols.Sil.V66.Messages.GetBlockHeadersMessage msg66 = new(1111, msg62);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg66, Sil66MessageCode.GetBlockHeaders);
+            _session.Received().DeliverMessage(Arg.Any<Network.P2P.Subprotocols.Sil.V66.Messages.BlockHeadersMessage>());
+        }
+
+        [Test]
+        public async Task Can_handle_block_headers()
+        {
+            using BlockHeadersMessage msg62 = new(Build.A.BlockHeader.TestObjectNTimes(3).ToPooledList());
+            using Network.P2P.Subprotocols.Sil.V66.Messages.BlockHeadersMessage msg66 = new(1111, msg62);
+
+            _session.When((session) => session.DeliverMessage(Arg.Any<Sil66Message<GetBlockHeadersMessage>>())).Do(callInfo =>
+            {
+                Sil66Message<GetBlockHeadersMessage> message = (Sil66Message<GetBlockHeadersMessage>)callInfo[0];
+                msg66.RequestId = message.RequestId;
+            });
+
+            Task task = ((ISyncPeer)_handler).GetBlockHeaders(1, 1, 1, CancellationToken.None).AddResultTo(_disposables);
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg66, Sil66MessageCode.BlockHeaders);
+            await task;
+        }
+
+        [Test]
+        public void Should_throw_when_receiving_unrequested_block_headers()
+        {
+            using BlockHeadersMessage msg62 = new(Build.A.BlockHeader.TestObjectNTimes(3).ToPooledList());
+            using Network.P2P.Subprotocols.Sil.V66.Messages.BlockHeadersMessage msg66 = new(1111, msg62);
+
+            HandleIncomingStatusMessage();
+            System.Action act = () => HandleZeroMessage(msg66, Sil66MessageCode.BlockHeaders);
+            Assert.That(act, Throws.TypeOf<SubprotocolException>());
+        }
+
+        [Test]
+        public void Can_handle_get_block_bodies()
+        {
+            using GetBlockBodiesMessage msg62 = new(new[] { Keccak.Zero, TestItem.KeccakA });
+            using Network.P2P.Subprotocols.Sil.V66.Messages.GetBlockBodiesMessage msg66 = new(1111, msg62);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg66, Sil66MessageCode.GetBlockBodies);
+            _session.Received().DeliverMessage(Arg.Any<Network.P2P.Subprotocols.Sil.V66.Messages.BlockBodiesMessage>());
+        }
+
+        [Test]
+        public void Should_throw_when_receiving_get_block_bodies_before_status()
+        {
+            using GetBlockBodiesMessage msg62 = new(new[] { Keccak.Zero, TestItem.KeccakA });
+            using Network.P2P.Subprotocols.Sil.V66.Messages.GetBlockBodiesMessage msg66 = new(1111, msg62);
+
+            System.Action act = () => HandleZeroMessage(msg66, Sil66MessageCode.GetBlockBodies);
+
+            Assert.That(act, Throws.TypeOf<SubprotocolException>());
+            _session.DidNotReceive().DeliverMessage(Arg.Any<Network.P2P.Subprotocols.Sil.V66.Messages.BlockBodiesMessage>());
+        }
+
+        [Test]
+        public async Task Can_handle_block_bodies()
+        {
+            using BlockBodiesMessage msg62 = new(Build.A.Block.TestObjectNTimes(3));
+            using Network.P2P.Subprotocols.Sil.V66.Messages.BlockBodiesMessage msg66 = new(1111, msg62);
+
+            _session.When((session) => session.DeliverMessage(Arg.Any<Sil66Message<GetBlockBodiesMessage>>())).Do(callInfo =>
+            {
+                Sil66Message<GetBlockBodiesMessage> message = (Sil66Message<GetBlockBodiesMessage>)callInfo[0];
+                msg66.RequestId = message.RequestId;
+            });
+
+            HandleIncomingStatusMessage();
+            Task task = ((ISyncPeer)_handler).GetBlockBodies(new List<Hash256>(new[] { Keccak.Zero }), CancellationToken.None).AddResultTo(_disposables);
+            HandleZeroMessage(msg66, Sil66MessageCode.BlockBodies);
+            await task;
+        }
+
+        [Test]
+        public void Should_throw_when_receiving_unrequested_block_bodies()
+        {
+            using BlockBodiesMessage msg62 = new(Build.A.Block.TestObjectNTimes(3));
+            using Network.P2P.Subprotocols.Sil.V66.Messages.BlockBodiesMessage msg66 = new(1111, msg62);
+
+            HandleIncomingStatusMessage();
+            System.Action act = () => HandleZeroMessage(msg66, Sil66MessageCode.BlockBodies);
+            Assert.That(act, Throws.TypeOf<SubprotocolException>());
+        }
+
+        [Test]
+        public void Can_handle_get_pooled_transactions()
+        {
+            using Network.P2P.Subprotocols.Sil.V66.Messages.GetPooledTransactionsMessage msg66 = new(new[] { Keccak.Zero, TestItem.KeccakA }.ToPooledList());
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg66, Sil66MessageCode.GetPooledTransactions);
+            _session.Received().DeliverMessage(Arg.Any<Network.P2P.Subprotocols.Sil.V66.Messages.PooledTransactionsMessage>());
+        }
+
+        [Test]
+        public void Should_schedule_GetPooledTransactions_without_request_handler_delegate()
+        {
+            _handler.Dispose();
+            RecordingBackgroundTaskScheduler backgroundTaskScheduler = new();
+            _handler = CreateHandler(backgroundTaskScheduler);
+            _handler.Init();
+
+            using GetPooledTransactionsMessage66 firstMessage = new(new[] { Keccak.Zero }.ToPooledList());
+            using GetPooledTransactionsMessage66 secondMessage = new(new[] { TestItem.KeccakA }.ToPooledList());
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(firstMessage, Sil66MessageCode.GetPooledTransactions);
+            HandleZeroMessage(secondMessage, Sil66MessageCode.GetPooledTransactions);
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(backgroundTaskScheduler.ScheduledFulfillFuncs.Count, Is.EqualTo(2));
+                Assert.That(backgroundTaskScheduler.ScheduledFulfillFuncs[1], Is.SameAs(backgroundTaskScheduler.ScheduledFulfillFuncs[0]));
+                Assert.That(backgroundTaskScheduler.ScheduledRequestsHaveDelegateFields, Is.EqualTo(new[] { false, false }));
+            }
+        }
+
+        [Test]
+        public void Can_handle_pooled_transactions()
+        {
+            Transaction tx = Build.A.Transaction.Signed(new SilaEcdsa(1), TestItem.PrivateKeyA).TestObject;
+            using PooledTransactionsMessage msg65 = new(new ArrayPoolList<Transaction>(1) { tx });
+            using Network.P2P.Subprotocols.Sil.V66.Messages.PooledTransactionsMessage msg66 = new(1111, msg65);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg66, Sil66MessageCode.PooledTransactions);
+        }
+
+        [Test]
+        public void Can_handle_get_node_data()
+        {
+            using GetNodeDataMessage msg63 = new(new[] { Keccak.Zero, TestItem.KeccakA }.ToPooledList());
+            using Network.P2P.Subprotocols.Sil.V66.Messages.GetNodeDataMessage msg66 = new(1111, msg63);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg66, Sil66MessageCode.GetNodeData);
+            _session.Received().DeliverMessage(Arg.Any<Network.P2P.Subprotocols.Sil.V66.Messages.NodeDataMessage>());
+        }
+
+        [Test]
+        public async Task Can_handle_node_data()
+        {
+            using NodeDataMessage msg63 = new(new ByteArrayListAdapter(ArrayPoolList<byte[]>.Empty()));
+            using Network.P2P.Subprotocols.Sil.V66.Messages.NodeDataMessage msg66 = new(1111, msg63);
+
+            _session.When((session) => session.DeliverMessage(Arg.Any<Sil66Message<GetNodeDataMessage>>())).Do(callInfo =>
+            {
+                Sil66Message<GetNodeDataMessage> message = (Sil66Message<GetNodeDataMessage>)callInfo[0];
+                msg66.RequestId = message.RequestId;
+            });
+
+            HandleIncomingStatusMessage();
+            Task task = ((ISyncPeer)_handler).GetNodeData(new List<Hash256>(new[] { Keccak.Zero }), CancellationToken.None).AddResultTo(_disposables);
+            HandleZeroMessage(msg66, Sil66MessageCode.NodeData);
+            await task;
+        }
+
+        [Test]
+        public void Should_throw_when_receiving_unrequested_node_data()
+        {
+            using NodeDataMessage msg63 = new(new ByteArrayListAdapter(ArrayPoolList<byte[]>.Empty()));
+            using Network.P2P.Subprotocols.Sil.V66.Messages.NodeDataMessage msg66 = new(1111, msg63);
+
+            HandleIncomingStatusMessage();
+            System.Action act = () => HandleZeroMessage(msg66, Sil66MessageCode.NodeData);
+            Assert.That(act, Throws.TypeOf<SubprotocolException>());
+        }
+
+        [Test]
+        public void Can_handle_get_receipts()
+        {
+            using GetReceiptsMessage msg63 = new(new[] { Keccak.Zero, TestItem.KeccakA }.ToPooledList());
+            using Network.P2P.Subprotocols.Sil.V66.Messages.GetReceiptsMessage msg66 = new(1111, msg63);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg66, Sil66MessageCode.GetReceipts);
+            _session.Received().DeliverMessage(Arg.Any<Network.P2P.Subprotocols.Sil.V66.Messages.ReceiptsMessage>());
+        }
+
+        [Test]
+        public void Should_throw_when_receiving_get_receipts_before_status()
+        {
+            using GetReceiptsMessage msg63 = new(new[] { Keccak.Zero, TestItem.KeccakA }.ToPooledList());
+            using Network.P2P.Subprotocols.Sil.V66.Messages.GetReceiptsMessage msg66 = new(1111, msg63);
+
+            System.Action act = () => HandleZeroMessage(msg66, Sil66MessageCode.GetReceipts);
+
+            Assert.That(act, Throws.TypeOf<SubprotocolException>());
+            _session.DidNotReceive().DeliverMessage(Arg.Any<Network.P2P.Subprotocols.Sil.V66.Messages.ReceiptsMessage>());
+        }
+
+        [Test]
+        public async Task Can_handle_receipts()
+        {
+            using ReceiptsMessage msg63 = new(ArrayPoolList<TxReceipt[]>.Empty());
+            using Network.P2P.Subprotocols.Sil.V66.Messages.ReceiptsMessage msg66 = new(1111, msg63);
+
+            _session.When((session) => session.DeliverMessage(Arg.Any<Sil66Message<GetReceiptsMessage>>())).Do(callInfo =>
+            {
+                Sil66Message<GetReceiptsMessage> message = (Sil66Message<GetReceiptsMessage>)callInfo[0];
+                msg66.RequestId = message.RequestId;
+            });
+
+            HandleIncomingStatusMessage();
+            Task task = ((ISyncPeer)_handler).GetReceipts(new List<Hash256>(new[] { Keccak.Zero }), CancellationToken.None).AddResultTo(_disposables);
+            HandleZeroMessage(msg66, Sil66MessageCode.Receipts);
+            await task;
+        }
+
+        [Test]
+        public void Should_throw_when_receiving_unrequested_receipts()
+        {
+            using ReceiptsMessage msg63 = new(ArrayPoolList<TxReceipt[]>.Empty());
+            using Network.P2P.Subprotocols.Sil.V66.Messages.ReceiptsMessage msg66 = new(1111, msg63);
+
+            HandleIncomingStatusMessage();
+            System.Action act = () => HandleZeroMessage(msg66, Sil66MessageCode.Receipts);
+            Assert.That(act, Throws.TypeOf<SubprotocolException>());
+        }
+
+
+        [TestCase(0, 0)]
+        [TestCase(1, 1)]
+        [TestCase(256, 1)]
+        [TestCase(257, 2)]
+        [TestCase(512, 2)]
+        [TestCase(1000, 4)]
+        [TestCase(10000, 40)]
+        public void should_request_in_GetPooledTransactionsMessage_up_to_256_txs(int numberOfTransactions, int expectedNumberOfMessages)
+        {
+            const int maxNumberOfTxsInOneMsg = 256;
+
+            _handler = new Sil66ProtocolHandler(
+                _session,
+                _svc,
+                new NodeStatsManager(_timerFactory, LimboLogs.Instance),
+                _syncManager,
+                RunImmediatelyScheduler.Instance,
+                _transactionPool,
+                _gossipPolicy,
+                new ForkInfo(_specProvider, _syncManager),
+                LimboLogs.Instance);
+
+            using ArrayPoolList<Hash256> hashes = new(numberOfTransactions);
+
+            for (int i = 0; i < numberOfTransactions; i++)
+            {
+                hashes.Add(new Hash256(i.ToString("X64")));
+            }
+
+            using NewPooledTransactionHashesMessage hashesMsg = new(hashes);
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(hashesMsg, Sil65MessageCode.NewPooledTransactionHashes);
+
+            _session.Received(expectedNumberOfMessages)
+                .DeliverMessage(Arg.Is<Network.P2P.Subprotocols.Sil.V66.Messages.GetPooledTransactionsMessage>(m =>
+                    m.SilMessage.Hashes.Count == maxNumberOfTxsInOneMsg ||
+                    m.SilMessage.Hashes.Count == numberOfTransactions % maxNumberOfTxsInOneMsg
+                ));
+        }
+
+        private void HandleZeroMessage<T>(T msg, int messageCode) where T : MessageBase
+        {
+            using DisposableByteBuffer getBlockHeadersPacket = _svc.ZeroSerialize(msg).AsDisposable();
+            getBlockHeadersPacket.ReadByte();
+            _handler.HandleMessage(new ZeroPacket(getBlockHeadersPacket) { PacketType = (byte)messageCode });
+        }
+        private void HandleIncomingStatusMessage()
+        {
+            using StatusMessage statusMsg = new();
+            statusMsg.GenesisHash = _genesisBlock.Hash;
+            statusMsg.BestHash = _genesisBlock.Hash;
+
+            using DisposableByteBuffer statusPacket = _svc.ZeroSerialize(statusMsg).AsDisposable();
+            statusPacket.ReadByte();
+            _handler.HandleMessage(new ZeroPacket(statusPacket) { PacketType = 0 });
+        }
+
+        private sealed class RecordingBackgroundTaskScheduler : IBackgroundTaskScheduler
+        {
+            public List<Delegate> ScheduledFulfillFuncs { get; } = [];
+            public List<bool> ScheduledRequestsHaveDelegateFields { get; } = [];
+
+            public bool TryScheduleTask<TReq>(TReq request, Func<TReq, CancellationToken, Task> fulfillFunc, TimeSpan? timeout = null, string? source = null)
+            {
+                ScheduledRequestsHaveDelegateFields.Add(HasDelegateField<TReq>());
+                ScheduledFulfillFuncs.Add(fulfillFunc);
+                fulfillFunc(request, CancellationToken.None).GetAwaiter().GetResult();
+                return true;
+            }
+
+            private static bool HasDelegateField<TReq>()
+            {
+                FieldInfo[] fields = typeof(TReq).GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    FieldInfo field = fields[i];
+                    if (typeof(Delegate).IsAssignableFrom(field.FieldType))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+    }
+}

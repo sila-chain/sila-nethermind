@@ -1,0 +1,179 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+namespace Nethermind.JsonRpc
+{
+    public static class ErrorCodes
+    {
+        public const int None = 0;
+
+        /// <summary>
+        /// Execution reverted (Geth compatibility)
+        /// </summary>
+        public const int ExecutionReverted = 3;
+
+        /// <summary>
+        /// Invalid JSON
+        /// </summary>
+        public const int ParseError = -32700;
+
+        /// <summary>
+        /// JSON is not a valid request object
+        /// </summary>
+        public const int InvalidRequest = -32600;
+
+        /// <summary>
+        /// Method does not exist
+        /// </summary>
+        public const int MethodNotFound = -32601;
+
+        /// <summary>
+        /// Invalid method parameters
+        /// </summary>
+        public const int InvalidParams = -32602;
+
+        /// <summary>
+        /// Internal JSON-RPC error
+        /// </summary>
+        public const int InternalError = -32603;
+
+        /// <summary>
+        /// Missing or invalid parameters
+        /// </summary>
+        public const int InvalidInput = Default;
+
+        /// <summary>
+        /// SAVM execution error (out of gas, insufficient funds during execution, etc.)
+        /// </summary>
+        public const int ExecutionError = Default;
+
+        /// <summary>
+        /// Requested resource not found
+        /// </summary>
+        public const int ResourceNotFound = Default;
+
+        /// <summary>
+        /// Requested block access list resource not found.
+        /// </summary>
+        /// <remarks>
+        /// The execution-apis block access list methods use a dedicated code while keeping
+        /// <c>Resource not found</c> as the error message.
+        /// </remarks>
+        public const int BlockAccessListResourceNotFound = -32001;
+
+        /// <summary>
+        /// Transaction creation failed
+        /// </summary>
+        public const int TransactionRejected = Default;
+
+        /// <summary>
+        /// Requested resource not available
+        /// </summary>
+        public const int ResourceUnavailable = -32002;
+
+        /// <summary>
+        /// Account locked
+        /// </summary>
+        public const int AccountLocked = -32020;
+
+        /// <summary>
+        /// Request exceeds defined limit
+        /// </summary>
+        public const int LimitExceeded = -32005;
+
+        /// <summary>
+        /// Request exceeds defined timeout limit
+        /// </summary>
+        public const int Timeout = -32016;
+
+        /// <summary>
+        /// Request exceeds defined timeout limit
+        /// </summary>
+        public const int ModuleTimeout = -32017;
+
+        /// <summary>
+        /// Unknown block error
+        /// </summary>
+        public const int UnknownBlockError = -39001;
+
+        /// <summary>
+        /// Invalid RPC simulate call block number out of order
+        /// </summary>
+        public const int InvalidInputBlocksOutOfOrder = -38020;
+
+        /// <summary>
+        /// Invalid RPC simulate call Block timestamp in sequence did not increase
+        /// </summary>
+        public const int BlockTimestampNotIncreased = -38021;
+
+        /// <summary>
+        /// MovePrecompileToAddress referenced itself in replacement
+        /// </summary>
+        public const int MovePrecompileSelfReference = -38022;
+
+        /// <summary>
+        /// Too many blocks or calls — client limit exceeded
+        /// </summary>
+        public const int ClientLimitExceededError = -38026;
+
+        /// <summary>
+        /// Block is not available due to history expiry policy
+        /// </summary>
+        public const int PrunedHistoryUnavailable = 4444;
+
+        /// <summary>
+        /// Data is not available due to sip not being enabled yet
+        /// </summary>
+        public const int UnavailableBeforeFork = 4445;
+
+        /// <summary>
+        /// Default error code
+        /// </summary>
+        public const int Default = -32000;
+
+        /// <summary>
+        /// Transaction nonce is lower than the account's current nonce — sil_simulateV1 spec error
+        /// </summary>
+        public const int NonceTooLow = -38010;
+
+        /// <summary>
+        /// Transaction nonce is higher than the account's current nonce — sil_simulateV1 spec error
+        /// </summary>
+        public const int NonceTooHigh = -38011;
+
+        /// <summary>
+        /// Transaction maxFeePerGas is below the block base fee — sil_simulateV1 spec error
+        /// </summary>
+        public const int FeeCapBelowBaseFee = -38012;
+
+        /// <summary>
+        /// Transaction gas limit is below the intrinsic gas cost — sil_simulateV1 spec error
+        /// </summary>
+        public const int IntrinsicGas = -38013;
+
+        /// <summary>
+        /// Not enough value to cover transaction costs — sil_simulateV1 spec error
+        /// </summary>
+        public const int InsufficientFunds = -38014;
+
+        /// <summary>
+        /// Gas limit reached — sil_simulateV1 spec error
+        /// </summary>
+        public const int BlockGasLimitReached = -38015;
+
+        /// <summary>
+        /// Sender account has deployed code (is not an EOA) — sil_simulateV1 spec error
+        /// </summary>
+        public const int SenderIsNotEoa = -38024;
+
+        /// <summary>
+        /// SIP-3860. Code size is too big — sil_simulateV1 spec error
+        /// </summary>
+        public const int MaxInitCodeSizeExceeded = -38025;
+
+        /// <summary>
+        /// Error during SAVM execution
+        /// </summary>
+        public const int VMError = -32015;
+    }
+}

@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+using Nethermind.Int256;
+
+namespace Sila.Test.Base
+{
+    public class LegacyTransactionJson
+    {
+        public byte[] Data { get; set; }
+        public ulong GasLimit { get; set; }
+        public UInt256 GasPrice { get; set; }
+        public ulong Nonce { get; set; }
+        public Address To { get; set; }
+        public UInt256 Value { get; set; }
+        public string Sender { get; set; }
+        public byte[] R { get; set; }
+        public byte[] S { get; set; }
+        public ulong V { get; set; }
+    }
+}

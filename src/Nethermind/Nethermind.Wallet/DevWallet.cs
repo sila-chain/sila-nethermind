@@ -1,0 +1,126 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using System.Security;
+using Nethermind.Core;
+using Nethermind.Core.Attributes;
+using Nethermind.Core.Crypto;
+using Nethermind.Crypto;
+using Nethermind.Logging;
+
+namespace Nethermind.Wallet
+{
+    [DoNotUseInSecuredContext("For dev purposes only")]
+    public class DevWallet : IWallet
+    {
+        private const string AnyPassword = "#DEV_ACCOUNT_NETHERMIND_ANY_PASSWORD#";
+        private static readonly byte[] _keySeed = new byte[32];
+        private readonly ILogger _logger;
+        private readonly Dictionary<Address, bool> _isUnlocked = [];
+        private readonly Dictionary<Address, PrivateKey> _keys = [];
+        private readonly Dictionary<Address, string> _passwords = [];
+        public event EventHandler<AccountLockedEventArgs> AccountLocked;
+        public event EventHandler<AccountUnlockedEventArgs> AccountUnlocked;
+
+        public DevWallet(IWalletConfig walletConfig, ILogManager logManager)
+        {
+            _logger = logManager?.GetClassLogger<DevWallet>() ?? throw new ArgumentNullException(nameof(logManager));
+
+            _keySeed[31] = 1;
+            for (int i = 0; i < walletConfig?.DevAccounts; i++)
+            {
+                PrivateKey key = new(_keySeed);
+                _keys.Add(key.Address, key);
+                _passwords.Add(key.Address, AnyPassword);
+                _isUnlocked.Add(key.Address, true);
+                _keySeed[31]++;
+            }
+        }
+
+        public void Import(byte[] keyData, SecureString passphrase) => throw new NotSupportedException();
+
+        public Address[] GetAccounts() => _keys.Keys.ToArray();
+
+        public Address NewAccount(SecureString passphrase)
+        {
+            using PrivateKeyGenerator privateKeyGenerator = new();
+            PrivateKey key = privateKeyGenerator.Generate();
+            _keys.Add(key.Address, key);
+            _isUnlocked.Add(key.Address, true);
+            _passwords.Add(key.Address, passphrase.Unsecure());
+            return key.Address;
+        }
+
+        public bool UnlockAccount(Address address, SecureString passphrase, TimeSpan? timeSpan)
+        {
+
+            if (address is null || address == Address.Zero)
+            {
+                return false;
+            }
+
+            if (!_passwords.ContainsKey(address))
+            {
+                if (_logger.IsError) _logger.Error("Account does not exist.");
+                return false;
+            }
+
+            if (!CheckPassword(address, passphrase))
+            {
+                if (_logger.IsError) _logger.Error("Password is invalid.");
+                return false;
+            }
+
+            AccountUnlocked?.Invoke(this, new AccountUnlockedEventArgs(address));
+            _isUnlocked[address] = true;
+
+            return true;
+        }
+
+        public bool LockAccount(Address address)
+        {
+            if (!_passwords.ContainsKey(address))
+            {
+                if (_logger.IsError) _logger.Error("Account does not exist.");
+                return false;
+            }
+
+            AccountLocked?.Invoke(this, new AccountLockedEventArgs(address));
+            _isUnlocked[address] = false;
+
+            return true;
+        }
+        public bool IsUnlocked(Address address) => _isUnlocked.TryGetValue(address, out bool unlocked) && unlocked;
+
+        private bool CheckPassword(Address address, SecureString passphrase) => _passwords[address] == AnyPassword || passphrase?.Unsecure() == _passwords[address];
+
+        public bool TrySign(in ValueHash256 message, Address address, [NotNullWhen(true)] out Signature signature)
+        {
+            if (!_isUnlocked.TryGetValue(address, out bool unlocked) || !unlocked || !_keys.TryGetValue(address, out PrivateKey key))
+            {
+                signature = null;
+                return false;
+            }
+
+            signature = WalletSigner.Sign(in message, key);
+            return true;
+        }
+
+        public bool TrySign(in ValueHash256 message, Address address, SecureString passphrase, [NotNullWhen(true)] out Signature signature)
+        {
+            // Dev accounts created with AnyPassword accept any passphrase here (see CheckPassword) — dev-only behavior.
+            if (!_passwords.ContainsKey(address) || !CheckPassword(address, passphrase) || !_keys.TryGetValue(address, out PrivateKey key))
+            {
+                signature = null;
+                return false;
+            }
+
+            signature = WalletSigner.Sign(in message, key);
+            return true;
+        }
+    }
+}

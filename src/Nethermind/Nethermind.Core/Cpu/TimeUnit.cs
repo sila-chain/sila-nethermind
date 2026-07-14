@@ -1,0 +1,112 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+// Derived from https://github.com/AndreyAkinshin/perfolizer
+// Licensed under the MIT License
+
+using System;
+using System.Linq;
+
+namespace Nethermind.Core.Cpu;
+
+public class TimeUnit : IEquatable<TimeUnit>
+{
+    public static readonly TimeUnit Nanosecond = new("ns", "Nanosecond", 1L);
+
+    public static readonly TimeUnit Microsecond = new("μs", "Microsecond", 1000L);
+
+    public static readonly TimeUnit Millisecond = new("ms", "Millisecond", 1000000L);
+
+    public static readonly TimeUnit Second = new("s", "Second", 1000000000L);
+
+    public static readonly TimeUnit Minute = new("m", "Minute", Second.NanosecondAmount * 60);
+
+    public static readonly TimeUnit Hour = new("h", "Hour", Minute.NanosecondAmount * 60);
+
+    public static readonly TimeUnit Day = new("d", "Day", Hour.NanosecondAmount * 24);
+
+    public static readonly TimeUnit[] All = new TimeUnit[7] { Nanosecond, Microsecond, Millisecond, Second, Minute, Hour, Day };
+
+    public string Name { get; }
+
+    public string Description { get; }
+
+    public long NanosecondAmount { get; }
+
+    private TimeUnit(string name, string description, long nanosecondAmount)
+    {
+        Name = name;
+        Description = description;
+        NanosecondAmount = nanosecondAmount;
+    }
+
+    public TimeInterval ToInterval(long value = 1L) => new(value, this);
+
+    public static TimeUnit GetBestTimeUnit(params double[] values)
+    {
+        if (values.Length == 0)
+        {
+            return Nanosecond;
+        }
+
+        double num = values.Min();
+        TimeUnit[] all = All;
+        foreach (TimeUnit timeUnit in all)
+        {
+            if (num < (double)(timeUnit.NanosecondAmount * 1000))
+            {
+                return timeUnit;
+            }
+        }
+
+        return All.Last();
+    }
+
+    public static double Convert(double value, TimeUnit from, TimeUnit to) => value * (double)from.NanosecondAmount / (double)(to ?? GetBestTimeUnit(value)).NanosecondAmount;
+
+    public bool Equals(TimeUnit? other)
+    {
+        if (other is null)
+        {
+            return false;
+        }
+
+        if (ReferenceEquals((object)this, other))
+        {
+            return true;
+        }
+
+        if (object.Equals(Name, other.Name) && string.Equals(Description, other.Description))
+        {
+            return NanosecondAmount == other.NanosecondAmount;
+        }
+
+        return false;
+    }
+
+    public override bool Equals(object? obj)
+    {
+        if (obj is null)
+        {
+            return false;
+        }
+
+        if ((object)this == obj)
+        {
+            return true;
+        }
+
+        if (obj.GetType() != GetType())
+        {
+            return false;
+        }
+
+        return Equals((TimeUnit)obj);
+    }
+
+    public override int GetHashCode() => (((((Name is not null) ? Name.GetHashCode() : 0) * 397) ^ ((Description is not null) ? Description.GetHashCode() : 0)) * 397) ^ NanosecondAmount.GetHashCode();
+
+    public static bool operator ==(TimeUnit left, TimeUnit right) => object.Equals(left, right);
+
+    public static bool operator !=(TimeUnit left, TimeUnit right) => !object.Equals(left, right);
+}

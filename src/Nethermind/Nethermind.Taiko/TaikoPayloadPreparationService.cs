@@ -1,0 +1,203 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Concurrent;
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Blockchain.Tracing;
+using Nethermind.Consensus.Processing;
+using Nethermind.Consensus.Producers;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.ExecutionRequest;
+using Nethermind.Core.Specs;
+using Nethermind.Savm.State;
+using Nethermind.Int256;
+using Nethermind.Logging;
+using Nethermind.Merge.Plugin.BlockProduction;
+using Nethermind.Serialization.Rlp;
+using Nethermind.Taiko.TaikoSpec;
+
+namespace Nethermind.Taiko;
+
+public class TaikoPayloadPreparationService(
+    IBlockchainProcessor processor,
+    IWorldState worldState,
+    IL1OriginStore l1OriginStore,
+    ISpecProvider specProvider,
+    ILogManager logManager,
+    IRlpDecoder<Transaction> txDecoder) : IPayloadPreparationService
+{
+    private const int _emptyBlockProcessingTimeout = 2000;
+    private readonly SemaphoreSlim _worldStateLock = new(1);
+
+    private readonly ILogger _logger = logManager.GetClassLogger<TaikoPayloadPreparationService>();
+
+    private readonly ConcurrentDictionary<string, IBlockProductionContext> _payloadStorage = new();
+
+    public string? StartPreparingPayload(BlockHeader parentHeader, PayloadAttributes payloadAttributes)
+    {
+        TaikoPayloadAttributes attrs = (payloadAttributes as TaikoPayloadAttributes)
+            ?? throw new InvalidOperationException("Payload attributes have incorrect type. Expected TaikoPayloadAttributes.");
+
+        string payloadId = payloadAttributes.GetPayloadId(parentHeader);
+
+        _payloadStorage.AddOrUpdate(payloadId, payloadId =>
+            {
+                Block block = BuildBlock(parentHeader, attrs);
+                if (parentHeader.StateRoot is null) throw new InvalidOperationException("Parent state root is null");
+                block = ProcessBlock(block, parentHeader);
+
+                // L1Origin **MUST NOT** be null, it's a required field in PayloadAttributes.
+                L1Origin l1Origin = attrs.L1Origin ?? throw new InvalidOperationException("L1Origin is required");
+
+                // Set the block hash before inserting the L1Origin into database.
+                l1Origin.L2BlockHash = block.Hash;
+
+                // Write L1Origin.
+                l1OriginStore.WriteL1Origin(l1Origin.BlockId, l1Origin);
+
+                // Write the head L1Origin, only when it's not a preconfirmation block.
+                if (!l1Origin.IsPreconfBlock)
+                {
+                    l1OriginStore.WriteHeadL1Origin(l1Origin.BlockId);
+
+                    // Write the batch to block mapping if the batch ID is given.
+                    if (attrs.BlockMetadata?.BatchID is not null)
+                    {
+                        l1OriginStore.WriteBatchToLastBlockID(attrs.BlockMetadata.BatchID.Value, l1Origin.BlockId);
+                    }
+                }
+
+                // ignore TryAdd failure (it can only happen if payloadId is already in the dictionary)
+                return new NoBlockProductionContext(block, UInt256.Zero);
+            },
+            (payloadId, existing) =>
+            {
+                if (_logger.IsInfo) _logger.Info($"Payload with the same parameters has already started. PayloadId: {payloadId}");
+
+                // Write L1Origin and HeadL1Origin even if the payload is already in the cache.
+                L1Origin l1Origin = attrs.L1Origin ?? throw new InvalidOperationException("L1Origin is required");
+                l1OriginStore.WriteL1Origin(l1Origin.BlockId, l1Origin);
+
+                if (!l1Origin.IsPreconfBlock)
+                {
+                    l1OriginStore.WriteHeadL1Origin(l1Origin.BlockId);
+
+                    if (attrs.BlockMetadata?.BatchID is not null)
+                    {
+                        l1OriginStore.WriteBatchToLastBlockID(attrs.BlockMetadata.BatchID.Value, l1Origin.BlockId);
+                    }
+                }
+
+                return existing;
+            });
+
+        return payloadId;
+    }
+
+    private Block ProcessBlock(Block block, BlockHeader? parent, CancellationToken token = default)
+    {
+        if (_worldStateLock.Wait(_emptyBlockProcessingTimeout))
+        {
+            try
+            {
+                if (worldState.HasStateForBlock(parent))
+                {
+                    return processor.Process(block, ProcessingOptions.ProducingBlock, NullBlockTracer.Instance, token)
+                        ?? throw new InvalidOperationException("Block processing failed");
+                }
+            }
+            finally
+            {
+                _worldStateLock.Release();
+            }
+        }
+
+        throw new EmptyBlockProductionException("Setting state for processing block failed");
+    }
+
+    private BlockHeader BuildHeader(BlockHeader parentHeader, TaikoPayloadAttributes payloadAttributes)
+    {
+        BlockHeader header = new(
+            parentHeader.Hash!,
+            Keccak.OfAnEmptySequenceRlp,
+            payloadAttributes.BlockMetadata!.Beneficiary!,
+            UInt256.Zero,
+            parentHeader.Number + 1,
+            payloadAttributes.BlockMetadata.GasLimit,
+            payloadAttributes.Timestamp,
+            payloadAttributes.BlockMetadata.ExtraData!)
+        {
+            MixHash = payloadAttributes.BlockMetadata.MixHash,
+            ParentBeaconBlockRoot = payloadAttributes.ParentBeaconBlockRoot,
+            BaseFeePerGas = payloadAttributes.BaseFeePerGas,
+            Difficulty = UInt256.Zero,
+            TotalDifficulty = UInt256.Zero,
+        };
+
+        ITaikoReleaseSpec taikoSpec = (ITaikoReleaseSpec)specProvider.GetSpec(header);
+
+        // Taiko L2 has no real blobs, no beacon root data, and no execution-layer deposits.
+        // These header fields are pinned only from Unzen onwards (matching alethia-reth's
+        // normalize_parent_beacon_block_root, which gates on is_uzen_active rather than the
+        // chainspec SIP timestamps).  The Taiko driver's isKnownCanonicalBlock requires
+        // ParentBeaconBlockRoot==nil and RequestsHash==nil for pre-Unzen (Shasta) blocks;
+        // pinning them to zero earlier would force the driver to re-derive every proposal
+        // from L1 instead of taking the canonical-chain shortcut.
+        if (taikoSpec.IsUnzenEnabled)
+        {
+            header.BlobGasUsed = 0;
+            header.ExcessBlobGas = 0;
+            header.ParentBeaconBlockRoot = Keccak.Zero;
+            header.RequestsHash = ExecutionRequestExtensions.EmptyRequestsHash;
+        }
+
+        return header;
+    }
+
+    private Transaction[] BuildTransactions(TaikoPayloadAttributes payloadAttributes)
+    {
+        RlpReader ctx = new(payloadAttributes.BlockMetadata!.TxList!);
+
+        int transactionsSequenceLength = ctx.ReadSequenceLength();
+        int transactionsCheck = ctx.Position + transactionsSequenceLength;
+
+        int txCount = ctx.PeekNumberOfItemsRemaining(transactionsCheck);
+        ctx.GuardLimit(txCount);
+
+        Transaction[] transactions = new Transaction[txCount];
+        int txIndex = 0;
+
+        while (ctx.Position < transactionsCheck)
+        {
+            transactions[txIndex++] = txDecoder.DecodeGuardNotNull(ref ctx);
+        }
+
+        ctx.Check(transactionsCheck);
+
+        return transactions;
+    }
+
+    private Block BuildBlock(BlockHeader parentHeader, TaikoPayloadAttributes payloadAttributes)
+    {
+        BlockHeader header = BuildHeader(parentHeader, payloadAttributes);
+        Transaction[] transactions = BuildTransactions(payloadAttributes);
+
+        return new BlockToProduce(header, transactions, [], payloadAttributes.Withdrawals);
+    }
+
+    public ValueTask<IBlockProductionContext?> GetPayload(string payloadId, bool skipCancel = false)
+    {
+        if (_payloadStorage.TryRemove(payloadId, out IBlockProductionContext? blockContext))
+            return ValueTask.FromResult<IBlockProductionContext?>(blockContext);
+
+        return ValueTask.FromResult<IBlockProductionContext?>(null);
+    }
+
+    public void CancelBlockProduction(string payloadId) => _ = GetPayload(payloadId);
+
+
+    public event EventHandler<BlockEventArgs>? BlockImproved { add { } remove { } }
+}

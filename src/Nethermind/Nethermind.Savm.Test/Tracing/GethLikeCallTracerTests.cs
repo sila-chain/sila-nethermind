@@ -1,0 +1,744 @@
+// SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using Nethermind.Core;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Blockchain.Tracing.GethStyle;
+using Nethermind.Blockchain.Tracing.GethStyle.Custom;
+using Nethermind.Blockchain.Tracing.GethStyle.Custom.Native.Call;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Serialization.Json;
+using Nethermind.Specs;
+using Nethermind.Savm.State;
+using NUnit.Framework;
+
+namespace Nethermind.Savm.Test.Tracing;
+
+[TestFixture]
+public class GethLikeCallTracerTests : VirtualMachineTestsBase
+{
+    private static readonly JsonSerializerOptions SerializerOptions = new(SilaJsonSerializer.JsonOptionsIndented) { NewLine = "\n" };
+    private const string? WithLog = """{"withLog":true}""";
+    private const string? OnlyTopCall = """{"onlyTopCall":true}""";
+    private const string? WithLogAndOnlyTopCall = """{"withLog":true,"onlyTopCall":true}""";
+
+    private string ExecuteCallTrace(byte[] code, string? tracerConfig = null)
+    {
+        (_, Transaction tx) = PrepareTx(MainnetSpecProvider.CancunActivation, 100000, code);
+        using NativeCallTracer tracer = new(tx, GetGethTraceOptions(tracerConfig));
+        using GethLikeTxTrace callTrace = Execute(tracer, code, MainnetSpecProvider.CancunActivation).BuildResult();
+        return JsonSerializer.Serialize(callTrace.CustomTracerResult?.Value, SerializerOptions);
+    }
+
+    private static GethTraceOptions GetGethTraceOptions(string? config) => GethTraceOptions.Default with
+    {
+        Tracer = NativeCallTracer.CallTracer,
+        TracerConfig = config is not null ? JsonSerializer.Deserialize<JsonElement>(config) : null
+    };
+
+    [Test]
+    public void Test_CallTrace_SingleCall()
+    {
+        byte[] code = Prepare.SavmCode
+            .PushData(SampleHexData1.PadLeft(64, '0'))
+            .PushData(0)
+            .Op(Instruction.SSTORE)
+            .PushData(SampleHexData2.PadLeft(64, '0'))
+            .PushData(32)
+            .Op(Instruction.SSTORE)
+            .Op(Instruction.STOP)
+            .Done;
+
+        string callTrace = ExecuteCallTrace(code);
+        const string expectedCallTrace = """
+{
+  "type": "CALL",
+  "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+  "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+  "value": "0x1",
+  "gas": "0x186a0",
+  "gasUsed": "0xfebc",
+  "input": "0x"
+}
+""";
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_NestedCalls()
+    {
+        byte[] code = CreateNestedCallsCode();
+        string callTrace = ExecuteCallTrace(code);
+        const string expectedCallTrace = """
+{
+  "type": "CALL",
+  "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+  "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+  "value": "0x1",
+  "gas": "0x186a0",
+  "gasUsed": "0x16644",
+  "input": "0x",
+  "calls": [
+    {
+      "type": "CALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x0",
+      "gas": "0xc350",
+      "gasUsed": "0x8400",
+      "input": "0xa01234",
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x76e68a8696537e4141926f3e528733af9e237d69",
+          "to": "0xd75a3a95360e44a3874e691fb48d77855f127069",
+          "value": "0x0",
+          "gas": "0x4513",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    },
+    {
+      "type": "DELEGATECALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x1",
+      "gas": "0xa342",
+      "gasUsed": "0x8400",
+      "input": "0x",
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+          "to": "0x89aa9b2ce05aaef815f25b237238c0b4ffff6ae3",
+          "value": "0x0",
+          "gas": "0x2585",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    }
+  ]
+}
+""";
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_NestedCalls_WithLog()
+    {
+        byte[] code = CreateNestedCallsCode();
+        string callTrace = ExecuteCallTrace(code, WithLog);
+        const string expectedCallTrace = """
+{
+  "type": "CALL",
+  "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+  "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+  "value": "0x1",
+  "gas": "0x186a0",
+  "gasUsed": "0x16644",
+  "input": "0x",
+  "logs": [
+    {
+      "address": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "data": "0x",
+      "topics": [],
+      "position": "0x2"
+    }
+  ],
+  "calls": [
+    {
+      "type": "CALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x0",
+      "gas": "0xc350",
+      "gasUsed": "0x8400",
+      "input": "0xa01234",
+      "logs": [
+        {
+          "address": "0x76e68a8696537e4141926f3e528733af9e237d69",
+          "data": "0x",
+          "topics": ["0x1f675bff07515f5df96737194ea945c36c41e7b4fcef307b7cd4d0e602a69111","0x03783fac2efed8fbc9ad443e592ee30e61d65f471140c10ca155e937b435b760"
+          ],
+          "position": "0x1"
+        }
+      ],
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x76e68a8696537e4141926f3e528733af9e237d69",
+          "to": "0xd75a3a95360e44a3874e691fb48d77855f127069",
+          "value": "0x0",
+          "gas": "0x4513",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    },
+    {
+      "type": "DELEGATECALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x1",
+      "gas": "0xa342",
+      "gasUsed": "0x8400",
+      "input": "0x",
+      "logs": [
+        {
+          "address": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+          "data": "0x",
+          "topics": ["0x1f675bff07515f5df96737194ea945c36c41e7b4fcef307b7cd4d0e602a69111","0x03783fac2efed8fbc9ad443e592ee30e61d65f471140c10ca155e937b435b760"
+          ],
+          "position": "0x1"
+        }
+      ],
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+          "to": "0x89aa9b2ce05aaef815f25b237238c0b4ffff6ae3",
+          "value": "0x0",
+          "gas": "0x2585",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    }
+  ]
+}
+""";
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_NestedCalls_OnlyTopCall()
+    {
+        byte[] code = CreateNestedCallsCode();
+        string callTrace = ExecuteCallTrace(code, OnlyTopCall);
+        const string expectedCallTrace = """
+{
+  "type": "CALL",
+  "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+  "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+  "value": "0x1",
+  "gas": "0x186a0",
+  "gasUsed": "0x16644",
+  "input": "0x"
+}
+""";
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_NestedCalls_WithLogsAndOnlyTopCall()
+    {
+        byte[] code = CreateNestedCallsCode();
+        string callTrace = ExecuteCallTrace(code, WithLogAndOnlyTopCall);
+        const string expectedCallTrace = """
+{
+  "type": "CALL",
+  "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+  "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+  "value": "0x1",
+  "gas": "0x186a0",
+  "gasUsed": "0x16644",
+  "input": "0x",
+  "logs": [
+    {
+      "address": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "data": "0x",
+      "topics": [],
+      "position": "0x0"
+    }
+  ]
+}
+""";
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_NestedCalls_RevertParentCall()
+    {
+        byte[] code = CreateNestedCallsCode(true);
+        string callTrace = ExecuteCallTrace(code, WithLog);
+        const string expectedCallTrace = """
+{
+  "type": "CALL",
+  "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+  "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+  "value": "0x1",
+  "gas": "0x186a0",
+  "gasUsed": "0x1664a",
+  "input": "0x",
+  "error": "execution reverted",
+  "calls": [
+    {
+      "type": "CALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x0",
+      "gas": "0xc350",
+      "gasUsed": "0x8400",
+      "input": "0xa01234",
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x76e68a8696537e4141926f3e528733af9e237d69",
+          "to": "0xd75a3a95360e44a3874e691fb48d77855f127069",
+          "value": "0x0",
+          "gas": "0x4513",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    },
+    {
+      "type": "DELEGATECALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x1",
+      "gas": "0xa342",
+      "gasUsed": "0x8400",
+      "input": "0x",
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+          "to": "0x89aa9b2ce05aaef815f25b237238c0b4ffff6ae3",
+          "value": "0x0",
+          "gas": "0x2585",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    }
+  ]
+}
+""";
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_NestedCalls_RevertInternalCall()
+    {
+        byte[] code = CreateNestedCallsCode(false, true);
+        string callTrace = ExecuteCallTrace(code, WithLog);
+        const string expectedCallTrace = """
+{
+  "type": "CALL",
+  "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+  "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+  "value": "0x1",
+  "gas": "0x186a0",
+  "gasUsed": "0x16650",
+  "input": "0x",
+  "logs": [
+    {
+      "address": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "data": "0x",
+      "topics": [],
+      "position": "0x2"
+    }
+  ],
+  "calls": [
+    {
+      "type": "CALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x0",
+      "gas": "0xc350",
+      "gasUsed": "0x8406",
+      "input": "0xa01234",
+      "error": "execution reverted",
+      "logs": [
+        {
+          "address": "0x76e68a8696537e4141926f3e528733af9e237d69",
+          "data": "0x",
+          "topics": ["0x1f675bff07515f5df96737194ea945c36c41e7b4fcef307b7cd4d0e602a69111","0x03783fac2efed8fbc9ad443e592ee30e61d65f471140c10ca155e937b435b760"
+          ],
+          "position": "0x1"
+        }
+      ],
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x76e68a8696537e4141926f3e528733af9e237d69",
+          "to": "0xd75a3a95360e44a3874e691fb48d77855f127069",
+          "value": "0x0",
+          "gas": "0x4513",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    },
+    {
+      "type": "DELEGATECALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x1",
+      "gas": "0xa33c",
+      "gasUsed": "0x8406",
+      "input": "0x",
+      "error": "execution reverted",
+      "logs": [
+        {
+          "address": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+          "data": "0x",
+          "topics": ["0x1f675bff07515f5df96737194ea945c36c41e7b4fcef307b7cd4d0e602a69111","0x03783fac2efed8fbc9ad443e592ee30e61d65f471140c10ca155e937b435b760"
+          ],
+          "position": "0x1"
+        }
+      ],
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+          "to": "0x89aa9b2ce05aaef815f25b237238c0b4ffff6ae3",
+          "value": "0x0",
+          "gas": "0x257f",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    }
+  ]
+}
+""";
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_NestedCalls_RevertAllCalls()
+    {
+        byte[] code = CreateNestedCallsCode(true, true);
+        string callTrace = ExecuteCallTrace(code, WithLog);
+        const string expectedCallTrace = """
+{
+  "type": "CALL",
+  "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+  "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+  "value": "0x1",
+  "gas": "0x186a0",
+  "gasUsed": "0x16656",
+  "input": "0x",
+  "error": "execution reverted",
+  "calls": [
+    {
+      "type": "CALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x0",
+      "gas": "0xc350",
+      "gasUsed": "0x8406",
+      "input": "0xa01234",
+      "error": "execution reverted",
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x76e68a8696537e4141926f3e528733af9e237d69",
+          "to": "0xd75a3a95360e44a3874e691fb48d77855f127069",
+          "value": "0x0",
+          "gas": "0x4513",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    },
+    {
+      "type": "DELEGATECALL",
+      "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+      "to": "0x76e68a8696537e4141926f3e528733af9e237d69",
+      "value": "0x1",
+      "gas": "0xa33c",
+      "gasUsed": "0x8406",
+      "input": "0x",
+      "error": "execution reverted",
+      "calls": [
+        {
+          "type": "CREATE",
+          "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+          "to": "0x89aa9b2ce05aaef815f25b237238c0b4ffff6ae3",
+          "value": "0x0",
+          "gas": "0x257f",
+          "gasUsed": "0x26a",
+          "input": "0x7f000000000000000000000000000000000000000000000000000000000000000060005260036000f3",
+          "output": "0x000000"
+        }
+      ]
+    }
+  ]
+}
+""";
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_SelfDestruct()
+    {
+        byte[] code = Prepare.SavmCode
+            .PushData(TestItem.AddressA)
+            .Op(Instruction.SELFDESTRUCT)
+            .Done;
+
+        string callTrace = ExecuteCallTrace(code);
+        const string expectedCallTrace = """
+            {
+              "type": "CALL",
+              "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+              "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+              "value": "0x1",
+              "gas": "0x186a0",
+              "gasUsed": "0x6593",
+              "input": "0x",
+              "calls": [
+                {
+                  "type": "SELFDESTRUCT",
+                  "from": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+                  "to": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+                  "value": "0xad78ebc5ac6200001",
+                  "gas": "0x0",
+                  "gasUsed": "0x0",
+                  "input": "0x"
+                }
+              ]
+            }
+            """;
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [Test]
+    public void Test_CallTrace_SelfDestruct_OnlyTopCall()
+    {
+        byte[] code = Prepare.SavmCode
+            .PushData(TestItem.AddressA)
+            .Op(Instruction.SELFDESTRUCT)
+            .Done;
+
+        string callTrace = ExecuteCallTrace(code, OnlyTopCall);
+        const string expectedCallTrace = """
+            {
+              "type": "CALL",
+              "from": "0xb7705ae4c6f81b66cdb323c65f4e8133690fc099",
+              "to": "0x942921b14f1b1c385cd7e0cc2ef7abe5598c8358",
+              "value": "0x1",
+              "gas": "0x186a0",
+              "gasUsed": "0x6593",
+              "input": "0x"
+            }
+            """;
+        Assert.That(callTrace, Is.EqualTo(expectedCallTrace));
+    }
+
+    [TestCase(false, false, TestName = "TopLevelCreate_Success")]
+    [TestCase(true, false, TestName = "TopLevelCreate_Revert")]
+    [TestCase(false, true, TestName = "TopLevelCreate_AddressCollision")]
+    public void Test_CallTrace_TopLevelCreate(bool revert, bool addressCollision)
+    {
+        byte[] initCode;
+        if (addressCollision)
+        {
+            initCode = Prepare.SavmCode.PushData(0).PushData(0).Op(Instruction.RETURN).Done;
+            Address deploymentAddress = ContractAddress.From(Sender, TestState.GetNonce(Sender));
+            TestState.CreateAccount(deploymentAddress, 0);
+            TestState.InsertCode(deploymentAddress, new byte[] { 0xEF }, SpecProvider.GenesisSpec);
+            TestState.Commit(SpecProvider.GenesisSpec);
+        }
+        else
+        {
+            initCode = revert
+                ? Prepare.SavmCode.PushData(0).PushData(0).Op(Instruction.REVERT).Done
+                : Prepare.SavmCode.ForInitOf(new byte[3]).Done;
+        }
+
+        (Block block, Transaction tx) = PrepareInitTx(MainnetSpecProvider.CancunActivation, 100000, initCode);
+        using NativeCallTracer tracer = new(tx, GetGethTraceOptions(null));
+        _processor.Execute(tx, new BlockExecutionContext(block.Header, SpecProvider.GetSpec((block.Header.Number, block.Header.Timestamp))), tracer);
+        using GethLikeTxTrace trace = tracer.BuildResult();
+
+        if (addressCollision)
+        {
+            Assert.That(trace.CustomTracerResult, Is.Null,
+                "address-collision path never enters the SAVM; no call frame should be produced");
+            return;
+        }
+
+        NativeCallTracerCallFrame? frame = trace.CustomTracerResult?.Value as NativeCallTracerCallFrame;
+        Assert.That(frame, Is.Not.Null, "expected a top-level CREATE call frame");
+        Assert.That(frame!.Type, Is.EqualTo(Instruction.CREATE));
+        if (revert)
+            Assert.That(frame.Error, Is.Not.Null, "expected error description on reverted CREATE");
+        else
+        {
+            Assert.That(frame.Error, Is.Null, "expected no error on successful CREATE");
+            Assert.That(frame.To, Is.Not.Null, "expected deployed contract address");
+        }
+    }
+
+    [Test]
+    public void Test_CallTrace_MarkAsFailed_WithoutSavmError_NoCrash()
+    {
+        Transaction tx = Build.A.Transaction.WithGasLimit(100000).WithData([0x00]).TestObject;
+        using NativeCallTracer tracer = new(tx, GetGethTraceOptions(null));
+
+        tracer.ReportAction(100000, 0, TestItem.AddressA, TestItem.AddressB, ReadOnlyMemory<byte>.Empty, ExecutionType.CREATE);
+        tracer.ReportActionEnd(40000, TestItem.AddressB, new byte[] { 0xEF });
+
+        Assert.That(
+            () => tracer.MarkAsFailed(TestItem.AddressB, new GasConsumed(60000, 60000), [], "deploy failed post-SAVM"),
+            Throws.Nothing);
+
+        using GethLikeTxTrace trace = tracer.BuildResult();
+        NativeCallTracerCallFrame? frame = trace.CustomTracerResult?.Value as NativeCallTracerCallFrame;
+        Assert.That(frame, Is.Not.Null, "expected a top-level call frame (ReportAction populated _callStack)");
+        Assert.That(frame!.Type, Is.EqualTo(Instruction.CREATE));
+        Assert.That(frame.Error, Is.Null, "no SAVM exception fired; Error must stay null when _error is null");
+    }
+
+    [Test]
+    public void Test_CallTrace_TopLevelCreate_WithLog_DeployContractFailure_LogsCleared()
+    {
+        byte[] initCode = Prepare.SavmCode
+            .PushData(0)
+            .PushData(0)
+            .Op(Instruction.LOG0)
+            .PushData(0xEF)
+            .PushData(0)
+            .Op(Instruction.MSTORE8)
+            .PushData(1)
+            .PushData(0)
+            .Op(Instruction.RETURN)
+            .Done;
+
+        (Block block, Transaction tx) = PrepareInitTx(MainnetSpecProvider.CancunActivation, 100000, initCode);
+        using NativeCallTracer tracer = new(tx, GetGethTraceOptions(WithLog));
+        _processor.Execute(tx, new BlockExecutionContext(block.Header, SpecProvider.GetSpec((block.Header.Number, block.Header.Timestamp))), tracer);
+        using GethLikeTxTrace trace = tracer.BuildResult();
+
+        NativeCallTracerCallFrame? frame = trace.CustomTracerResult?.Value as NativeCallTracerCallFrame;
+        Assert.That(frame, Is.Not.Null, "expected a top-level call frame (SAVM ran before deployment was rejected)");
+        Assert.That(frame!.Logs, Is.Null, "logs must be cleared on a failed CREATE frame even when _error is null");
+    }
+
+
+    [Test]
+    public void Test_CallTrace_DeepNesting_DoesNotThrow()
+    {
+        using NativeCallTracerCallFrame root = BuildLinearCallChain(VirtualMachineStatics.MaxCallDepth);
+        GethLikeCustomTrace customTrace = new() { Value = root };
+
+        Assert.That(
+            () => JsonSerializer.Serialize(customTrace, SilaJsonSerializer.JsonOptions),
+            Throws.Nothing);
+    }
+
+    [Test]
+    public void Test_CallTrace_DeepNesting_StreamedJsonIsComplete()
+    {
+        int depth = VirtualMachineStatics.MaxCallDepth;
+        using NativeCallTracerCallFrame root = BuildLinearCallChain(depth);
+        GethLikeCustomTrace customTrace = new() { Value = root };
+
+        using MemoryStream stream = new();
+        using (Utf8JsonWriter writer = new(stream, new JsonWriterOptions { SkipValidation = true, MaxDepth = SilaJsonSerializer.DefaultMaxDepth }))
+        {
+            JsonSerializer.Serialize(writer, customTrace, SilaJsonSerializer.JsonOptions);
+        }
+
+        string output = Encoding.UTF8.GetString(stream.ToArray());
+
+        using JsonDocument document = JsonDocument.Parse(output, new JsonDocumentOptions { MaxDepth = SilaJsonSerializer.DefaultMaxDepth });
+        JsonElement element = document.RootElement;
+        int observed = 1;
+        while (element.TryGetProperty("calls", out JsonElement calls))
+        {
+            Assert.That(calls.GetArrayLength(), Is.EqualTo(1), $"frame at depth {observed} should have one child");
+            element = calls[0];
+            observed++;
+        }
+        Assert.That(observed, Is.EqualTo(depth), "deserialized frame chain depth should match the constructed depth");
+    }
+
+    [Test]
+    public void Test_CallTrace_DeepNesting_FailsBeyondMaxDepth()
+    {
+        int boundary = SilaJsonSerializer.DefaultMaxDepth / 2;
+
+        using NativeCallTracerCallFrame atBoundary = BuildLinearCallChain(boundary);
+        Assert.That(
+            () => JsonSerializer.Serialize(new GethLikeCustomTrace { Value = atBoundary }, SilaJsonSerializer.JsonOptions),
+            Throws.Nothing,
+            $"chain of {boundary} frames must serialize");
+
+        using NativeCallTracerCallFrame justOver = BuildLinearCallChain(boundary + 1);
+        Assert.That(
+            () => JsonSerializer.Serialize(new GethLikeCustomTrace { Value = justOver }, SilaJsonSerializer.JsonOptions),
+            Throws.TypeOf<JsonException>()
+                .With.InnerException.TypeOf<InvalidOperationException>()
+                .And.InnerException.Message.EqualTo(
+                    $"CurrentDepth ({SilaJsonSerializer.DefaultMaxDepth}) is equal to or larger than the maximum allowed depth of {SilaJsonSerializer.DefaultMaxDepth}. Cannot write the next JSON object or array."),
+            $"chain of {boundary + 1} frames must throw the writer's depth-too-large error");
+    }
+
+    private static NativeCallTracerCallFrame BuildLinearCallChain(int depth)
+    {
+        NativeCallTracerCallFrame root = new()
+        {
+            Type = Instruction.CALL,
+            From = TestItem.AddressA,
+            To = TestItem.AddressB,
+            Gas = 100_000,
+            GasUsed = 50_000,
+        };
+        NativeCallTracerCallFrame current = root;
+        for (int i = 1; i < depth; i++)
+        {
+            NativeCallTracerCallFrame child = new()
+            {
+                Type = Instruction.CALL,
+                From = TestItem.AddressA,
+                To = TestItem.AddressB,
+                Gas = 100_000,
+                GasUsed = 50_000,
+            };
+            current.Calls.Add(child);
+            current = child;
+        }
+        return root;
+    }
+
+    private byte[] CreateNestedCallsCode(bool revertParentCall = false, bool revertCreateCall = false)
+    {
+        byte[] deployedCode = new byte[3];
+
+        byte[] initCode = Prepare.SavmCode.ForInitOf(deployedCode).Done;
+
+        Prepare createCodePrepare = Prepare.SavmCode
+            .Create(initCode, 0)
+            .Log(0, 0, [TestItem.KeccakA, TestItem.KeccakB]);
+        byte[] createCode = revertCreateCall ? createCodePrepare.Revert(0, 0).Done : createCodePrepare.STOP().Done;
+
+        TestState.CreateAccount(TestItem.AddressC, 1.Sila);
+        TestState.InsertCode(TestItem.AddressC, createCode, Spec);
+        Prepare callCodePrepare = Prepare.SavmCode
+            .CallWithInput(TestItem.AddressC, 50000, SampleHexData1)
+            .DelegateCall(TestItem.AddressC, 50000)
+            .Log(0, 0);
+        return revertParentCall ? callCodePrepare.Revert(0, 0).Done : callCodePrepare.Done;
+    }
+}

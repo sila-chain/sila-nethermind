@@ -1,0 +1,1320 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Config;
+using Nethermind.Consensus.AuRa.Config;
+using Nethermind.Core;
+using Nethermind.Core.Exceptions;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Int256;
+using Nethermind.Logging;
+using Nethermind.Serialization.Json;
+using Nethermind.Specs.ChainSpecStyle;
+using Nethermind.Specs.ChainSpecStyle.Json;
+using Nethermind.Specs.Forks;
+using Nethermind.Specs.GnosisForks;
+using NSubstitute;
+using NUnit.Framework;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+
+namespace Nethermind.Specs.Test.ChainSpecStyle;
+
+[NonParallelizable]
+[TestFixture]
+public class ChainSpecBasedSpecProviderTests
+{
+    private const double GnosisBlockTime = 5;
+
+    [SetUp]
+    public void Setup() => Sip4844Constants.OverrideIfAny(1);
+
+    private static ChainSpec LoadGethGenesisFromString(string json)
+    {
+        using MemoryStream stream = new(Encoding.UTF8.GetBytes(json));
+        return new GethGenesisLoader(new SilaJsonSerializer()).Load(stream);
+    }
+
+    private static ChainSpec LoadChainSpecFromString(string json)
+    {
+        using MemoryStream stream = new(Encoding.UTF8.GetBytes(json));
+        return new ChainSpecLoader(new SilaJsonSerializer(), LimboLogs.Instance).Load(stream);
+    }
+
+    private static ChainSpec LoadGethGenesisWithBlobSchedule(string forkTimestamps, string blobSchedule)
+    {
+        string genesisJson = $$"""
+        {
+          "config": {
+            "chainId": 3151908,
+            "homesteadBlock": 0,
+            "sip150Block": 0,
+            "sip155Block": 0,
+            "sip158Block": 0,
+            "byzantiumBlock": 0,
+            "constantinopleBlock": 0,
+            "petersburgBlock": 0,
+            "istanbulBlock": 0,
+            "berlinBlock": 0,
+            "londonBlock": 0,
+            "terminalTotalDifficulty": 0,
+            "terminalTotalDifficultyPassed": true,
+        {{forkTimestamps}},
+            "blobSchedule": {
+        {{blobSchedule}}
+            }
+          },
+          "difficulty": "0x0",
+          "gasLimit": "0x3938700",
+          "timestamp": "0x6a0c6040",
+          "alloc": {}
+        }
+        """;
+
+        return LoadGethGenesisFromString(genesisJson);
+    }
+
+    [TestCase(0ul, null, false)]
+    [TestCase(0ul, 0ul, false)]
+    [TestCase(0ul, 4660ul, false)]
+    [TestCase(1ul, 4660ul, false)]
+    [TestCase(1ul, 4661ul, false)]
+    [TestCase(4ul, 4672ul, true)]
+    [TestCase(4ul, 4673ul, true)]
+    [TestCase(5ul, 4680ul, true)]
+    [NonParallelizable]
+    public void Timestamp_activation_equal_to_genesis_timestamp_loads_correctly(ulong blockNumber, ulong? timestamp, bool isSip3855Enabled)
+    {
+        ChainSpecFileLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+        string path = Path.Combine(TestContext.CurrentContext.WorkDirectory,
+            $"../../../../{Assembly.GetExecutingAssembly().GetName().Name}/Specs/Timestamp_activation_equal_to_genesis_timestamp_test.json");
+        ChainSpec chainSpec = loader.LoadEmbeddedOrFromFile(path);
+        Assert.That(chainSpec.Parameters.Sip2537Transition, Is.Null);
+        ILogger logger = new(Substitute.ForPartsOf<LimboTraceLogger>());
+        ILogManager logManager = Substitute.For<ILogManager>();
+        logManager.GetClassLogger<ChainSpecBasedSpecProvider>().Returns(logger);
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        ReleaseSpec expectedSpec = ((ReleaseSpec)MainnetSpecProvider.Instance.GetSpec((MainnetSpecProvider.GrayGlacierBlockNumber, null))).Clone();
+        expectedSpec.Name = "Genesis_with_non_zero_timestamp";
+        expectedSpec.IsSip3651Enabled = true;
+        expectedSpec.IsSip3198Enabled = false;
+        expectedSpec.Sip1559TransitionBlock = 0;
+        expectedSpec.DifficultyBombDelay = 0;
+        expectedSpec.IsSip3855Enabled = isSip3855Enabled;
+        TestSpecProvider testProvider = TestSpecProvider.Instance;
+        testProvider.NextForkSpec = expectedSpec;
+        testProvider.TerminalTotalDifficulty = 0;
+        testProvider.GenesisSpec = expectedSpec;
+
+        CompareSpecs(testProvider, provider, (blockNumber, timestamp));
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.GenesisSpec.Sip1559TransitionBlock, Is.EqualTo(testProvider.GenesisSpec.Sip1559TransitionBlock));
+            Assert.That(provider.GenesisSpec.DifficultyBombDelay, Is.EqualTo(testProvider.GenesisSpec.DifficultyBombDelay));
+        }
+    }
+
+    [Test]
+    public void Missing_dependent_property()
+    {
+        ChainSpecFileLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+        string path = Path.Combine(TestContext.CurrentContext.WorkDirectory,
+            $"../../../../{Assembly.GetExecutingAssembly().GetName().Name}/Specs/hoodi_no_deposit_contract.json");
+        InvalidDataException? exception = Assert.Throws<InvalidDataException>(() => loader.LoadEmbeddedOrFromFile(path));
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(exception, Is.Not.Null);
+            Assert.That(exception.InnerException, Is.TypeOf<InvalidConfigurationException>());
+            Assert.That(((InvalidConfigurationException?)exception.InnerException)?.ExitCode, Is.EqualTo(ExitCodes.MissingChainspecSipConfiguration));
+        }
+    }
+
+
+    [TestCase(0ul, null, false, false, false)]
+    [TestCase(0ul, 0ul, false, false, false)]
+    [TestCase(0ul, 4660ul, false, false, false)]
+    [TestCase(1ul, 4660ul, false, false, false)]
+    [TestCase(1ul, 4661ul, false, false, false)]
+    [TestCase(1ul, 4672ul, false, false, false)]
+    [TestCase(2ul, 4673ul, false, false, true)]
+    [TestCase(3ul, 4680ul, false, false, true)]
+    [TestCase(4ul, 4672ul, false, true, false)]
+    [TestCase(5ul, 4672ul, true, true, false)]
+    [TestCase(5ul, 4673ul, true, true, false)]
+    [TestCase(6ul, 4680ul, true, true, false)]
+    [NonParallelizable]
+    public void Logs_warning_when_timestampActivation_happens_before_blockActivation(ulong blockNumber, ulong? timestamp, bool isSip3855Enabled, bool isSip3198Enabled, bool receivesWarning)
+    {
+        ChainSpecFileLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+        string path = Path.Combine(TestContext.CurrentContext.WorkDirectory,
+            $"../../../../{Assembly.GetExecutingAssembly().GetName().Name}/Specs/Logs_warning_when_timestampActivation_happens_before_blockActivation_test.json");
+        ChainSpec chainSpec = loader.LoadEmbeddedOrFromFile(path);
+        Assert.That(chainSpec.Parameters.Sip2537Transition, Is.Null);
+        InterfaceLogger iLogger = Substitute.For<InterfaceLogger>();
+        iLogger.IsWarn.Returns(true);
+        ILogger logger = new(iLogger);
+        ILogManager logManager = Substitute.For<ILogManager>();
+        logManager.GetClassLogger<ChainSpecBasedSpecProvider>().Returns(logger);
+        ChainSpecBasedSpecProvider provider = new(chainSpec, logManager);
+        ReleaseSpec expectedSpec = ((ReleaseSpec)MainnetSpecProvider
+            .Instance.GetSpec((MainnetSpecProvider.GrayGlacierBlockNumber, null))).Clone();
+        expectedSpec.Name = "Genesis_with_non_zero_timestamp";
+        expectedSpec.IsSip3651Enabled = true;
+        expectedSpec.IsSip3198Enabled = isSip3198Enabled;
+        expectedSpec.IsSip3855Enabled = isSip3855Enabled;
+        expectedSpec.Sip1559TransitionBlock = 0;
+        expectedSpec.DifficultyBombDelay = 0;
+        List<ForkActivation> forkActivationsToTest =
+        [
+            (blockNumber, timestamp),
+        ];
+
+        foreach (ForkActivation activation in forkActivationsToTest)
+        {
+            provider.GetSpec(activation);
+        }
+
+        if (receivesWarning)
+        {
+            iLogger.Received(1).Warn(Arg.Is("Chainspec file is misconfigured! Timestamp transition is configured to happen before the last block transition."));
+        }
+        else
+        {
+            iLogger.DidNotReceive().Warn(Arg.Is("Chainspec file is misconfigured! Timestamp transition is configured to happen before the last block transition."));
+        }
+    }
+
+    public static IEnumerable<TestCaseData> SepoliaActivations
+    {
+        get
+        {
+            yield return new TestCaseData((ForkActivation)(2, 0)) { TestName = "First" };
+            yield return new TestCaseData((ForkActivation)(120_000_000, 0)) { TestName = "Block number" };
+            yield return new TestCaseData((ForkActivation)(1735372, 3)) { TestName = "Low timestamp" };
+            yield return new TestCaseData((ForkActivation)(1735372, 1677557088)) { TestName = "1677557088" };
+            yield return new TestCaseData((ForkActivation)(1735372, 1677557087)) { TestName = "1677557087" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.CancunTimestamp - 1)) { TestName = "Before SilaCancun" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.CancunTimestamp)) { TestName = "First SilaCancun" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.CancunTimestamp + 1000)) { TestName = "SilaCancun" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.PragueTimestamp)) { TestName = "First SilaPrague" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.PragueTimestamp + 1000)) { TestName = "SilaPrague" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.OsakaTimestamp)) { TestName = "First SilaOsaka" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.OsakaTimestamp + 1000)) { TestName = "SilaOsaka" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.BPO1Timestamp)) { TestName = "First BPO1" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.BPO1Timestamp + 1000)) { TestName = "BPO1" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.BPO2Timestamp)) { TestName = "First BPO2" };
+            yield return new TestCaseData(new ForkActivation(1735372, SepoliaSpecProvider.BPO2Timestamp + 1000)) { TestName = "BPO2" };
+        }
+    }
+
+    [TestCaseSource(nameof(SepoliaActivations))]
+    public void Sepolia_loads_properly(ForkActivation forkActivation)
+    {
+        ChainSpec chainSpec = LoadChainSpecFromChainFolder("sepolia");
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        SepoliaSpecProvider sepolia = SepoliaSpecProvider.Instance;
+
+        CompareSpecs(sepolia, provider, forkActivation);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.TerminalTotalDifficulty, Is.EqualTo(SepoliaSpecProvider.Instance.TerminalTotalDifficulty));
+            Assert.That(provider.GenesisSpec.Sip1559TransitionBlock, Is.Zero);
+            Assert.That(provider.GenesisSpec.DifficultyBombDelay, Is.EqualTo(long.MaxValue));
+            Assert.That(provider.ChainId, Is.EqualTo(BlockchainIds.SilaSepolia));
+            Assert.That(provider.NetworkId, Is.EqualTo(BlockchainIds.SilaSepolia));
+
+            IEnumerable<ulong> timestamps = GetTransitionTimestamps(chainSpec.Parameters);
+            foreach (ulong t in timestamps)
+            {
+                Assert.That(ValidateSlotByTimestamp(t, SepoliaSpecProvider.BeaconChainGenesisTimestampConst), Is.True);
+            }
+        }
+
+        IReleaseSpec postCancunSpec = provider.GetSpec((2, SepoliaSpecProvider.CancunTimestamp));
+        VerifyCancunSpecificsForMainnetAndSepolia(postCancunSpec);
+
+        IReleaseSpec postPragueSpec = provider.GetSpec((2, SepoliaSpecProvider.PragueTimestamp));
+        VerifyPragueSpecificsForMainnetHoodiAndSepolia(provider.ChainId, postPragueSpec);
+
+        IReleaseSpec postOsakaSpec = provider.GetSpec((2, SepoliaSpecProvider.OsakaTimestamp));
+        IReleaseSpec postBPO1Spec = provider.GetSpec((2, SepoliaSpecProvider.BPO1Timestamp));
+        IReleaseSpec postBPO2Spec = provider.GetSpec((2, SepoliaSpecProvider.BPO2Timestamp));
+        VerifyOsakaSpecificsForMainnetHoleskyHoodiAndSepolia(provider.ChainId, postOsakaSpec, postBPO1Spec, postBPO2Spec);
+    }
+
+    private static void VerifyCancunSpecificsForMainnetAndSepolia(IReleaseSpec spec)
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(spec.BlobBaseFeeUpdateFraction, Is.EqualTo(3338477UL));
+            Assert.That(spec.GasCosts.MaxBlobGasPerBlock, Is.EqualTo(786432));
+            Assert.That(Sip4844Constants.MinBlobGasPrice, Is.EqualTo(1.Wei));
+            Assert.That(spec.GasCosts.TargetBlobGasPerBlock, Is.EqualTo(393216));
+        }
+    }
+
+    private static void VerifyPragueSpecificsForMainnetHoodiAndSepolia(ulong chainId, IReleaseSpec spec)
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(spec.BlobBaseFeeUpdateFraction, Is.EqualTo(5007716UL));
+            Assert.That(spec.MaxBlobCount, Is.EqualTo(9));
+            Assert.That(spec.TargetBlobCount, Is.EqualTo(6));
+            Assert.That(spec.Sip2935ContractAddress, Is.EqualTo(Sip2935Constants.BlockHashHistoryAddress));
+        }
+
+        Address expectedDepositContractAddress;
+        switch (chainId)
+        {
+            case BlockchainIds.SilaMainnet:
+                expectedDepositContractAddress = Sip6110Constants.MainnetDepositContractAddress;
+                break;
+            case BlockchainIds.SilaHolesky:
+                expectedDepositContractAddress = Sip6110Constants.HoleskyDepositContractAddress;
+                break;
+            case BlockchainIds.Hoodi:
+                expectedDepositContractAddress = Sip6110Constants.HoodiDepositContractAddress;
+                break;
+            case BlockchainIds.SilaSepolia:
+                expectedDepositContractAddress = Sip6110Constants.SepoliaDepositContractAddress;
+                break;
+            default:
+                Assert.Fail("Unrecognized chain id when verifying SilaPrague specifics.");
+                return;
+        }
+
+        Assert.That(spec.DepositContractAddress, Is.EqualTo(expectedDepositContractAddress));
+    }
+
+    private static void VerifyOsakaSpecificsForMainnetHoleskyHoodiAndSepolia(ulong chainId, IReleaseSpec postOsakaSpec, IReleaseSpec postBPO1Spec, IReleaseSpec postBPO2Spec)
+    {
+        VerifyPragueSpecificsForMainnetHoodiAndSepolia(chainId, postOsakaSpec);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(postBPO1Spec.BlobBaseFeeUpdateFraction, Is.EqualTo(8346193UL));
+            Assert.That(postBPO1Spec.MaxBlobCount, Is.EqualTo(15));
+            Assert.That(postBPO1Spec.TargetBlobCount, Is.EqualTo(10));
+            Assert.That(postBPO2Spec.BlobBaseFeeUpdateFraction, Is.EqualTo(11684671UL));
+            Assert.That(postBPO2Spec.MaxBlobCount, Is.EqualTo(21));
+            Assert.That(postBPO2Spec.TargetBlobCount, Is.EqualTo(14));
+        }
+    }
+
+    public static IEnumerable<TestCaseData> HoodiActivations
+    {
+        get
+        {
+            yield return new TestCaseData(new ForkActivation(0, HoodiSpecProvider.GenesisTimestamp)) { TestName = "Genesis" };
+            yield return new TestCaseData(new ForkActivation(1, HoodiSpecProvider.ShanghaiTimestamp)) { TestName = "SilaShanghai" };
+            yield return new TestCaseData(new ForkActivation(3, HoodiSpecProvider.ShanghaiTimestamp)) { TestName = "Post SilaShanghai" };
+            yield return new TestCaseData(new ForkActivation(4, HoodiSpecProvider.CancunTimestamp)) { TestName = "Before SilaCancun" };
+            yield return new TestCaseData(new ForkActivation(5, HoodiSpecProvider.CancunTimestamp)) { TestName = "SilaCancun" };
+            yield return new TestCaseData(new ForkActivation(6, HoodiSpecProvider.CancunTimestamp)) { TestName = "Post SilaCancun" };
+            yield return new TestCaseData(new ForkActivation(7, HoodiSpecProvider.PragueTimestamp - 1)) { TestName = "Before SilaPrague" };
+            yield return new TestCaseData(new ForkActivation(8, HoodiSpecProvider.PragueTimestamp)) { TestName = "SilaPrague" };
+            yield return new TestCaseData(new ForkActivation(9, HoodiSpecProvider.OsakaTimestamp - 1)) { TestName = "Before SilaOsaka" };
+            yield return new TestCaseData(new ForkActivation(10, HoodiSpecProvider.OsakaTimestamp)) { TestName = "SilaOsaka" };
+            yield return new TestCaseData(new ForkActivation(11, HoodiSpecProvider.BPO1Timestamp - 1)) { TestName = "Before BPO1" };
+            yield return new TestCaseData(new ForkActivation(12, HoodiSpecProvider.BPO1Timestamp)) { TestName = "BPO1" };
+            yield return new TestCaseData(new ForkActivation(13, HoodiSpecProvider.BPO2Timestamp - 1)) { TestName = "Before BPO2" };
+            yield return new TestCaseData(new ForkActivation(14, HoodiSpecProvider.BPO2Timestamp)) { TestName = "BPO2" };
+            yield return new TestCaseData(new ForkActivation(15, HoodiSpecProvider.BPO2Timestamp + 100000000)) { TestName = "Future BPO2" };
+        }
+    }
+
+    [TestCaseSource(nameof(HoodiActivations))]
+    public void Hoodi_loads_properly(ForkActivation forkActivation)
+    {
+        ChainSpec chainSpec = LoadChainSpecFromChainFolder("hoodi");
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        ISpecProvider hardCodedSpec = HoodiSpecProvider.Instance;
+
+        CompareSpecs(hardCodedSpec, provider, forkActivation);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.TerminalTotalDifficulty, Is.EqualTo(hardCodedSpec.TerminalTotalDifficulty));
+            Assert.That(provider.GenesisSpec.Sip1559TransitionBlock, Is.Zero);
+            Assert.That(provider.GenesisSpec.DifficultyBombDelay, Is.Zero);
+            Assert.That(provider.ChainId, Is.EqualTo(BlockchainIds.Hoodi));
+            Assert.That(provider.NetworkId, Is.EqualTo(BlockchainIds.Hoodi));
+        }
+
+        IReleaseSpec postCancunSpec = provider.GetSpec((2, HoodiSpecProvider.CancunTimestamp));
+        VerifyCancunSpecificsForMainnetAndSepolia(postCancunSpec);
+
+        IReleaseSpec postPragueSpec = provider.GetSpec((2, HoodiSpecProvider.PragueTimestamp));
+        VerifyPragueSpecificsForMainnetHoodiAndSepolia(provider.ChainId, postPragueSpec);
+
+        IReleaseSpec postOsakaSpec = provider.GetSpec((2, HoodiSpecProvider.OsakaTimestamp));
+        IReleaseSpec postBPO1Spec = provider.GetSpec((2, HoodiSpecProvider.BPO1Timestamp));
+        IReleaseSpec postBPO2Spec = provider.GetSpec((2, HoodiSpecProvider.BPO2Timestamp));
+        VerifyOsakaSpecificsForMainnetHoleskyHoodiAndSepolia(provider.ChainId, postOsakaSpec, postBPO1Spec, postBPO2Spec);
+
+    }
+
+    public static IEnumerable<TestCaseData> ChiadoActivations
+    {
+        get
+        {
+            yield return new TestCaseData((ForkActivation)0) { TestName = "Genesis" };
+            yield return new TestCaseData((ForkActivation)(1, 20)) { TestName = "(1, 20)" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.ShanghaiTimestamp - 1)) { TestName = "Before SilaShanghai" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.ShanghaiTimestamp)) { TestName = "SilaShanghai" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.CancunTimestamp - 1)) { TestName = "Before SilaCancun" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.CancunTimestamp)) { TestName = "SilaCancun" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.PragueTimestamp - 1)) { TestName = "Before SilaPrague" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.PragueTimestamp)) { TestName = "SilaPrague" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.OsakaTimestamp - 1)) { TestName = "Before SilaOsaka" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.OsakaTimestamp)) { TestName = "SilaOsaka" };
+            yield return new TestCaseData((ForkActivation)(1, ChiadoSpecProvider.OsakaTimestamp + 100000000)) { TestName = "Future" };
+        }
+    }
+
+    [TestCaseSource(nameof(ChiadoActivations))]
+    public void Chiado_loads_properly(ForkActivation forkActivation)
+    {
+        // We need this to discover AuthorityRoundEngineParams
+        _ = new AuRaConfig();
+        ChainSpec chainSpec = LoadChainSpecFromChainFolder("chiado");
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        ChiadoSpecProvider chiado = ChiadoSpecProvider.Instance;
+
+        CompareSpecs(chiado, provider, forkActivation, CompareSpecsOptions.IsGnosis);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.TerminalTotalDifficulty, Is.EqualTo(ChiadoSpecProvider.Instance.TerminalTotalDifficulty));
+            Assert.That(provider.ChainId, Is.EqualTo(BlockchainIds.Chiado));
+            Assert.That(provider.NetworkId, Is.EqualTo(BlockchainIds.Chiado));
+            Assert.That(chiado.TransitionActivations, Is.EqualTo(provider.TransitionActivations));
+        }
+
+        IReleaseSpec? preShanghaiSpec = provider.GetSpec((1, ChiadoSpecProvider.ShanghaiTimestamp - 1));
+        IReleaseSpec? postShanghaiSpec = provider.GetSpec((1, ChiadoSpecProvider.ShanghaiTimestamp));
+        IReleaseSpec? postCancunSpec = provider.GetSpec((1, ChiadoSpecProvider.CancunTimestamp));
+        IReleaseSpec? prePragueSpec = provider.GetSpec((1, ChiadoSpecProvider.PragueTimestamp - 1));
+        IReleaseSpec? postPragueSpec = provider.GetSpec((1, ChiadoSpecProvider.PragueTimestamp));
+        IReleaseSpec? postOsakaSpec = provider.GetSpec((1, ChiadoSpecProvider.OsakaTimestamp));
+
+        VerifyGnosisShanghaiSpecifics(preShanghaiSpec, postShanghaiSpec);
+        VerifyGnosisCancunSpecifics(postCancunSpec);
+        VerifyGnosisPragueSpecifics(prePragueSpec, postPragueSpec, ChiadoSpecProvider.FeeCollector);
+        VerifyGnosisOsakaSpecifics(postOsakaSpec, ChiadoSpecProvider.FeeCollector);
+
+        using (Assert.EnterMultipleScope())
+        {
+            IEnumerable<ulong> timestamps = GetTransitionTimestamps(chainSpec.Parameters);
+            foreach (ulong t in timestamps)
+            {
+                Assert.That(ValidateSlotByTimestamp(t, ChiadoSpecProvider.BeaconChainGenesisTimestampConst, GnosisBlockTime), Is.True);
+            }
+
+            Assert.That(postPragueSpec.DepositContractAddress, Is.EqualTo(new Address("0xb97036A26259B7147018913bD58a774cf91acf25")));
+        }
+    }
+
+    public static IEnumerable<TestCaseData> GnosisActivations
+    {
+        get
+        {
+            yield return new TestCaseData((ForkActivation)0) { TestName = "Genesis" };
+            yield return new TestCaseData((ForkActivation)1) { TestName = "Genesis + 1" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.ConstantinopleBlockNumber - 1)) { TestName = "Before Constantinople" };
+            yield return new TestCaseData((ForkActivation)GnosisSpecProvider.ConstantinopleBlockNumber) { TestName = "Constantinople" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.ConstantinopleFixBlockNumber - 1)) { TestName = "Before ConstantinopleFix" };
+            yield return new TestCaseData((ForkActivation)GnosisSpecProvider.ConstantinopleFixBlockNumber) { TestName = "ConstantinopleFix" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.IstanbulBlockNumber - 1)) { TestName = "Before Istanbul" };
+            yield return new TestCaseData((ForkActivation)GnosisSpecProvider.IstanbulBlockNumber) { TestName = "Istanbul" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.BerlinBlockNumber - 1)) { TestName = "Before Berlin" };
+            yield return new TestCaseData((ForkActivation)GnosisSpecProvider.BerlinBlockNumber) { TestName = "Berlin" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber - 1)) { TestName = "Before London" };
+            yield return new TestCaseData((ForkActivation)GnosisSpecProvider.LondonBlockNumber) { TestName = "London" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber + 1, GnosisSpecProvider.ShanghaiTimestamp - 1))
+            { TestName = "Before SilaShanghai" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber + 1, GnosisSpecProvider.ShanghaiTimestamp))
+            { TestName = "SilaShanghai" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber + 2, GnosisSpecProvider.CancunTimestamp - 1))
+            { TestName = "Before SilaCancun" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber + 2, GnosisSpecProvider.CancunTimestamp))
+            { TestName = "SilaCancun" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber + 2, GnosisSpecProvider.CancunTimestamp + 100000000))
+            { TestName = "Future" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber + 2, GnosisSpecProvider.PragueTimestamp - 1))
+            { TestName = "Before SilaPrague" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber + 2, GnosisSpecProvider.PragueTimestamp))
+            { TestName = "SilaPrague" };
+            yield return new TestCaseData((ForkActivation)(GnosisSpecProvider.LondonBlockNumber + 2, GnosisSpecProvider.PragueTimestamp + 100000000))
+            { TestName = "Future" };
+        }
+    }
+
+    [TestCaseSource(nameof(GnosisActivations))]
+    public void Gnosis_loads_properly(ForkActivation forkActivation)
+    {
+        ChainSpec chainSpec = LoadChainSpecFromChainFolder("gnosis");
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        GnosisSpecProvider gnosisSpecProvider = GnosisSpecProvider.Instance;
+
+        CompareSpecs(gnosisSpecProvider, provider, forkActivation, CompareSpecsOptions.IsGnosis);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.TerminalTotalDifficulty, Is.EqualTo(GnosisSpecProvider.Instance.TerminalTotalDifficulty));
+            Assert.That(provider.ChainId, Is.EqualTo(BlockchainIds.Gnosis));
+            Assert.That(provider.NetworkId, Is.EqualTo(BlockchainIds.Gnosis));
+            Assert.That(gnosisSpecProvider.TransitionActivations, Is.EqualTo(provider.TransitionActivations));
+        }
+
+        VerifyGnosisPreShanghaiSpecifics(provider);
+
+        IReleaseSpec? preShanghaiSpec = provider.GetSpec((1, GnosisSpecProvider.ShanghaiTimestamp - 1));
+        IReleaseSpec? postShanghaiSpec = provider.GetSpec((1, GnosisSpecProvider.ShanghaiTimestamp));
+        IReleaseSpec? postCancunSpec = provider.GetSpec((1, GnosisSpecProvider.CancunTimestamp));
+        IReleaseSpec? prePragueSpec = provider.GetSpec((1, GnosisSpecProvider.PragueTimestamp - 1));
+        IReleaseSpec? postPragueSpec = provider.GetSpec((1, GnosisSpecProvider.PragueTimestamp));
+        IReleaseSpec? postOsakaSpec = provider.GetSpec((1, GnosisSpecProvider.OsakaTimestamp));
+
+        VerifyGnosisShanghaiSpecifics(preShanghaiSpec, postShanghaiSpec);
+        VerifyGnosisCancunSpecifics(postCancunSpec);
+        VerifyGnosisPragueSpecifics(prePragueSpec, postPragueSpec, GnosisSpecProvider.FeeCollector);
+        VerifyGnosisOsakaSpecifics(postOsakaSpec, GnosisSpecProvider.FeeCollector);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(postPragueSpec.DepositContractAddress, Is.EqualTo(new Address("0x0B98057eA310F4d31F2a452B414647007d1645d9")));
+
+            IEnumerable<ulong> timestamps = GetTransitionTimestamps(chainSpec.Parameters);
+            foreach (ulong t in timestamps)
+            {
+                Assert.That(ValidateSlotByTimestamp(t, GnosisSpecProvider.BeaconChainGenesisTimestampConst, GnosisBlockTime), Is.True);
+            }
+        }
+    }
+
+    private static void VerifyGnosisOsakaSpecifics(IReleaseSpec spec, Address feeCollector)
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(spec.FeeCollector, Is.EqualTo(feeCollector));
+            Assert.That(spec.IsSip4844FeeCollectorEnabled, Is.True);
+        }
+
+        VerifyGnosisCancunSpecifics(spec);
+    }
+
+    private static void VerifyGnosisPragueSpecifics(IReleaseSpec prePragueSpec, IReleaseSpec postPragueSpec, Address feeCollector)
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(prePragueSpec.FeeCollector, Is.EqualTo(feeCollector));
+            Assert.That(postPragueSpec.FeeCollector, Is.EqualTo(feeCollector));
+            Assert.That(prePragueSpec.IsSip4844FeeCollectorEnabled, Is.False);
+            Assert.That(postPragueSpec.IsSip4844FeeCollectorEnabled, Is.True);
+            Assert.That(postPragueSpec.Sip2935ContractAddress, Is.EqualTo(Sip2935Constants.BlockHashHistoryAddress));
+        }
+
+        // should be unchanged
+        VerifyGnosisCancunSpecifics(postPragueSpec);
+    }
+
+    private static void VerifyGnosisCancunSpecifics(IReleaseSpec spec)
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(spec.BlobBaseFeeUpdateFraction, Is.EqualTo(1112826UL));
+            Assert.That(spec.GasCosts.MaxBlobGasPerBlock, Is.EqualTo(262144));
+            Assert.That(Sip4844Constants.MinBlobGasPrice, Is.EqualTo(1.GWei));
+            Assert.That(spec.GasCosts.TargetBlobGasPerBlock, Is.EqualTo(131072));
+        }
+    }
+
+    private static void VerifyGnosisShanghaiSpecifics(IReleaseSpec preShanghaiSpec, IReleaseSpec postShanghaiSpec)
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(preShanghaiSpec.MaxCodeSize, Is.EqualTo(long.MaxValue));
+            Assert.That(postShanghaiSpec.MaxCodeSize, Is.EqualTo(CodeSizeConstants.MaxCodeSizeSip170));
+
+            Assert.That(preShanghaiSpec.MaxInitCodeSize, Is.EqualTo(-2L)); // doesn't have meaningful value before SIP3860
+            Assert.That(postShanghaiSpec.MaxInitCodeSize, Is.EqualTo(2 * CodeSizeConstants.MaxCodeSizeSip170));
+
+            Assert.That(preShanghaiSpec.LimitCodeSize, Is.False);
+            Assert.That(postShanghaiSpec.LimitCodeSize, Is.True);
+
+            Assert.That(preShanghaiSpec.IsSip170Enabled, Is.False);
+            Assert.That(postShanghaiSpec.IsSip170Enabled, Is.True);
+        }
+    }
+
+    private static void VerifyGnosisPreShanghaiSpecifics(ISpecProvider specProvider)
+    {
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(specProvider.GenesisSpec.MaximumUncleCount, Is.Zero);
+            Assert.That(specProvider.GetSpec((ForkActivation)(GnosisSpecProvider.ConstantinopleBlockNumber - 1)).IsSip1283Enabled, Is.False);
+            Assert.That(specProvider.GetSpec((ForkActivation)(GnosisSpecProvider.ConstantinopleBlockNumber)).IsSip1283Enabled, Is.True);
+            Assert.That(specProvider.GetSpec((ForkActivation)(GnosisSpecProvider.ConstantinopleBlockNumber - 1)).UseConstantinopleNetGasMetering, Is.False);
+            Assert.That(specProvider.GetSpec((ForkActivation)(GnosisSpecProvider.ConstantinopleBlockNumber)).UseConstantinopleNetGasMetering, Is.True);
+        }
+    }
+
+    public static IEnumerable<TestCaseData> MainnetActivations
+    {
+        get
+        {
+            yield return new TestCaseData((ForkActivation)0) { TestName = "Genesis" };
+            yield return new TestCaseData((ForkActivation)(0, null)) { TestName = "Genesis null" };
+            yield return new TestCaseData((ForkActivation)(0, 0)) { TestName = "Genesis timestamp" };
+            yield return new TestCaseData((ForkActivation)1) { TestName = "Genesis + 1" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.HomesteadBlockNumber - 1)) { TestName = "Before Homestead" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.HomesteadBlockNumber) { TestName = "Homestead" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.TangerineWhistleBlockNumber - 1)) { TestName = "Before TangerineWhistle" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.TangerineWhistleBlockNumber) { TestName = "TangerineWhistle" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.SpuriousDragonBlockNumber - 1)) { TestName = "Before SpuriousDragon" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.SpuriousDragonBlockNumber) { TestName = "SpuriousDragon" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.ByzantiumBlockNumber - 1)) { TestName = "Before Byzantium" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.ByzantiumBlockNumber) { TestName = "Byzantium" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.ConstantinopleFixBlockNumber - 1)) { TestName = "Before Constantinople" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.ConstantinopleFixBlockNumber) { TestName = "Constantinople" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.IstanbulBlockNumber - 1)) { TestName = "Before Istanbul" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.IstanbulBlockNumber) { TestName = "Istanbul" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.MuirGlacierBlockNumber - 1)) { TestName = "Before MuirGlacier" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.MuirGlacierBlockNumber) { TestName = "MuirGlacier" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.BerlinBlockNumber - 1)) { TestName = "Before Berlin" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.BerlinBlockNumber) { TestName = "Berlin" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.LondonBlockNumber - 1)) { TestName = "Before London" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.LondonBlockNumber) { TestName = "London" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.ArrowGlacierBlockNumber - 1)) { TestName = "Before ArrowGlacier" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.ArrowGlacierBlockNumber) { TestName = "ArrowGlacier" };
+            yield return new TestCaseData((ForkActivation)(MainnetSpecProvider.ArrowGlacierBlockNumber - 1)) { TestName = "Before GrayGlacier" };
+            yield return new TestCaseData((ForkActivation)MainnetSpecProvider.ArrowGlacierBlockNumber) { TestName = "GrayGlacier" };
+            yield return new TestCaseData(MainnetSpecProvider.ShanghaiActivation) { TestName = "SilaShanghai" };
+            yield return new TestCaseData(new ForkActivation(MainnetSpecProvider.ParisBlockNumber, MainnetSpecProvider.CancunBlockTimestamp - 1)) { TestName = "Before SilaCancun" };
+            yield return new TestCaseData(MainnetSpecProvider.CancunActivation) { TestName = "SilaCancun" };
+            yield return new TestCaseData(new ForkActivation(MainnetSpecProvider.ParisBlockNumber, MainnetSpecProvider.PragueBlockTimestamp - 1)) { TestName = "Before SilaPrague" };
+            yield return new TestCaseData(MainnetSpecProvider.PragueActivation) { TestName = "SilaPrague" };
+            yield return new TestCaseData(new ForkActivation(MainnetSpecProvider.ParisBlockNumber, MainnetSpecProvider.OsakaBlockTimestamp - 1)) { TestName = "Before SilaOsaka" };
+            yield return new TestCaseData(MainnetSpecProvider.OsakaActivation) { TestName = "SilaOsaka" };
+            yield return new TestCaseData(new ForkActivation(MainnetSpecProvider.ParisBlockNumber, MainnetSpecProvider.BPO1BlockTimestamp - 1)) { TestName = "Before BPO1" };
+            yield return new TestCaseData(MainnetSpecProvider.BPO1Activation) { TestName = "BPO1" };
+            yield return new TestCaseData(new ForkActivation(MainnetSpecProvider.ParisBlockNumber, MainnetSpecProvider.BPO2BlockTimestamp - 1)) { TestName = "Before BPO2" };
+            yield return new TestCaseData(MainnetSpecProvider.BPO2Activation) { TestName = "BPO2" };
+            yield return new TestCaseData(new ForkActivation(MainnetSpecProvider.ParisBlockNumber, MainnetSpecProvider.BPO2BlockTimestamp + 100000000)) { TestName = "Future" };
+        }
+    }
+
+    [TestCaseSource(nameof(MainnetActivations))]
+    public void Mainnet_loads_properly(ForkActivation forkActivation)
+    {
+        ChainSpec chainSpec = LoadChainSpecFromChainFolder("foundation");
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        MainnetSpecProvider sila-mainnet = MainnetSpecProvider.Instance;
+
+        CompareSpecs(sila-mainnet, provider, forkActivation, CompareSpecsOptions.CheckDifficultyBomb);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.GetSpec((MainnetSpecProvider.SpuriousDragonBlockNumber, null)).MaxCodeSize, Is.EqualTo(CodeSizeConstants.MaxCodeSizeSip170));
+            Assert.That(provider.GetSpec((MainnetSpecProvider.SpuriousDragonBlockNumber, null)).MaxInitCodeSize, Is.EqualTo(2 * CodeSizeConstants.MaxCodeSizeSip170));
+            Assert.That(provider.GetSpec((ForkActivation)(long.MaxValue - 1)).IsSip2537Enabled, Is.False);
+            Assert.That(provider.GenesisSpec.Sip1559TransitionBlock, Is.EqualTo(MainnetSpecProvider.LondonBlockNumber));
+            Assert.That(provider.GetSpec((ForkActivation)4_369_999).DifficultyBombDelay, Is.EqualTo(0_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)4_370_000).DifficultyBombDelay, Is.EqualTo(3_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)7_279_999).DifficultyBombDelay, Is.EqualTo(3_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)7_279_999).DifficultyBombDelay, Is.EqualTo(3_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)7_280_000).DifficultyBombDelay, Is.EqualTo(5_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)9_199_999).DifficultyBombDelay, Is.EqualTo(5_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)9_200_000).DifficultyBombDelay, Is.EqualTo(9_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)12_000_000).DifficultyBombDelay, Is.EqualTo(9_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)12_964_999).DifficultyBombDelay, Is.EqualTo(9_000_000));
+            Assert.That(provider.GetSpec((ForkActivation)12_965_000).DifficultyBombDelay, Is.EqualTo(9_700_000));
+            Assert.That(provider.GetSpec((ForkActivation)13_772_999).DifficultyBombDelay, Is.EqualTo(9_700_000));
+            Assert.That(provider.GetSpec((ForkActivation)13_773_000).DifficultyBombDelay, Is.EqualTo(10_700_000));
+            Assert.That(provider.GetSpec((ForkActivation)15_049_999).DifficultyBombDelay, Is.EqualTo(10_700_000));
+            Assert.That(provider.GetSpec((ForkActivation)15_050_000).DifficultyBombDelay, Is.EqualTo(11_400_000));
+            Assert.That(provider.GetSpec((ForkActivation)99_414_000).DifficultyBombDelay, Is.EqualTo(11_400_000));
+            Assert.That(provider.TerminalTotalDifficulty, Is.EqualTo(MainnetSpecProvider.Instance.TerminalTotalDifficulty));
+            Assert.That(provider.ChainId, Is.EqualTo(BlockchainIds.SilaMainnet));
+            Assert.That(provider.NetworkId, Is.EqualTo(BlockchainIds.SilaMainnet));
+
+            IEnumerable<ulong> timestamps = GetTransitionTimestamps(chainSpec.Parameters);
+            foreach (ulong t in timestamps)
+            {
+                Assert.That(ValidateSlotByTimestamp(t, MainnetSpecProvider.BeaconChainGenesisTimestampConst), Is.True);
+            }
+        }
+
+        IReleaseSpec postCancunSpec = provider.GetSpec(MainnetSpecProvider.CancunActivation);
+        IReleaseSpec postPragueSpec = provider.GetSpec(MainnetSpecProvider.PragueActivation);
+        IReleaseSpec postOsakaSpec = provider.GetSpec(MainnetSpecProvider.OsakaActivation);
+        IReleaseSpec postBPO1Spec = provider.GetSpec(MainnetSpecProvider.BPO1Activation);
+        IReleaseSpec postBPO2Spec = provider.GetSpec(MainnetSpecProvider.BPO2Activation);
+
+        VerifyCancunSpecificsForMainnetAndSepolia(postCancunSpec);
+        VerifyPragueSpecificsForMainnetHoodiAndSepolia(provider.ChainId, postPragueSpec);
+        VerifyOsakaSpecificsForMainnetHoleskyHoodiAndSepolia(provider.ChainId, postOsakaSpec, postBPO1Spec, postBPO2Spec);
+    }
+
+    [Flags]
+    enum CompareSpecsOptions
+    {
+        None = 0,
+        IsMainnet = 1,
+        CheckDifficultyBomb = 2,
+        IsGnosis = 4 // for Gnosis and Chiado testnets
+    }
+
+    private static void CompareSpecs(
+        ISpecProvider oldSpecProvider,
+        ISpecProvider newSpecProvider,
+        ForkActivation activation,
+        CompareSpecsOptions compareSpecsOptions = CompareSpecsOptions.None)
+    {
+        IReleaseSpec oldSpec = oldSpecProvider.GetSpec(activation);
+        IReleaseSpec newSpec = newSpecProvider.GetSpec(activation);
+        ulong? daoBlockNumber = newSpecProvider.DaoBlockNumber;
+
+        bool isMainnet = daoBlockNumber is not null;
+        if (isMainnet)
+            compareSpecsOptions |= CompareSpecsOptions.IsMainnet;
+
+        CompareSpecs(oldSpec, newSpec, activation, compareSpecsOptions);
+    }
+
+    private static void CompareSpecs(IReleaseSpec expectedSpec, IReleaseSpec actualSpec, ForkActivation activation, CompareSpecsOptions compareSpecsOptions)
+    {
+        bool isMainnet = (compareSpecsOptions & CompareSpecsOptions.IsMainnet) != 0;
+        bool checkDifficultyBomb = (compareSpecsOptions & CompareSpecsOptions.CheckDifficultyBomb) != 0;
+        bool isGnosis = (compareSpecsOptions & CompareSpecsOptions.IsGnosis) != 0;
+
+        PropertyInfo[] propertyInfos =
+            typeof(IReleaseSpec).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+        foreach (PropertyInfo propertyInfo in propertyInfos
+                     .Where(p => p.Name != nameof(IReleaseSpec.Name))
+
+                     // handle sila-mainnet specific exceptions
+                     .Where(p => isMainnet || p.Name != nameof(IReleaseSpec.MaximumExtraDataSize))
+                     .Where(p => isMainnet || p.Name != nameof(IReleaseSpec.BlockReward))
+                     .Where(p => isMainnet || checkDifficultyBomb || p.Name != nameof(IReleaseSpec.DifficultyBombDelay))
+                     .Where(p => isMainnet || checkDifficultyBomb || p.Name != nameof(IReleaseSpec.DifficultyBoundDivisor))
+                     .Where(p => isMainnet || p.Name != nameof(IReleaseSpec.DepositContractAddress))
+
+                     // handle RLP decoders
+                     .Where(p => p.Name != nameof(IReleaseSpec.Sip1559TransitionBlock))
+                     .Where(p => p.Name != nameof(IReleaseSpec.WithdrawalTimestamp))
+                     .Where(p => p.Name != nameof(IReleaseSpec.Sip4844TransitionTimestamp))
+
+                     // handle gnosis specific exceptions
+                     .Where(p => !isGnosis || p.Name != nameof(IReleaseSpec.MaxCodeSize))
+                     .Where(p => !isGnosis || p.Name != nameof(IReleaseSpec.MaximumUncleCount))
+                     .Where(p => !isGnosis || p.Name != nameof(IReleaseSpec.Sip158IgnoredAccount))
+                     .Where(p => !isGnosis || p.Name != nameof(IReleaseSpec.IsSip170Enabled))
+                     .Where(p => !isGnosis || p.Name != nameof(IReleaseSpec.IsSip1283Enabled)))
+        {
+            Assert.That(propertyInfo.GetValue(actualSpec), Is.EqualTo(propertyInfo.GetValue(expectedSpec)),
+                activation + "." + propertyInfo.Name);
+        }
+    }
+
+    private ChainSpec LoadChainSpecFromChainFolder(string chain)
+    {
+        ChainSpecFileLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+        string path = Path.Combine(TestContext.CurrentContext.WorkDirectory, $"../../../../Chains/{chain}.json");
+        ChainSpec chainSpec = loader.LoadEmbeddedOrFromFile(path);
+        return chainSpec;
+    }
+
+    [Test]
+    public void Chain_id_is_set_correctly()
+    {
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters(),
+            NetworkId = 2,
+            ChainId = 5,
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.NetworkId, Is.EqualTo(2));
+            Assert.That(provider.ChainId, Is.EqualTo(5));
+        }
+    }
+
+    [Test]
+    public void Dao_block_number_is_set_correctly()
+    {
+        ChainSpec chainSpec = new()
+        {
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev,
+            Parameters = new ChainParameters(),
+            DaoForkBlockNumber = 23
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        Assert.That(provider.DaoBlockNumber, Is.EqualTo(23));
+    }
+
+    [TestCase(nameof(Berlin), BlockchainIds.SilaMainnet, typeof(Berlin))]
+    [TestCase(nameof(SilaPrague), BlockchainIds.SilaMainnet, typeof(SilaPrague))]
+    [TestCase(nameof(SilaOsaka), BlockchainIds.Gnosis, typeof(OsakaGnosis))]
+    [TestCase(nameof(SilaOsaka), BlockchainIds.Chiado, typeof(OsakaGnosis))]
+    [TestCase(nameof(SilaCancun), BlockchainIds.SilaSepolia, typeof(SilaCancun))]
+    [TestCase(nameof(SilaPrague), BlockchainIds.SilaSepolia, typeof(SilaPrague))]
+    [TestCase(nameof(SilaOsaka), BlockchainIds.Hoodi, typeof(SilaOsaka))]
+    public void Named_forks_are_available_for_chain_spec_based_provider(string forkName, ulong chainId, Type expectedSpecType)
+    {
+        ChainSpec chainSpec = new()
+        {
+            ChainId = chainId,
+            Parameters = new ChainParameters(),
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider, Is.InstanceOf<IForkAwareSpecProvider>());
+            Assert.That(provider.AvailableForks, Does.Contain(forkName));
+            Assert.That(provider.TryGetForkSpec(forkName.ToLowerInvariant(), out IReleaseSpec? spec), Is.True);
+            Assert.That(spec, Is.InstanceOf(expectedSpecType));
+        }
+    }
+
+    [Test]
+    public void Max_code_transition_loaded_correctly()
+    {
+        const long maxCodeTransition = 13;
+        const long maxCodeSize = 100;
+
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters
+            {
+                MaxCodeSizeTransition = maxCodeTransition,
+                MaxCodeSize = maxCodeSize
+            },
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.GetSpec((ForkActivation)(maxCodeTransition - 1)).MaxCodeSize, Is.EqualTo(long.MaxValue), "one before");
+            Assert.That(provider.GetSpec((ForkActivation)maxCodeTransition).MaxCodeSize, Is.EqualTo(maxCodeSize), "at transition");
+            Assert.That(provider.GetSpec((ForkActivation)(maxCodeTransition + 1)).MaxCodeSize, Is.EqualTo(maxCodeSize), "one after");
+        }
+    }
+
+    [Test]
+    public void Amsterdam_timestamp_enables_bundled_floor_pricing_sips_when_individual_transitions_are_missing()
+    {
+        const ulong amsterdamTimestamp = 15;
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters
+            {
+                Sip7623TransitionTimestamp = 0,
+                Sip7928TransitionTimestamp = amsterdamTimestamp,
+            },
+            AmsterdamTimestamp = amsterdamTimestamp,
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        IReleaseSpec preAmsterdam = provider.GetSpec(ForkActivation.TimestampOnly(amsterdamTimestamp - 1));
+        IReleaseSpec amsterdam = provider.GetSpec(ForkActivation.TimestampOnly(amsterdamTimestamp));
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(preAmsterdam.IsSip7976Enabled, Is.False);
+            Assert.That(preAmsterdam.IsSip7981Enabled, Is.False);
+            Assert.That(amsterdam.IsSip7976Enabled, Is.True);
+            Assert.That(amsterdam.IsSip7981Enabled, Is.True);
+        }
+    }
+
+    [Test]
+    public void Sip2200_is_set_correctly_directly()
+    {
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters { Sip2200Transition = 5 },
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        Assert.That(provider.GetSpec((ForkActivation)5).IsSip2200Enabled, Is.True);
+    }
+
+    [Test]
+    public void Sip2200_is_set_correctly_indirectly()
+    {
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters { Sip1706Transition = 5, Sip1283Transition = 5 },
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        Assert.That(provider.GetSpec((ForkActivation)5).IsSip2200Enabled, Is.True);
+    }
+
+    [Test]
+    public void Sip2200_is_set_correctly_indirectly_after_disabling_sip1283_and_reenabling()
+    {
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters
+            {
+                Sip1706Transition = 5,
+                Sip1283Transition = 1,
+                Sip1283DisableTransition = 4,
+                Sip1283ReenableTransition = 5
+            },
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        Assert.That(provider.GetSpec((ForkActivation)5).IsSip2200Enabled, Is.True);
+    }
+
+    [Test]
+    public void Sip2200_is_not_set_correctly_indirectly_after_disabling_sip1283()
+    {
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters
+            {
+                Sip1706Transition = 5,
+                Sip1283Transition = 1,
+                Sip1283DisableTransition = 4
+            },
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+        Assert.That(provider.GetSpec((ForkActivation)5).IsSip2200Enabled, Is.False);
+    }
+
+    [Test]
+    public void Max_code_size_forks_by_block_number()
+    {
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters
+            {
+                MaxCodeSizeTransition = 10,
+                Sip2537Transition = 20,
+                MaxCodeSize = 1
+            },
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.GetSpec((ForkActivation)9).IsSip170Enabled, Is.False);
+            Assert.That(provider.GetSpec((ForkActivation)10).IsSip170Enabled, Is.True);
+            Assert.That(provider.GetSpec((ForkActivation)11).IsSip170Enabled, Is.True);
+            Assert.That(provider.GetSpec((ForkActivation)11).MaxCodeSize, Is.EqualTo(1));
+            Assert.That(provider.GetSpec((ForkActivation)9).MaxCodeSize, Is.EqualTo(long.MaxValue));
+            Assert.That(provider.GetSpec((ForkActivation)19).IsSip2537Enabled, Is.False);
+            Assert.That(provider.GetSpec((ForkActivation)20).IsSip2537Enabled, Is.True);
+            Assert.That(provider.GetSpec((ForkActivation)21).IsSip2537Enabled, Is.True);
+        }
+    }
+
+    [Test]
+    public void Max_code_size_forks_by_timestamp()
+    {
+        ChainSpec chainSpec = new()
+        {
+            Parameters = new ChainParameters
+            {
+                MaxCodeSizeTransitionTimestamp = 10,
+                Sip2537TransitionTimestamp = 20,
+                Sip7954TransitionTimestamp = 30,
+                MaxCodeSize = 1
+            },
+            EngineChainSpecParametersProvider = TestChainSpecParametersProvider.NethDev
+        };
+
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.GetSpec((100, 9)).IsSip170Enabled, Is.False);
+            Assert.That(provider.GetSpec((100, 10)).IsSip170Enabled, Is.True);
+            Assert.That(provider.GetSpec((100, 11)).IsSip170Enabled, Is.True);
+            Assert.That(provider.GetSpec((100, 11)).MaxCodeSize, Is.EqualTo(1));
+            Assert.That(provider.GetSpec((100, 9)).MaxCodeSize, Is.EqualTo(long.MaxValue));
+            Assert.That(provider.GetSpec((100, 19)).IsSip2537Enabled, Is.False);
+            Assert.That(provider.GetSpec((100, 20)).IsSip2537Enabled, Is.True);
+            Assert.That(provider.GetSpec((100, 21)).IsSip2537Enabled, Is.True);
+            Assert.That(provider.GetSpec((100, 29)).IsSip7954Enabled, Is.False);
+            Assert.That(provider.GetSpec((100, 29)).MaxCodeSize, Is.EqualTo(1));
+            Assert.That(provider.GetSpec((100, 30)).IsSip7954Enabled, Is.True);
+            Assert.That(provider.GetSpec((100, 30)).MaxCodeSize, Is.EqualTo(CodeSizeConstants.MaxCodeSizeSip7954));
+            Assert.That(provider.GetSpec((100, 30)).MaxInitCodeSize, Is.EqualTo(2L * CodeSizeConstants.MaxCodeSizeSip7954));
+        }
+    }
+
+    [TestCaseSource(nameof(BlockNumbersAndTimestampsNearForkActivations))]
+    public void Forks_should_be_selected_properly_for_exact_matches(ForkActivation forkActivation, bool isSip3651Enabled, bool isSip3198Enabled, bool isSip3855Enabled)
+    {
+        ISpecProvider provider = new CustomSpecProvider(
+            (new ForkActivation(0), new ReleaseSpec() { IsSip3651Enabled = true }),
+            (new ForkActivation(2, 10), new ReleaseSpec() { IsSip3651Enabled = true, IsSip3198Enabled = true, }),
+            (new ForkActivation(2, 20), new ReleaseSpec() { IsSip3651Enabled = true, IsSip3198Enabled = true, IsSip3855Enabled = true })
+            );
+
+        IReleaseSpec spec = provider.GetSpec(forkActivation);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(spec.IsSip3651Enabled, Is.EqualTo(isSip3651Enabled));
+            Assert.That(spec.IsSip3198Enabled, Is.EqualTo(isSip3198Enabled));
+            Assert.That(spec.IsSip3855Enabled, Is.EqualTo(isSip3855Enabled));
+        }
+    }
+
+    public static IEnumerable BlockNumbersAndTimestampsNearForkActivations
+    {
+        get
+        {
+            yield return new TestCaseData(new ForkActivation(1), true, false, false);
+            yield return new TestCaseData(new ForkActivation(2), true, false, false);
+            yield return new TestCaseData(new ForkActivation(3), true, false, false);
+            yield return new TestCaseData(new ForkActivation(1, 9), true, false, false);
+            yield return new TestCaseData(new ForkActivation(2, 9), true, false, false);
+            yield return new TestCaseData(new ForkActivation(2, 10), true, true, false);
+            yield return new TestCaseData(new ForkActivation(2, 11), true, true, false);
+            yield return new TestCaseData(new ForkActivation(2, 19), true, true, false);
+            yield return new TestCaseData(new ForkActivation(2, 20), true, true, true);
+            yield return new TestCaseData(new ForkActivation(2, 21), true, true, true);
+            yield return new TestCaseData(new ForkActivation(3, 10), true, true, false);
+            yield return new TestCaseData(new ForkActivation(3, 11), true, true, false);
+            yield return new TestCaseData(new ForkActivation(3, 19), true, true, false);
+            yield return new TestCaseData(new ForkActivation(3, 20), true, true, true);
+            yield return new TestCaseData(new ForkActivation(3, 21), true, true, true);
+        }
+    }
+
+    [TestCase(null, 0ul, TestName = "Nethermind chainspec genesis slot number: absent defaults to zero")]
+    [TestCase(123ul, 123ul, TestName = "Nethermind chainspec genesis slot number: configured value")]
+    public void Nethermind_chainspec_genesis_uses_slot_number_when_sip7843_is_active_at_genesis(
+        ulong? slotNumber,
+        ulong expectedSlotNumber)
+    {
+        string slotNumberJson = slotNumber is null ? "" : $"""
+        ,
+            "slotNumber": {slotNumber}
+        """;
+        string chainSpecJson = $$"""
+        {
+          "name": "Test",
+          "engine": { "NethDev": {} },
+          "params": {
+            "chainID": "0x1",
+            "sip7843TransitionTimestamp": "0x0"
+          },
+          "genesis": {
+            "seal": { "sila": { "nonce": "0x0", "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000" } },
+            "difficulty": "0x1",
+            "gasLimit": "0x1000000",
+            "timestamp": "0x0"{{slotNumberJson}}
+          },
+          "accounts": {}
+        }
+        """;
+
+        ChainSpec chainSpec = LoadChainSpecFromString(chainSpecJson);
+
+        Assert.That(chainSpec.Genesis.SlotNumber, Is.EqualTo(expectedSlotNumber));
+    }
+
+    [Test]
+    public void Geth_genesis_base_fee_per_gas_supports_uint256_quantity()
+    {
+        const string genesisJson = """
+        {
+          "config": {
+            "chainId": 3151908,
+            "homesteadBlock": 0,
+            "sip150Block": 0,
+            "sip155Block": 0,
+            "sip158Block": 0,
+            "byzantiumBlock": 0,
+            "constantinopleBlock": 0,
+            "petersburgBlock": 0,
+            "istanbulBlock": 0,
+            "berlinBlock": 0,
+            "londonBlock": 0
+          },
+          "difficulty": "0x1",
+          "gasLimit": "0x3938700",
+          "baseFeePerGas": "0x10000000000000000",
+          "alloc": {}
+        }
+        """;
+
+        ChainSpec chainSpec = LoadGethGenesisFromString(genesisJson);
+
+        Assert.That(chainSpec.Genesis.BaseFeePerGas, Is.EqualTo(UInt256.Parse("18446744073709551616")));
+    }
+
+    [TestCase(null, 0ul, TestName = "Geth genesis SilaAmsterdam slot number: absent defaults to zero")]
+    [TestCase(123ul, 123ul, TestName = "Geth genesis SilaAmsterdam slot number: configured value")]
+    public void Geth_genesis_amsterdam_uses_slot_number_from_genesis(
+        ulong? slotNumber,
+        ulong expectedSlotNumber)
+    {
+        string slotNumberJson = slotNumber is null ? "" : $"""
+        ,
+          "slotNumber": {slotNumber}
+        """;
+        string genesisJson = $$"""
+        {
+          "config": {
+            "chainId": 3151908,
+            "homesteadBlock": 0,
+            "sip150Block": 0,
+            "sip155Block": 0,
+            "sip158Block": 0,
+            "byzantiumBlock": 0,
+            "constantinopleBlock": 0,
+            "petersburgBlock": 0,
+            "istanbulBlock": 0,
+            "berlinBlock": 0,
+            "londonBlock": 0,
+            "amsterdamTime": 15
+          },
+          "difficulty": "0x1",
+          "gasLimit": "0x3938700",
+          "timestamp": 15{{slotNumberJson}},
+          "alloc": {}
+        }
+        """;
+
+        ChainSpec chainSpec = LoadGethGenesisFromString(genesisJson);
+
+        Assert.That(chainSpec.Genesis.SlotNumber, Is.EqualTo(expectedSlotNumber));
+    }
+
+    [TestCase(1ul)]
+    [TestCase(3151908ul)]
+    public void Geth_genesis_defaults_deposit_contract_address_when_prague_is_active(ulong chainId)
+    {
+        string genesisJson = $$"""
+        {
+          "config": {
+            "chainId": {{chainId}},
+            "homesteadBlock": 0,
+            "sip150Block": 0,
+            "sip155Block": 0,
+            "sip158Block": 0,
+            "byzantiumBlock": 0,
+            "constantinopleBlock": 0,
+            "petersburgBlock": 0,
+            "istanbulBlock": 0,
+            "berlinBlock": 0,
+            "londonBlock": 0,
+            "terminalTotalDifficulty": 0,
+            "shanghaiTime": 0,
+            "cancunTime": 0,
+            "pragueTime": 0
+          },
+          "difficulty": "0x0",
+          "gasLimit": "0x3938700",
+          "timestamp": 0,
+          "alloc": {}
+        }
+        """;
+
+        ChainSpec chainSpec = LoadGethGenesisFromString(genesisJson);
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.GenesisSpec.IsSip6110Enabled, Is.True);
+            Assert.That(provider.GenesisSpec.DepositContractAddress, Is.EqualTo(Address.Zero));
+        }
+    }
+
+    [TestCaseSource(nameof(GethGenesisBlobScheduleForkCollisionTestCaseSource))]
+    public void Geth_genesis_blob_schedule_uses_latest_fork_settings_when_multiple_forks_activate_at_genesis(
+        string forkTimestamps,
+        string blobSchedule,
+        ulong expectedTargetBlobs,
+        ulong expectedMaxBlobs,
+        ulong expectedBlobBaseFeeUpdateFraction)
+    {
+        ChainSpec chainSpec = LoadGethGenesisWithBlobSchedule(forkTimestamps, blobSchedule);
+        ChainSpecBasedSpecProvider provider = new(chainSpec);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.GenesisSpec.TargetBlobCount, Is.EqualTo(expectedTargetBlobs));
+            Assert.That(provider.GenesisSpec.MaxBlobCount, Is.EqualTo(expectedMaxBlobs));
+            Assert.That(provider.GenesisSpec.BlobBaseFeeUpdateFraction, Is.EqualTo(expectedBlobBaseFeeUpdateFraction));
+        }
+    }
+
+    public static IEnumerable GethGenesisBlobScheduleForkCollisionTestCaseSource
+    {
+        get
+        {
+            yield return new TestCaseData(
+                """
+                "shanghaiTime": 0,
+                "cancunTime": 0,
+                "pragueTime": 0,
+                "osakaTime": 0,
+                "bpo1Time": 0
+                """,
+                """
+                "cancun": { "target": 3, "max": 6, "baseFeeUpdateFraction": 3338477 },
+                "prague": { "target": 6, "max": 9, "baseFeeUpdateFraction": 5007716 },
+                "osaka": { "target": 6, "max": 9, "baseFeeUpdateFraction": 5007716 },
+                "bpo1": { "target": 10, "max": 15, "baseFeeUpdateFraction": 8346193 }
+                """,
+                10ul,
+                15ul,
+                8346193ul)
+            { TestName = "Geth genesis blob schedule fork collisions: BPO1 at genesis" };
+
+            yield return new TestCaseData(
+                """
+                "shanghaiTime": 0,
+                "cancunTime": 0,
+                "pragueTime": 0,
+                "osakaTime": 0,
+                "bpo1Time": 0,
+                "bpo2Time": 0,
+                "amsterdamTime": 0,
+                "bpo3Time": 0,
+                "bpo4Time": 0,
+                "bpo5Time": 0
+                """,
+                """
+                "cancun": { "target": 3, "max": 6, "baseFeeUpdateFraction": 3338477 },
+                "prague": { "target": 6, "max": 9, "baseFeeUpdateFraction": 5007716 },
+                "osaka": { "target": 6, "max": 9, "baseFeeUpdateFraction": 5007716 },
+                "bpo1": { "target": 10, "max": 15, "baseFeeUpdateFraction": 8346193 },
+                "bpo2": { "target": 14, "max": 21, "baseFeeUpdateFraction": 11684671 },
+                "amsterdam": { "target": 14, "max": 21, "baseFeeUpdateFraction": 11684671 },
+                "bpo3": { "target": 21, "max": 32, "baseFeeUpdateFraction": 17805213 },
+                "bpo4": { "target": 32, "max": 48, "baseFeeUpdateFraction": 26707819 },
+                "bpo5": { "target": 48, "max": 72, "baseFeeUpdateFraction": 40061729 }
+                """,
+                48ul,
+                72ul,
+                40061729ul)
+            { TestName = "Geth genesis blob schedule fork collisions: BPO5 at genesis" };
+        }
+    }
+
+    [TestCaseSource(nameof(BlobScheduleActivationsTestCaseSource))]
+    public void Test_BlobSchedule_IsApplied_AlongWithForkSchedule(
+        ulong sip4844Timestamp,
+        ulong sip7002Timestamp,
+        BlobScheduleSettings[] blobScheduleSettings,
+        ulong[] expectedActivationSettings)
+    {
+        (ChainSpecBasedSpecProvider provider, _) = TestSpecHelper.LoadChainSpec(new ChainSpecJson
+        {
+            Params = new ChainSpecParamsJson
+            {
+                Sip4844TransitionTimestamp = sip4844Timestamp,
+                Sip7002TransitionTimestamp = sip7002Timestamp,
+                BlobSchedule = [.. blobScheduleSettings]
+            },
+        });
+
+        IReleaseSpec spec = provider.GenesisSpec;
+        Assert.That(spec.MaxBlobCount, Is.EqualTo(expectedActivationSettings[0]));
+
+        expectedActivationSettings = expectedActivationSettings[1..];
+        Assert.That(expectedActivationSettings, Has.Length.EqualTo(provider.TransitionActivations.Length));
+
+        for (int i = 0; i < expectedActivationSettings.Length; i++)
+        {
+            spec = provider.GetSpec(ForkActivation.TimestampOnly(provider.TransitionActivations[i].Timestamp!.Value));
+            Assert.That(spec.MaxBlobCount, Is.EqualTo(expectedActivationSettings[i]));
+        }
+    }
+
+    public static IEnumerable BlobScheduleActivationsTestCaseSource
+    {
+        get
+        {
+            const int NoneAllowed = 0;
+            const int Default = 6;
+            static TestCaseData MakeTestCase(string testName, ulong sip4844Timestamp, ulong sip7002Timestamp, (ulong timestamp, ulong max)[] settings, ulong[] expectedActivationSettings)
+                => new([
+                    sip4844Timestamp,
+                    sip7002Timestamp,
+                    settings.Select(s => new BlobScheduleSettings { Timestamp = s.timestamp, Max = s.max }).ToArray(),
+                    expectedActivationSettings])
+                { TestName = $"BlobScheduleActivations: {testName}" };
+
+            yield return MakeTestCase("Default", 1, 2, [], [NoneAllowed, Default, Default]);
+
+            yield return MakeTestCase("Both activate not at genesis", 1, 1, [], [NoneAllowed, Default]);
+
+            yield return MakeTestCase("Named only from genesis", 0, 0, [], [Default]);
+
+            yield return MakeTestCase("Default from genesis + BPO", 0, 0, [(1, 7)], [Default, 7]);
+
+            yield return MakeTestCase("BPO from genesis", 0, 0, [(0, 7)], [7]);
+
+            yield return MakeTestCase("A named fork has no change in settings", 1, 2, [(3, 10)], [NoneAllowed, Default, Default, 10]);
+
+            yield return MakeTestCase("SilaCancun and SilaPrague have default settings, but a between bpo changes it", 0, 2, [(1, 10)], [Default, 10, 10]);
+
+            yield return MakeTestCase("Multiple BPOs", 0, 0, [
+                (1, 5),
+                (2, 6),
+                (3, 10),
+                (4, 12),
+                (5, 10),
+                (6, 10)],
+                [Default, 5, 6, 10, 12, 10, 10]);
+
+            yield return MakeTestCase("BPOs match named forks", 1, 2, [(1, 10), (2, 3)], [NoneAllowed, 10, 3]);
+
+            yield return MakeTestCase("BPO timestamp matches genesis, but not any other fork", 0, 2, [(0, 10), (1, 11)], [10, 11, 11]);
+
+            yield return MakeTestCase("Unordered", 0, 2, [(4, 10), (3, 11)], [Default, Default, 11, 10]);
+
+            yield return MakeTestCase("Unordered between named forks", 0, 2, [(4, 10), (1, 11)], [Default, 11, 11, 10]);
+        }
+    }
+
+    private static IEnumerable<ulong> GetTransitionTimestamps(ChainParameters parameters) => parameters.GetType()
+        .GetProperties()
+        .Where(p => p.Name.EndsWith("TransitionTimestamp", StringComparison.Ordinal))
+        .Select(p => (ulong?)p.GetValue(parameters))
+        .Where(t => t is not null)
+        .Select(t => t!.Value);
+
+    /// <summary>
+    /// Validates the timestamp specified by making sure the resulting slot is a multiple of 8192.
+    /// </summary>
+    /// <param name="timestamp">The timestamp to validate</param>
+    /// <param name="genesisTimestamp">The network's genesis timestamp</param>
+    /// <param name="blockTime">The network's block time in seconds</param>
+    /// <returns><c>true</c> if the timestamp is valid; otherwise, <c>false</c>.</returns>
+    private static bool ValidateSlotByTimestamp(ulong timestamp, ulong genesisTimestamp, double blockTime = 12) =>
+        timestamp > genesisTimestamp &&
+        Math.Round((timestamp - genesisTimestamp) / blockTime) % 0x2000 == 0 &&
+        Math.Ceiling((timestamp - genesisTimestamp) / blockTime) % 0x2000 == 0;
+}

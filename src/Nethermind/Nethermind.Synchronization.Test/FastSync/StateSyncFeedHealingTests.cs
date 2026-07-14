@@ -1,0 +1,199 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Autofac;
+using Nethermind.Core;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Int256;
+using Nethermind.State;
+using Nethermind.State.Proofs;
+using Nethermind.State.Snap;
+using Nethermind.Synchronization.FastSync;
+using Nethermind.Synchronization.SnapSync;
+using NUnit.Framework;
+
+namespace Nethermind.Synchronization.Test.FastSync;
+
+[FixtureLifeCycle(LifeCycle.InstancePerTestCase)]
+[TestFixture]
+[Parallelizable(ParallelScope.All)]
+public class StateSyncFeedHealingTests : StateSyncFeedTestsBase
+{
+    [Test]
+    public async Task HealTreeWithoutBoundaryProofs()
+    {
+        RemoteDbContext remote = new(_logManager);
+        TestItem.Tree.FillStateTreeWithTestAccounts(remote.StateTree);
+
+        Hash256 rootHash = remote.StateTree.RootHash;
+
+        await using IContainer container = PrepareDownloader(remote, syncDispatcherAllocateTimeoutMs: 2000);
+        IStateSyncTestOperation local = container.Resolve<IStateSyncTestOperation>();
+        ISnapTrieFactory snapTrieFactory = container.Resolve<ISnapTrieFactory>();
+
+        ProcessAccountRange(remote.StateTree, snapTrieFactory, 1, rootHash, TestItem.Tree.AccountsWithPaths);
+
+        SafeContext ctx = container.Resolve<SafeContext>();
+        await ActivateAndWait(ctx);
+
+        DetailedProgress data = ctx.TreeFeed.GetDetailedProgress();
+
+        local.CompareTrees(remote, _logger, "END");
+        Assert.That(local.RootHash, Is.EqualTo(remote.StateTree.RootHash));
+
+        // I guess state root will be requested regardless
+        Assert.That(data.RequestedNodesCount, Is.EqualTo(1));   // 4 boundary proof nodes stitched together => 0
+    }
+
+    [Test]
+    public async Task HealBigSqueezedRandomTree()
+    {
+        RemoteDbContext remote = new(_logManager);
+
+        int pathPoolCount = 100_000;
+        Hash256[] pathPool = new Hash256[pathPoolCount];
+
+        for (int i = 0; i < pathPoolCount; i++)
+        {
+            byte[] key = new byte[32];
+            // Snap can't actually use GetTrieNodes where the path is exactly 64 nibble. So *255.
+            ((UInt256)(i * 255)).ToBigEndian(key);
+            Hash256 keccak = new(key);
+            pathPool[i] = keccak;
+        }
+
+        ulong blockJumps = 5;
+
+        // Store accounts snapshot at each block number
+        SortedDictionary<Hash256, Account>[] accountsAtBlock = new SortedDictionary<Hash256, Account>[blockJumps + 1];
+        Hash256[] rootHashAtBlock = new Hash256[blockJumps + 1];
+
+        // Initialize accounts
+        SortedDictionary<Hash256, Account> accounts = [];
+
+        // Generate initial Remote Tree (block 0)
+        for (int accountIndex = 0; accountIndex < 10000; accountIndex++)
+        {
+            Account account = TestItem.GenerateRandomAccount();
+            Hash256 path = pathPool[TestItem.Random.Next(pathPool.Length - 1)];
+
+            remote.StateTree.Set(path, account);
+            accounts[path] = account;
+        }
+
+        remote.StateTree.Commit();
+
+        // Pre-build all blocks and store state at each block
+        for (ulong blockNumber = 1; blockNumber <= blockJumps; blockNumber++)
+        {
+            // Store snapshot of accounts and root hash at this block
+            accountsAtBlock[blockNumber] = new SortedDictionary<Hash256, Account>(accounts);
+            rootHashAtBlock[blockNumber] = remote.StateTree.RootHash;
+
+            // Modify tree for next block
+            for (int accountIndex = 0; accountIndex < 1000; accountIndex++)
+            {
+                Account account = TestItem.GenerateRandomAccount();
+                Hash256 path = pathPool[TestItem.Random.Next(pathPool.Length - 1)];
+
+                if (accounts.ContainsKey(path))
+                {
+                    if (TestItem.Random.NextSingle() > 0.5)
+                    {
+                        remote.StateTree.Set(path, account);
+                        accounts[path] = account;
+                    }
+                    else
+                    {
+                        remote.StateTree.Set(path, null);
+                        accounts.Remove(path);
+                    }
+                }
+                else
+                {
+                    remote.StateTree.Set(path, account);
+                    accounts[path] = account;
+                }
+            }
+
+            remote.StateTree.Commit();
+        }
+
+        // Final state root
+        Hash256 finalRootHash = remote.StateTree.RootHash;
+
+        await using IContainer container = PrepareDownloader(remote, syncDispatcherAllocateTimeoutMs: 1000);
+        IStateSyncTestOperation local = container.Resolve<IStateSyncTestOperation>();
+        ISnapTrieFactory snapTrieFactory = container.Resolve<ISnapTrieFactory>();
+
+        int startingHashIndex = 0;
+        int endHashIndex;
+
+        // Now process account ranges using stored snapshots
+        for (ulong blockNumber = 1; blockNumber <= blockJumps; blockNumber++)
+        {
+            // Set remote tree to the state at this block number
+            remote.StateTree.RootHash = rootHashAtBlock[blockNumber];
+            SortedDictionary<Hash256, Account> blockAccounts = accountsAtBlock[blockNumber];
+
+            for (int i = 0; i < 19; i++)
+            {
+                endHashIndex = startingHashIndex + 1000;
+
+                ProcessAccountRange(remote.StateTree, snapTrieFactory, blockNumber, rootHashAtBlock[blockNumber],
+                   blockAccounts.Where(a => a.Key >= pathPool[startingHashIndex] && a.Key <= pathPool[endHashIndex]).Select(a => new PathWithAccount(a.Key, a.Value)).ToArray());
+
+                startingHashIndex = endHashIndex + 1;
+            }
+        }
+
+        // Set remote tree back to final state for remaining processing
+        remote.StateTree.RootHash = finalRootHash;
+
+        endHashIndex = startingHashIndex + 1000;
+        while (endHashIndex < pathPool.Length - 1)
+        {
+            endHashIndex = startingHashIndex + 1000;
+            if (endHashIndex > pathPool.Length - 1)
+            {
+                endHashIndex = pathPool.Length - 1;
+            }
+
+            ProcessAccountRange(remote.StateTree, snapTrieFactory, blockJumps, finalRootHash,
+                accounts.Where(a => a.Key >= pathPool[startingHashIndex] && a.Key <= pathPool[endHashIndex]).Select(a => new PathWithAccount(a.Key, a.Value)).ToArray());
+
+            startingHashIndex += 1000;
+        }
+
+        SafeContext ctx = container.Resolve<SafeContext>();
+        await ActivateAndWait(ctx, timeout: 20000);
+
+        DetailedProgress data = ctx.TreeFeed.GetDetailedProgress();
+
+        local.UpdateRootHash();
+        local.CompareTrees(remote, _logger, "END");
+        _logger.Info($"REQUESTED NODES TO HEAL: {data.RequestedNodesCount}");
+        Assert.That(data.RequestedNodesCount, Is.LessThan(accounts.Count / 2));
+    }
+
+    private static void ProcessAccountRange(StateTree remoteStateTree, ISnapTrieFactory snapTrieFactory, ulong blockNumber, Hash256 rootHash, PathWithAccount[] accounts)
+    {
+        ValueHash256 startingHash = accounts.First().Path;
+        ValueHash256 endHash = accounts.Last().Path;
+        Hash256 limitHash = Keccak.MaxValue;
+
+        AccountProofCollector accountProofCollector = new(startingHash.Bytes);
+        remoteStateTree.Accept(accountProofCollector, remoteStateTree.RootHash);
+        byte[][] firstProof = accountProofCollector.BuildResult().Proof!;
+        accountProofCollector = new(endHash.Bytes);
+        remoteStateTree.Accept(accountProofCollector, remoteStateTree.RootHash);
+        byte[][] lastProof = accountProofCollector.BuildResult().Proof!;
+
+        _ = SnapProviderHelper.AddAccountRange(snapTrieFactory, blockNumber, rootHash, startingHash, limitHash, accounts, new ByteArrayListAdapter(new ArrayPoolList<byte[]>(firstProof.Length + lastProof.Length, firstProof.Concat(lastProof))));
+    }
+}

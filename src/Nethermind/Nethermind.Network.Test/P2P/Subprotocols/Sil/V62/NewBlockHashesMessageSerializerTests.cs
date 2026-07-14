@@ -1,0 +1,28 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core.Crypto;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages;
+using NUnit.Framework;
+
+namespace Nethermind.Network.Test.P2P.Subprotocols.Sil.V62
+{
+    [TestFixture, Parallelizable(ParallelScope.All)]
+    public class NewBlockHashesMessageSerializerTests
+    {
+        [Test]
+        public void Roundtrip()
+        {
+            using NewBlockHashesMessage message = new((Keccak.Compute("1"), 1UL), (Keccak.Compute("2"), 2UL));
+            NewBlockHashesMessageSerializer serializer = new();
+            SerializerTester.TestZero(serializer, message);
+        }
+
+        [Test]
+        public void To_string()
+        {
+            using NewBlockHashesMessage statusMessage = new();
+            _ = statusMessage.ToString();
+        }
+    }
+}

@@ -1,0 +1,46 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using BenchmarkDotNet.Attributes;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Crypto;
+using Nethermind.Int256;
+
+namespace Nethermind.Benchmarks.Rlp
+{
+    public class RlpDecodeBlockBenchmark
+    {
+        private static byte[] _block;
+
+        private byte[][] _scenarios;
+
+        public RlpDecodeBlockBenchmark()
+        {
+            Transaction[] transactions = new Transaction[100];
+            for (ulong i = 0; i < 100; i++)
+            {
+                transactions[(int)i] = Build.A.Transaction.WithData([(byte)i]).WithNonce(i).WithValue((UInt256)i).Signed(new SilaEcdsa(TestBlockchainIds.ChainId), TestItem.PrivateKeyA).TestObject;
+            }
+
+            _scenarios = new[]
+            {
+                Serialization.Rlp.Rlp.Encode(Build.A.Block.WithNumber(1).TestObject).Bytes,
+                Serialization.Rlp.Rlp.Encode(Build.A.Block.WithNumber(1).WithTransactions(transactions).WithUncles(Build.A.BlockHeader.TestObject).WithMixHash(Keccak.EmptyTreeHash).TestObject).Bytes
+            };
+        }
+
+        [Params(0, 1)]
+        public int ScenarioIndex { get; set; }
+
+        [GlobalSetup]
+        public void Setup() => _block = _scenarios[ScenarioIndex];
+
+        [Benchmark]
+        public Block Improved() => Serialization.Rlp.Rlp.Decode<Block>(_block);
+
+        [Benchmark]
+        public Block Current() => Serialization.Rlp.Rlp.Decode<Block>(_block);
+    }
+}

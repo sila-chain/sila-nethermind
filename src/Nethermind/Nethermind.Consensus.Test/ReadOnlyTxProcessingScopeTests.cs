@@ -1,0 +1,30 @@
+// SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Consensus.Processing;
+using Nethermind.Core;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Savm.State;
+using NSubstitute;
+using NUnit.Framework;
+
+namespace Nethermind.Consensus.Test;
+
+public class ReadOnlyTxProcessingScopeTests
+{
+    [Test]
+    public void Test_WhenDispose_ThenStateRootWillReset()
+    {
+        bool closed = false;
+        IDisposable closer = new Reactive.AnonymousDisposable(() => closed = true);
+        ReadOnlyTxProcessingScope env = new(
+            Substitute.For<ITransactionProcessor>(),
+            closer,
+            Substitute.For<IWorldState>());
+
+        env.Dispose();
+
+        Assert.That(closed, Is.True);
+    }
+}

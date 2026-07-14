@@ -1,0 +1,55 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+using Nethermind.Core.Extensions;
+using Nethermind.Specs;
+using Nethermind.Core.Test.Builders;
+using NUnit.Framework;
+
+namespace Nethermind.Savm.Test
+{
+    /// <summary>
+    /// https://gist.github.com/holiman/174548cad102096858583c6fbbb0649a
+    /// </summary>
+    public class Sip3651Tests : VirtualMachineTestsBase
+    {
+        protected override ulong BlockNumber => MainnetSpecProvider.ParisBlockNumber;
+        protected override ulong Timestamp => MainnetSpecProvider.ShanghaiBlockTimestamp;
+
+        [Test]
+        public void Access_beneficiary_address_after_sip_3651()
+        {
+            byte[] code = Prepare.SavmCode
+                .PushData(MinerKey.Address)
+                .Op(Instruction.BALANCE)
+                .Op(Instruction.POP)
+                .Done;
+            TestAllTracerWithOutput result = Execute(code);
+            Assert.That(result.StatusCode, Is.EqualTo(1));
+            AssertGas(result, GasCostOf.Transaction + 105);
+        }
+
+        [Test]
+        public void Access_beneficiary_address_before_sip_3651()
+        {
+            TestState.CreateAccount(TestItem.AddressF, 100.Sila);
+            byte[] code = Prepare.SavmCode
+                .PushData(MinerKey.Address)
+                .Op(Instruction.BALANCE)
+                .Op(Instruction.POP)
+                .Done;
+            TestAllTracerWithOutput result = Execute((BlockNumber, Timestamp - 1), 100000, code);
+            Assert.That(result.StatusCode, Is.EqualTo(1));
+            AssertGas(result, GasCostOf.Transaction + 2605);
+        }
+
+        protected override TestAllTracerWithOutput CreateTracer()
+        {
+            TestAllTracerWithOutput tracer = base.CreateTracer();
+            tracer.IsTracingAccess = false;
+            return tracer;
+        }
+
+    }
+}

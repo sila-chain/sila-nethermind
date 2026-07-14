@@ -1,0 +1,158 @@
+// SPDX-FileCopyrightText: 2025 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Consensus;
+using Nethermind.Core;
+using Nethermind.Core.Test;
+using Nethermind.Logging;
+using Nethermind.Network.P2P;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62;
+using Nethermind.Stats;
+using Nethermind.Stats.Model;
+using Nethermind.Synchronization;
+using Nethermind.TxPool;
+using NSubstitute;
+using NUnit.Framework;
+
+namespace Nethermind.Network.Test.P2P.Subprotocols.Sil.V62
+{
+    [TestFixture]
+    public class TxFloodControllerTests
+    {
+        private TxFloodController _controller;
+        private Sil62ProtocolHandler _handler;
+        private ISession _session;
+        private ITimestamper _timestamper;
+
+        private readonly AcceptTxResult Flooding = AcceptTxResult.NonceGap;
+
+        [SetUp]
+        public void Setup()
+        {
+            _session = Substitute.For<ISession>();
+            _handler = new Sil62ProtocolHandler(
+                _session,
+                Substitute.For<IMessageSerializationService>(),
+                Substitute.For<INodeStatsManager>(),
+                Substitute.For<ISyncServer>(),
+                RunImmediatelyScheduler.Instance,
+                Substitute.For<ITxPool>(),
+                Substitute.For<IGossipPolicy>(),
+                LimboLogs.Instance);
+
+            _timestamper = Substitute.For<ITimestamper>();
+            _timestamper.UtcNow.Returns(static c => DateTime.UtcNow);
+            _controller = new TxFloodController(_handler, _timestamper, LimboNoErrorLogger.Instance);
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            _handler?.Dispose();
+            _session?.Dispose();
+        }
+
+        [Test]
+        public void Is_allowed_will_be_true_unless_misbehaving()
+        {
+            for (int i = 0; i < 10000; i++)
+            {
+                Assert.That(_controller.IsAllowed(), Is.True);
+            }
+        }
+
+        [Test]
+        public void Is_allowed_will_be_false_when_misbehaving()
+        {
+            for (int i = 0; i < 601; i++)
+            {
+                _controller.Report(Flooding);
+            }
+
+            int allowedCount = 0;
+            for (int i = 0; i < 10000; i++)
+            {
+                if (_controller.IsAllowed()) allowedCount++;
+            }
+
+            Assert.That(allowedCount, Is.InRange(500, 1500));
+        }
+
+        [Test]
+        public void Will_only_get_disconnected_when_really_flooding()
+        {
+            for (int i = 0; i < 600; i++)
+            {
+                _controller.Report(Flooding);
+            }
+
+            // for easier debugging
+            _controller.Report(Flooding);
+
+            _session.DidNotReceiveWithAnyArgs()
+                .InitiateDisconnect(DisconnectReason.TxFlooding, null);
+
+            for (int i = 0; i < 6000 - 601; i++)
+            {
+                _controller.Report(Flooding);
+            }
+
+            // for easier debugging
+            _controller.Report(Flooding);
+
+            _session.Received()
+                .InitiateDisconnect(DisconnectReason.TxFlooding, Arg.Any<string>());
+        }
+
+        [Test]
+        public void Will_downgrade_at_first()
+        {
+            for (int i = 0; i < 1000; i++)
+            {
+                _controller.Report(Flooding);
+            }
+
+            Assert.That(_controller.IsDowngraded, Is.True);
+        }
+
+        [Test]
+        public void Enabled_by_default() => Assert.That(_controller.IsEnabled, Is.True);
+
+        [Test]
+        public void Can_be_disabled_and_enabled()
+        {
+            _controller.IsEnabled = false;
+            Assert.That(_controller.IsEnabled, Is.False);
+            _controller.IsEnabled = false;
+            Assert.That(_controller.IsEnabled, Is.False);
+            _controller.IsEnabled = true;
+            Assert.That(_controller.IsEnabled, Is.True);
+            _controller.IsEnabled = true;
+            Assert.That(_controller.IsEnabled, Is.True);
+        }
+
+        [Test]
+        public void Misbehaving_expires()
+        {
+            for (int i = 0; i < 1000; i++)
+            {
+                _controller.Report(Flooding);
+            }
+
+            Assert.That(_controller.IsDowngraded, Is.True);
+            _timestamper.UtcNow.Returns(DateTime.UtcNow.AddSeconds(61));
+            _controller.Report(false);
+            Assert.That(_controller.IsDowngraded, Is.False);
+        }
+
+        [Test]
+        public void Will_disconnect_on_invalid_tx()
+        {
+            _controller.Report(AcceptTxResult.Invalid);
+
+            _session.Received(1)
+                .InitiateDisconnect(DisconnectReason.InvalidTxReceived, "invalid tx");
+        }
+    }
+}

@@ -1,0 +1,70 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
+using Sila.Test.Base;
+using Nethermind.Logging.NLog;
+
+namespace Nethermind.Blockchain.Test.Runner
+{
+    public class BlockchainTestsBugHunter(ITestSourceLoader testsSource) : BlockchainTestBase, IBlockchainTestRunner
+    {
+        private ITestSourceLoader _testsSource = testsSource ?? throw new ArgumentNullException(nameof(testsSource));
+        private ConsoleColor _defaultColor = Console.ForegroundColor;
+
+        public async Task<IEnumerable<SilaTestResult>> RunTestsAsync()
+        {
+            List<SilaTestResult> testResults = [];
+            string directoryName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "FailingTests");
+            IEnumerable<BlockchainTest> tests = _testsSource.LoadTests<BlockchainTest>();
+            foreach (BlockchainTest test in tests)
+            {
+                Console.Write($"{test,-120} ");
+                if (test.LoadFailure is not null)
+                {
+                    WriteRed(test.LoadFailure);
+                    testResults.Add(new SilaTestResult(test.Name, test.LoadFailure));
+                }
+                else
+                {
+                    SilaTestResult result = await RunTest(test);
+                    testResults.Add(result);
+                    if (result.Pass)
+                    {
+                        WriteGreen("PASS");
+                    }
+                    else
+                    {
+                        WriteRed("FAIL");
+                        _ = new NLogManager(string.Concat(test.Category, "_", test.Name, ".txt"), directoryName);
+                        if (!Directory.Exists(directoryName))
+                        {
+                            Directory.CreateDirectory(directoryName);
+                        }
+
+                        await RunTest(test);
+                    }
+                }
+            }
+
+            return testResults;
+        }
+
+        private void WriteRed(string text)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine(text);
+            Console.ForegroundColor = _defaultColor;
+        }
+
+        private void WriteGreen(string text)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine(text);
+            Console.ForegroundColor = _defaultColor;
+        }
+    }
+}

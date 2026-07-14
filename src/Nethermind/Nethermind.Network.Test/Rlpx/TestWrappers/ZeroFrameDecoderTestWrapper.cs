@@ -1,0 +1,51 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using DotNetty.Buffers;
+using DotNetty.Codecs;
+using DotNetty.Transport.Channels;
+using Nethermind.Network.Rlpx;
+using NSubstitute;
+
+namespace Nethermind.Network.Test.Rlpx.TestWrappers
+{
+    internal class ZeroFrameDecoderTestWrapper : ZeroFrameDecoder
+    {
+        private readonly IChannelHandlerContext _context;
+
+        public ZeroFrameDecoderTestWrapper(IFrameCipher frameCipher, FrameMacProcessor frameMacProcessor)
+            : this(frameCipher, frameMacProcessor, ZeroFrameDecoder.DefaultMaxInboundFrameSize)
+        {
+        }
+
+        public ZeroFrameDecoderTestWrapper(IFrameCipher frameCipher, FrameMacProcessor frameMacProcessor, int maxFrameSize) : base(frameCipher, frameMacProcessor, maxFrameSize)
+        {
+            _context = Substitute.For<IChannelHandlerContext>();
+            _context.Allocator.Returns(PooledByteBufferAllocator.Default);
+        }
+
+        public IByteBuffer Decode(IByteBuffer input, bool throwOnCorruptedFrames = true)
+        {
+            List<object> result = [];
+            try
+            {
+                base.Decode(_context, input, result);
+            }
+            catch (CorruptedFrameException)
+            {
+                if (throwOnCorruptedFrames)
+                {
+                    throw;
+                }
+            }
+
+            if (result.Count != 0)
+            {
+                return (IByteBuffer)result[0];
+            }
+
+            return null;
+        }
+    }
+}

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="../tests.props" />
+  
+  <ItemGroup>
+    <ProjectReference Include="..\Sila.Test.Base\Sila.Test.Base.csproj" />
+    <ProjectReference Include="..\Nethermind.Abi\Nethermind.Abi.csproj" />
+    <ProjectReference Include="..\Nethermind.Savm\Nethermind.Savm.csproj" />
+    <EmbeddedResource Include="..\..\tests\ABITests\**\*.*">
+      <Link>%(RecursiveDir)%(FileName)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\tests\LegacyTests\SilaCancun\GeneralStateTests\VMTests\**\*.*">
+      <Link>%(RecursiveDir)%(FileName)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </EmbeddedResource>
+  </ItemGroup>
+</Project>

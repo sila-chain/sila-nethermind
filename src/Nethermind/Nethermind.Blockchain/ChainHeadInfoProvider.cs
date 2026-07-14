@@ -1,0 +1,85 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Runtime.CompilerServices;
+using Nethermind.Core;
+using Nethermind.Core.Specs;
+using Nethermind.Savm;
+using Nethermind.Savm.State;
+using Nethermind.Int256;
+using Nethermind.State;
+using Nethermind.TxPool;
+
+[assembly: InternalsVisibleTo("Nethermind.TxPool.Test")]
+
+namespace Nethermind.Blockchain
+{
+    public class ChainHeadInfoProvider : IChainHeadInfoProvider
+    {
+        private readonly IBlockTree _blockTree;
+        // For testing
+        public bool HasSynced { private get; init; }
+
+        public ChainHeadInfoProvider(IChainHeadSpecProvider specProvider, IBlockTree blockTree, IStateReader stateReader)
+            : this(specProvider, blockTree, new ChainHeadReadOnlyStateProvider(blockTree, stateReader))
+        {
+        }
+
+        public ChainHeadInfoProvider(IChainHeadSpecProvider specProvider, IBlockTree blockTree, IReadOnlyStateProvider stateProvider)
+        {
+            SpecProvider = specProvider;
+            ReadOnlyStateProvider = stateProvider;
+            HeadNumber = blockTree.BestKnownNumber;
+
+            blockTree.BlockAddedToMain += OnHeadChanged;
+            _blockTree = blockTree;
+        }
+
+        public IChainHeadSpecProvider SpecProvider { get; }
+
+        public IReadOnlyStateProvider ReadOnlyStateProvider { get; }
+
+        public ulong HeadNumber { get; private set; }
+
+        public ulong? BlockGasLimit { get; internal set; }
+
+        public UInt256 CurrentBaseFee { get; private set; }
+
+        public UInt256 CurrentFeePerBlobGas { get; internal set; }
+
+        public ProofVersion CurrentProofVersion { get; private set; }
+
+        public bool IsSyncing
+        {
+            get
+            {
+                if (HasSynced)
+                {
+                    return false;
+                }
+
+                (bool isSyncing, _, _) = _blockTree.IsSyncing(maxDistanceForSynced: 16);
+                return isSyncing;
+            }
+        }
+
+        public bool IsProcessingBlock => _blockTree.IsProcessingBlock;
+
+        public event EventHandler<BlockReplacementEventArgs>? HeadChanged;
+
+        private void OnHeadChanged(object? sender, BlockReplacementEventArgs e)
+        {
+            IReleaseSpec spec = SpecProvider.GetSpec(e.Block.Header);
+            HeadNumber = e.Block.Number;
+            BlockGasLimit = e.Block!.GasLimit;
+            CurrentBaseFee = e.Block.Header.BaseFeePerGas;
+            CurrentFeePerBlobGas =
+                BlobGasCalculator.TryCalculateFeePerBlobGas(e.Block.Header, spec.BlobBaseFeeUpdateFraction, out UInt256 currentFeePerBlobGas)
+                    ? currentFeePerBlobGas
+                    : UInt256.Zero;
+            CurrentProofVersion = spec.BlobProofVersion;
+            HeadChanged?.Invoke(sender, e);
+        }
+    }
+}

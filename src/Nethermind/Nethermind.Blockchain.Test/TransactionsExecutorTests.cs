@@ -1,0 +1,484 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Config;
+using Nethermind.Consensus.Comparers;
+using Nethermind.Consensus.Processing;
+using Nethermind.Consensus.Producers;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Savm;
+using Nethermind.Savm.Tracing;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Int256;
+using Nethermind.Logging;
+using Nethermind.Specs;
+using Nethermind.Specs.Forks;
+using Nethermind.Savm.State;
+using Nethermind.TxPool.Comparison;
+using NSubstitute;
+using NUnit.Framework;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using Nethermind.Blockchain.Tracing;
+using Nethermind.State;
+
+namespace Nethermind.Blockchain.Test
+{
+    [Parallelizable(ParallelScope.All)]
+    public class TransactionsExecutorTests
+    {
+        public static IEnumerable ProperTransactionsSelectedTestCases
+        {
+            get
+            {
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase noneTransactionSelectedDueToValue =
+                    TransactionSelectorTests.ProperTransactionsSelectedTestCase.Default;
+                noneTransactionSelectedDueToValue.Transactions.ForEach(t => t.Value = 901);
+                yield return new TestCaseData(noneTransactionSelectedDueToValue).SetName(
+                    "None transactions selected due to value");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase noneTransactionsSelectedDueToGasPrice =
+                    TransactionSelectorTests.ProperTransactionsSelectedTestCase.Default;
+                noneTransactionsSelectedDueToGasPrice.Transactions.ForEach(t => t.GasPrice = 100);
+                yield return new TestCaseData(noneTransactionsSelectedDueToGasPrice).SetName(
+                    "None transactions selected due to transaction gas price and limit");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase oneTransactionSelectedDueToValue =
+                    TransactionSelectorTests.ProperTransactionsSelectedTestCase.Default;
+                oneTransactionSelectedDueToValue.Transactions.ForEach(t => t.Value = 500);
+                oneTransactionSelectedDueToValue.ExpectedSelectedTransactions.AddRange(oneTransactionSelectedDueToValue
+                    .Transactions.OrderBy(t => t.Nonce).Take(1));
+                yield return new TestCaseData(oneTransactionSelectedDueToValue).SetName(
+                    "One transaction selected due to gas limit and value");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase twoTransactionSelectedDueToValue =
+                    TransactionSelectorTests.ProperTransactionsSelectedTestCase.Default;
+                twoTransactionSelectedDueToValue.Transactions.ForEach(t => t.Value = 400);
+                twoTransactionSelectedDueToValue.ExpectedSelectedTransactions.AddRange(twoTransactionSelectedDueToValue
+                    .Transactions.OrderBy(t => t.Nonce).Take(2));
+                yield return new TestCaseData(twoTransactionSelectedDueToValue).SetName(
+                    "Two transaction selected due to gas limit and value");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase twoTransactionSelectedDueToMinGasPriceForMining =
+                    TransactionSelectorTests.ProperTransactionsSelectedTestCase.Default;
+                twoTransactionSelectedDueToMinGasPriceForMining.MinGasPriceForMining = 2;
+                twoTransactionSelectedDueToMinGasPriceForMining.ExpectedSelectedTransactions.AddRange(
+                    twoTransactionSelectedDueToValue.Transactions.OrderBy(t => t.Nonce).Take(2));
+                yield return new TestCaseData(twoTransactionSelectedDueToValue).SetName(
+                    "Two transaction selected due to min gas price for mining");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase twoTransactionSelectedDueToWrongNonce =
+                    TransactionSelectorTests.ProperTransactionsSelectedTestCase.Default;
+                twoTransactionSelectedDueToWrongNonce.Transactions.First().Nonce = 4;
+                twoTransactionSelectedDueToWrongNonce.ExpectedSelectedTransactions.AddRange(
+                    twoTransactionSelectedDueToWrongNonce.Transactions.OrderBy(t => t.Nonce).Take(2));
+                yield return new TestCaseData(twoTransactionSelectedDueToWrongNonce).SetName(
+                    "Two transaction selected due to wrong nonce");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase missingAddressState = TransactionSelectorTests.ProperTransactionsSelectedTestCase.Default;
+                missingAddressState.MissingAddresses.Add(TestItem.AddressA);
+                yield return new TestCaseData(missingAddressState).SetName("Missing address state");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase complexCase = new()
+                {
+                    ReleaseSpec = Berlin.Instance,
+                    AccountStates =
+                    {
+                        {TestItem.AddressA, (1000, 1)},
+                        {TestItem.AddressB, (1000, 0)},
+                        {TestItem.AddressC, (1000, 3)}
+                    },
+                    Transactions =
+                    {
+                        // A
+                        /*0*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(1).WithValue(10)
+                            .WithGasPrice(10).WithGasLimit(10).SignedAndResolved(TestItem.PrivateKeyA).TestObject,
+                        /*1*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(3).WithValue(1)
+                            .WithGasPrice(10).WithGasLimit(10).SignedAndResolved(TestItem.PrivateKeyA).TestObject,
+                        /*2*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(2).WithValue(10)
+                            .WithGasPrice(10).WithGasLimit(10).SignedAndResolved(TestItem.PrivateKeyA).TestObject,
+
+                        //B
+                        /*3*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressB).WithNonce(0).WithValue(1)
+                            .WithGasPrice(10).WithGasLimit(10).SignedAndResolved(TestItem.PrivateKeyB).TestObject,
+                        /*4*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressB).WithNonce(1).WithValue(1)
+                            .WithGasPrice(10).WithGasLimit(9).SignedAndResolved(TestItem.PrivateKeyB).TestObject,
+                        /*5*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressB).WithNonce(3).WithValue(1)
+                            .WithGasPrice(10).WithGasLimit(9).SignedAndResolved(TestItem.PrivateKeyB).TestObject,
+
+                        //C
+                        /*6*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressC).WithNonce(3).WithValue(500)
+                            .WithGasPrice(19).WithGasLimit(9).SignedAndResolved(TestItem.PrivateKeyC).TestObject,
+                        /*7*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressC).WithNonce(3).WithValue(500)
+                            .WithGasPrice(20).WithGasLimit(9).SignedAndResolved(TestItem.PrivateKeyC).TestObject,
+                        /*8*/
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressC).WithNonce(4).WithValue(500)
+                            .WithGasPrice(20).WithGasLimit(9).SignedAndResolved(TestItem.PrivateKeyC).TestObject,
+                    },
+                    GasLimit = 10000000
+                };
+                complexCase.ExpectedSelectedTransactions.AddRange(
+                    new[] { 7, 3, 4, 0, 2, 1 }.Select(i => complexCase.Transactions[i]));
+                yield return new TestCaseData(complexCase).SetName("Complex case");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase baseFeeBalanceCheck = new()
+                {
+                    ReleaseSpec = London.Instance,
+                    BaseFee = 5,
+                    AccountStates = { { TestItem.AddressA, (1000, 1) } },
+                    Transactions =
+                    {
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(3)
+                            .WithGasPrice(60).WithGasLimit(10).SignedAndResolved(TestItem.PrivateKeyA).TestObject,
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(1)
+                            .WithGasPrice(30).WithGasLimit(10).SignedAndResolved(TestItem.PrivateKeyA).TestObject,
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(2)
+                            .WithGasPrice(20).WithGasLimit(10).SignedAndResolved(TestItem.PrivateKeyA).TestObject
+                    },
+                    GasLimit = 10000000
+                };
+                baseFeeBalanceCheck.ExpectedSelectedTransactions.AddRange(
+                    new[] { 1, 2 }.Select(i => baseFeeBalanceCheck.Transactions[i]));
+                yield return new TestCaseData(baseFeeBalanceCheck).SetName("Legacy transactions: two transactions selected because of account balance");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase balanceBelowMaxFeeTimesGasLimit = new()
+                {
+                    ReleaseSpec = London.Instance,
+                    BaseFee = 5,
+                    AccountStates = { { TestItem.AddressA, (400, 1) } },
+                    Transactions =
+                    {
+                        Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(1)
+                            .WithMaxFeePerGas(45).WithMaxPriorityFeePerGas(25).WithGasLimit(10).WithType(TxType.SIP1559).WithValue(60).SignedAndResolved(TestItem.PrivateKeyA).TestObject
+                    },
+                    GasLimit = 10000000
+                };
+                yield return new TestCaseData(balanceBelowMaxFeeTimesGasLimit).SetName("SIP1559 transactions: none transactions selected because balance is lower than MaxFeePerGas times GasLimit");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase balanceFailingWithMaxFeePerGasCheck =
+                    new()
+                    {
+                        ReleaseSpec = London.Instance,
+                        BaseFee = 5,
+                        AccountStates = { { TestItem.AddressA, (400, 1) } },
+                        Transactions =
+                        {
+                            Build.A.Transaction.WithSenderAddress(TestItem.AddressA).WithNonce(1)
+                                .WithMaxFeePerGas(300).WithMaxPriorityFeePerGas(10).WithGasLimit(10)
+                                .WithType(TxType.SIP1559).WithValue(101).SignedAndResolved(TestItem.PrivateKeyA)
+                                .TestObject,
+                        },
+                        GasLimit = 10000000
+                    };
+                yield return new TestCaseData(balanceFailingWithMaxFeePerGasCheck).SetName("SIP1559 transactions: None transactions selected - sender balance and max fee per gas check");
+            }
+        }
+
+
+
+        public static IEnumerable SIP3860TestCases
+        {
+            get
+            {
+                byte[] initCodeBelowTheLimit = Enumerable.Repeat((byte)0x20, (int)SilaShanghai.Instance.MaxInitCodeSize).ToArray();
+                byte[] initCodeAboveTheLimit = Enumerable.Repeat((byte)0x20, (int)SilaShanghai.Instance.MaxInitCodeSize + 1).ToArray();
+                byte[] sigData = new byte[65];
+                sigData[31] = 1; // correct r
+                sigData[63] = 1; // correct s
+                sigData[64] = 27;
+                Signature signature = new(sigData);
+                Transaction txAboveTheLimit = Build.A.Transaction
+                    .WithSignature(signature)
+                    .WithGasLimit(10000000)
+                    .WithMaxFeePerGas(100.GWei)
+                    .WithGasPrice(100.GWei)
+                    .WithNonce(1)
+                    .WithChainId(TestBlockchainIds.ChainId)
+                    .To(null)
+                    .WithData(initCodeAboveTheLimit)
+                    .SignedAndResolved(TestItem.PrivateKeyA).TestObject;
+                Transaction txAboveTheLimitNoContract = Build.A.Transaction
+                    .WithSignature(signature)
+                    .WithGasLimit(10000000)
+                    .WithMaxFeePerGas(100.GWei)
+                    .WithGasPrice(100.GWei)
+                    .WithNonce(1)
+                    .WithChainId(TestBlockchainIds.ChainId)
+                    .To(TestItem.AddressB)
+                    .WithData(initCodeAboveTheLimit)
+                    .SignedAndResolved(TestItem.PrivateKeyA).TestObject;
+                Transaction txBelowTheLimit = Build.A.Transaction
+                    .WithSignature(signature)
+                    .WithGasLimit(10000000)
+                    .WithMaxFeePerGas(100.GWei)
+                    .WithGasPrice(100.GWei)
+                    .WithNonce(2)
+                    .WithChainId(TestBlockchainIds.ChainId)
+                    .To(null)
+                    .WithData(initCodeBelowTheLimit)
+                    .SignedAndResolved(TestItem.PrivateKeyA).TestObject;
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase shanghai3860Scenarios = new()
+                {
+                    ReleaseSpec = SilaShanghai.Instance,
+                    BaseFee = 5,
+                    AccountStates = { { TestItem.AddressA, (30000000.Sila, 1) } },
+                    Transactions = [txAboveTheLimit, txAboveTheLimitNoContract, txBelowTheLimit],
+                    GasLimit = 10000000
+                };
+                shanghai3860Scenarios.ExpectedSelectedTransactions.AddRange(
+                    new[] { 1, 2 }.Select(i => shanghai3860Scenarios.Transactions[i]));
+                yield return new TestCaseData(shanghai3860Scenarios).SetName("SIP3860 enabled scenarios");
+
+                TransactionSelectorTests.ProperTransactionsSelectedTestCase london3860Scenarios = new()
+                {
+                    ReleaseSpec = London.Instance,
+                    BaseFee = 5,
+                    AccountStates = { { TestItem.AddressA, (30000000.Sila, 1) } },
+                    Transactions = [txAboveTheLimit],
+                    GasLimit = 10000000
+                };
+                london3860Scenarios.ExpectedSelectedTransactions.AddRange(
+                    new[] { 0 }.Select(i => london3860Scenarios.Transactions[i]));
+                yield return new TestCaseData(london3860Scenarios).SetName("SIP3860 disabled scenarios");
+            }
+        }
+
+        [TestCaseSource(nameof(ProperTransactionsSelectedTestCases))]
+        [TestCaseSource(nameof(SIP3860TestCases))]
+        public void Proper_transactions_selected(TransactionSelectorTests.ProperTransactionsSelectedTestCase testCase)
+        {
+            IWorldState stateProvider = TestWorldStateFactory.CreateForTest();
+            using IDisposable _ = stateProvider.BeginScope(IWorldState.PreGenesis);
+            ISpecProvider specProvider = Substitute.For<ISpecProvider>();
+
+            IReleaseSpec spec = testCase.ReleaseSpec;
+            specProvider.GetSpec(Arg.Any<ForkActivation>()).Returns(spec);
+
+            ITransactionProcessor transactionProcessor = Substitute.For<ITransactionProcessor>();
+            transactionProcessor.When(t => t.BuildUp(Arg.Any<Transaction>(), Arg.Any<ITxTracer>()))
+                .Do(info =>
+                {
+                    Transaction tx = info.Arg<Transaction>();
+                    stateProvider.IncrementNonce(tx.SenderAddress!);
+                    stateProvider.SubtractFromBalance(tx.SenderAddress!,
+                        tx.Value + ((UInt256)tx.GasLimit * tx.GasPrice), spec);
+                });
+
+            IBlockTree blockTree = Substitute.For<IBlockTree>();
+
+            TransactionComparerProvider transactionComparerProvider = new(specProvider, blockTree);
+            IComparer<Transaction> defaultComparer = transactionComparerProvider.GetDefaultComparer();
+            IComparer<Transaction> comparer = CompareTxByNonce.Instance.ThenBy(defaultComparer);
+            Transaction[] txArray = testCase.Transactions.Where(t => t?.SenderAddress is not null).OrderBy(t => t, comparer).ToArray();
+
+            Block block = Build.A.Block
+                .WithNumber(0)
+                .WithBaseFeePerGas(testCase.BaseFee)
+                .WithGasLimit(testCase.GasLimit)
+                .WithTransactions(txArray)
+                .TestObject;
+            BlockToProduce blockToProduce = new(block.Header, block.Transactions, block.Uncles);
+            blockTree.Head.Returns(blockToProduce);
+
+            void SetAccountStates(IEnumerable<Address> missingAddresses)
+            {
+                HashSet<Address> missingAddressesSet = missingAddresses.ToHashSet();
+
+                foreach (KeyValuePair<Address, (UInt256 Balance, ulong Nonce)> accountState in testCase.AccountStates
+                    .Where(v => !missingAddressesSet.Contains(v.Key)))
+                {
+                    stateProvider.CreateAccount(accountState.Key, accountState.Value.Balance);
+                    for (ulong i = 0; i < accountState.Value.Nonce; i++)
+                    {
+                        stateProvider.IncrementNonce(accountState.Key);
+                    }
+                }
+
+                stateProvider.Commit(Homestead.Instance);
+                stateProvider.CommitTree(0);
+            }
+
+            SetAccountStates(testCase.MissingAddresses);
+
+            Transaction[] selectedTransactions = RunBlockProduction(
+                new BuildUpTransactionProcessorAdapter(transactionProcessor),
+                stateProvider,
+                specProvider,
+                blockToProduce,
+                spec);
+            Assert.That(
+                selectedTransactions.Select(static transaction => transaction.Hash),
+                Is.EquivalentTo(testCase.ExpectedSelectedTransactions.Select(static transaction => transaction.Hash)));
+        }
+
+        [Test]
+        public void BlockProductionTransactionsExecutor_calculates_block_size_using_proper_tx_form()
+        {
+            Transaction transactionInMempoolForm = Build.A.Transaction
+                .WithShardBlobTxTypeAndFields(1, true, SilaOsaka.Instance)
+                .SignedAndResolved()
+                .TestObject;
+
+            int payloadLength = TxPool.TransactionExtensions.GetLength(transactionInMempoolForm, false);
+            int mempoolLength = TxPool.TransactionExtensions.GetLength(transactionInMempoolForm, true);
+
+            Block block = Build.A.Block
+                .WithExcessBlobGas(0)
+                .WithGasLimit(GasCostOf.Transaction)
+                .WithTransactions([transactionInMempoolForm])
+                .TestObject;
+
+            BlockToProduce blockToProduce = new(block.Header, block.Transactions, block.Uncles);
+
+            ITransactionProcessorAdapter transactionProcessor = Substitute.For<ITransactionProcessorAdapter>();
+
+            IWorldState stateProvider = new WorldStateStab();
+            using IDisposable _ = stateProvider.BeginScope(IWorldState.PreGenesis);
+
+            IReleaseSpec spec = SilaOsaka.Instance;
+            ISpecProvider specProvider = new TestSingleReleaseSpecProvider(spec);
+
+            BlockProcessor.BlockProductionTransactionPicker txPicker = new(specProvider, mempoolLength / 1.KiB - 1);
+            BlockProcessor.BlockProductionTransactionsExecutor txExecutor = new(transactionProcessor, stateProvider, txPicker, LimboLogs.Instance, NullBlockAccessListManager.Instance);
+
+            txExecutor.SetBlockExecutionContext(new BlockExecutionContext(block.Header, spec));
+            txExecutor.ProcessTransactions(blockToProduce, ProcessingOptions.ProducingBlock, new());
+
+            Assert.That(blockToProduce.TxByteLength, Is.EqualTo(payloadLength));
+        }
+
+        [Test]
+        public void BlockProductionTransactionsExecutor_tx_picker_uses_state_changes_from_previous_transactions()
+        {
+            IWorldState stateProvider = TestWorldStateFactory.CreateForTest();
+
+            using IDisposable scope = stateProvider.BeginScope(IWorldState.PreGenesis);
+            stateProvider.CreateAccount(TestItem.AddressA, 1.Sila);
+
+            Transaction firstTx = Build.A.Transaction
+                .WithSenderAddress(TestItem.AddressA)
+                .WithNonce(0)
+                .WithGasPrice(1)
+                .WithGasLimit(GasCostOf.Transaction)
+                .SignedAndResolved(TestItem.PrivateKeyA)
+                .TestObject;
+
+            Transaction secondTx = Build.A.Transaction
+                .WithSenderAddress(TestItem.AddressA)
+                .WithNonce(1)
+                .WithGasPrice(1)
+                .WithGasLimit(GasCostOf.Transaction)
+                .SignedAndResolved(TestItem.PrivateKeyA)
+                .TestObject;
+
+            Block block = Build.A.Block
+                .WithGasLimit(GasCostOf.Transaction * 2)
+                .WithTransactions([firstTx, secondTx])
+                .TestObject;
+
+            ITransactionProcessor transactionProcessor = Substitute.For<ITransactionProcessor>();
+            IReleaseSpec spec = Homestead.Instance;
+            transactionProcessor.When(t => t.BuildUp(Arg.Any<Transaction>(), Arg.Any<ITxTracer>()))
+                .Do(info =>
+                {
+                    Transaction tx = info.Arg<Transaction>();
+                    stateProvider.IncrementNonce(tx.SenderAddress!);
+                    stateProvider.SubtractFromBalance(tx.SenderAddress!, tx.Value + ((UInt256)tx.GasLimit * tx.GasPrice), spec);
+                });
+
+            Transaction[] selectedTransactions = RunBlockProduction(
+                new BuildUpTransactionProcessorAdapter(transactionProcessor),
+                stateProvider,
+                block,
+                spec);
+            Assert.That(selectedTransactions, Has.Length.EqualTo(2));
+            Assert.That(selectedTransactions[0], Is.SameAs(firstTx));
+            Assert.That(selectedTransactions[1], Is.SameAs(secondTx));
+        }
+
+        private static Transaction[] RunBlockProduction(
+            ITransactionProcessorAdapter transactionProcessor,
+            IWorldState stateProvider,
+            ISpecProvider specProvider,
+            BlockToProduce blockToProduce,
+            IReleaseSpec spec)
+        {
+            BlockProcessor.BlockProductionTransactionsExecutor txExecutor = new(
+                transactionProcessor,
+                stateProvider,
+                new BlockProcessor.BlockProductionTransactionPicker(specProvider, BlocksConfig.DefaultMaxTxKilobytes),
+                LimboLogs.Instance,
+                NullBlockAccessListManager.Instance);
+
+            BlockReceiptsTracer receiptsTracer = new();
+            receiptsTracer.StartNewBlockTrace(blockToProduce);
+            txExecutor.SetBlockExecutionContext(new BlockExecutionContext(blockToProduce.Header, spec));
+            txExecutor.ProcessTransactions(blockToProduce, ProcessingOptions.ProducingBlock, receiptsTracer);
+
+            return blockToProduce.Transactions.ToArray();
+        }
+
+        private static Transaction[] RunBlockProduction(
+            ITransactionProcessorAdapter transactionProcessor,
+            IWorldState stateProvider,
+            Block block,
+            IReleaseSpec spec)
+        {
+            BlockToProduce blockToProduce = new(block.Header, block.Transactions, block.Uncles);
+            return RunBlockProduction(transactionProcessor, stateProvider, new TestSingleReleaseSpecProvider(spec), blockToProduce, spec);
+        }
+    }
+
+    public class WorldStateStab()
+        : WorldState(Substitute.For<IWorldStateScopeProvider>(), LimboLogs.Instance), IWorldState
+    {
+        public new UInt256 GetBalance(Address address) => UInt256.MaxValue;
+
+        public static IReadOnlyStateProvider GetUntrackedReader() => TestReadOnlyStateProvider.Instance;
+
+        public new bool TryGetAccount(Address address, out AccountStruct account)
+        {
+            account = new(0ul, ulong.MaxValue);
+            return true;
+        }
+
+        private sealed class TestReadOnlyStateProvider : IReadOnlyStateProvider
+        {
+            public static TestReadOnlyStateProvider Instance { get; } = new();
+
+            public Hash256 StateRoot => Keccak.EmptyTreeHash;
+
+            public bool TryGetAccount(Address address, out AccountStruct account)
+            {
+                account = new(0ul, ulong.MaxValue);
+                return true;
+            }
+
+            public byte[] GetCode(Address address) => [];
+
+            public byte[] GetCode(in ValueHash256 codeHash) => [];
+
+            public bool IsContract(Address address) => false;
+
+            public bool AccountExists(Address address) => true;
+
+            public bool IsDeadAccount(Address address) => false;
+        }
+    }
+}

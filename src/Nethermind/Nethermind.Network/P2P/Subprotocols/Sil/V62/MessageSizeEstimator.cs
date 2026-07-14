@@ -1,0 +1,73 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Serialization.Rlp;
+
+namespace Nethermind.Network.P2P.Subprotocols.Sil.V62
+{
+    public static class MessageSizeEstimator
+    {
+        public static ulong EstimateSize(BlockHeader blockHeader)
+        {
+            if (blockHeader is null)
+            {
+                return 0;
+            }
+
+            return 512; // rough knowledge about the size of a header
+        }
+
+        public static ulong EstimateSize(Transaction tx)
+        {
+            if (tx is null)
+            {
+                return 0;
+            }
+
+            // Exact encoded length so access/authorization lists aren't under-counted.
+            return (ulong)TxDecoder.Instance.GetLength(tx, RlpBehaviors.None);
+        }
+
+        public static ulong EstimateSize(Block? block)
+        {
+            if (block is null)
+            {
+                return 0;
+            }
+
+            ulong estimate = EstimateSize(block.Header);
+            Transaction[] transactions = block.Transactions;
+            for (int i = 0; i < transactions.Length; i++)
+            {
+                estimate += EstimateSize(transactions[i]);
+            }
+
+            return estimate;
+        }
+
+        public static ulong EstimateSize(TxReceipt receipt)
+        {
+            ulong estimate = Bloom.ByteLength; // receipt is mostly Bloom + Logs
+            for (int i = 0; i < receipt.Logs.Length; i++)
+            {
+                estimate += (ulong)receipt.Logs[i].Data.Length + (ulong)receipt.Logs[i].Topics.Length * Hash256.Size;
+            }
+
+            return estimate;
+        }
+
+        public static ulong EstimateSize(TxReceipt[] receipts)
+        {
+            ulong estimate = 0;
+
+            for (int i = 0; i < receipts.Length; i++)
+            {
+                estimate += EstimateSize(receipts[i]);
+            }
+
+            return estimate;
+        }
+    }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindSil/core-scripts/refs/heads/main/schemas/config.json",
+  "Init": {
+    "ChainSpecPath": "chainspec/cyber-sila-mainnet.json.zst",
+    "GenesisHash": "0x0bbf36c47db3b42b40b2e6cadc183612337d1ac8602eb9e57071ae0043e70fc7",
+    "BaseDbPath": "nethermind_db/cyber-sila-mainnet",
+    "LogFileName": "cyber-sila-mainnet.log"
+  },
+  "TxPool": {
+    "BlobsSupport": "Disabled"
+  },
+  "Sync": {
+    "FastSync": true,
+    "SnapSync": true
+  },
+  "Discovery": {
+    "DiscoveryVersion": "V5"
+  },
+  "JsonRpc": {
+    "Enabled": true,
+    "Port": 8545,
+    "EnginePort": 8551
+  },
+  "Pruning": {
+    "PruningBoundary": 256
+  },
+  "Blocks": {
+    "SecondsPerSlot": 2
+  },
+  "Merge": {
+    "Enabled": true
+  },
+  "Optimism": {
+    "SequencerUrl": "https://cyber.alt.technology/"
+  }
+}

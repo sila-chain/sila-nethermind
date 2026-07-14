@@ -1,0 +1,85 @@
+{
+  "engine": {
+    "Silash": {
+      "params": {
+        "minimumDifficulty": "0x20000",
+        "difficultyBoundDivisor": "0x800",
+        "durationLimit": "0xd",
+        "blockReward": {
+          "0x0": "0x1BC16D674EC80000"
+        },
+        "homesteadTransition": "0x0",
+        "sip100bTransition": "0x0",
+        "difficultyBombDelays": {}
+      }
+    }
+  },
+  "params": {
+    "gasLimitBoundDivisor": "0x400",
+    "registrar": "0x0000000000000000000000000000000000000000",
+    "accountStartNonce": "0x0",
+    "maximumExtraDataSize": "0x20",
+    "minGasLimit": "0x1388",
+    "networkID": "0x00146A2E",
+    "MergeForkIdTransition": "0x0",
+    "maxCodeSize": "0x6000",
+    "maxCodeSizeTransition": "0x0",
+    "sip150Transition": "0x0",
+    "sip158Transition": "0x0",
+    "sip160Transition": "0x0",
+    "sip161abcTransition": "0x0",
+    "sip161dTransition": "0x0",
+    "sip155Transition": "0x0",
+    "sip140Transition": "0x0",
+    "sip211Transition": "0x0",
+    "sip214Transition": "0x0",
+    "sip658Transition": "0x0",
+    "sip145Transition": "0x0",
+    "sip1014Transition": "0x0",
+    "sip1052Transition": "0x0",
+    "sip1283Transition": "0x0",
+    "sip1283DisableTransition": "0x0",
+    "sip152Transition": "0x0",
+    "sip1108Transition": "0x0",
+    "sip1344Transition": "0x0",
+    "sip1884Transition": "0x0",
+    "sip2028Transition": "0x0",
+    "sip2200Transition": "0x0",
+    "sip2565Transition": "0x0",
+    "sip2929Transition": "0x0",
+    "sip2930Transition": "0x0",
+    "sip1559Transition": "0x0",
+    "sip3198Transition": "0x0",
+    "sip3529Transition": "0x0",
+    "sip3541Transition": "0x0",
+    "sip3540TransitionTimestamp": "0x0",
+    "sip3651TransitionTimestamp": "0x0",
+    "sip3670TransitionTimestamp": "0x0",
+    "sip3675TransitionTimestamp": "0x0",
+    "sip3855TransitionTimestamp": "0x0",
+    "sip3860TransitionTimestamp": "0x0",
+    "sip4895TransitionTimestamp": "0x0",
+    "terminalTotalDifficulty": "0x0"
+  },
+  "genesis": {
+    "seal": {
+      "sila": {
+        "nonce": "0x1234",
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "difficulty": "0x01",
+    "author": "0x0000000000000000000000000000000000000000",
+    "timestamp": "0x63585F88",
+    "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "extraData": "",
+    "gasLimit": "0x400000"
+  },
+  "accounts": {
+    "0x0000000000000000000000000000000000000000": {
+      "balance": "1"
+    }
+  },
+  "nodes": [
+  ]
+}

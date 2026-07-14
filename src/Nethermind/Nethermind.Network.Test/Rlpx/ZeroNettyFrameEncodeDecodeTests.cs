@@ -1,0 +1,125 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Threading.Tasks;
+using DotNetty.Buffers;
+using DotNetty.Common;
+using DotNetty.Transport.Channels;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Logging;
+using Nethermind.Network.Rlpx;
+using Nethermind.Serialization.Rlp;
+using NSubstitute;
+using NUnit.Framework;
+
+namespace Nethermind.Network.Test.Rlpx;
+
+public class ZeroNettyFrameEncodeDecodeTests
+{
+    private const int TestLength = 10000;
+
+    [Test]
+    public async Task TwoWayConcurrentEncodeDecodeTests()
+    {
+        (EncryptionSecrets A, EncryptionSecrets B) = NetTestVectors.GetSecretsPair();
+
+        FrameCipher frameCipher = new(B.AesSecret);
+        FrameMacProcessor macProcessor = new(TestItem.IgnoredPublicKey, B);
+
+        FrameCipher frameCipher2 = new(A.AesSecret);
+        FrameMacProcessor macProcessor2 = new(TestItem.IgnoredPublicKey, A);
+
+        Task t1 = Task.Factory.StartNew(() => RunStreamTests(frameCipher, macProcessor, frameCipher2, macProcessor2), TaskCreationOptions.LongRunning);
+        Task t2 = Task.Factory.StartNew(() => RunStreamTests(frameCipher2, macProcessor2, frameCipher, macProcessor), TaskCreationOptions.LongRunning);
+
+        await t1;
+        await t2;
+    }
+
+    private async Task RunStreamTests(FrameCipher frameCipher, FrameMacProcessor macProcessor, FrameCipher frameCipher2, FrameMacProcessor macProcessor2)
+    {
+        ZeroPacketSplitter splitter = new();
+        ZeroFrameEncoder encoder = new(frameCipher, macProcessor);
+
+        ZeroFrameDecoder decoder = new(frameCipher2, macProcessor2);
+        ZeroFrameMerger frameMerger = new(LimboLogs.Instance);
+
+        IByteBuffer reDecoded = null;
+
+        IChannelHandlerContext recordWrite = Substitute.For<IChannelHandlerContext>();
+        recordWrite.When((it) => it.FireChannelRead(Arg.Any<object>()))
+            .Do((info =>
+            {
+                ZeroPacket packet = (ZeroPacket)info[0];
+                RlpReader ctx = new(packet.Content.AsSpan());
+                byte[] bytes = ctx.DecodeByteArray();
+                reDecoded.WriteBytes(bytes);
+            }));
+
+        IChannelHandlerContext mergerWrite = PipeReadToChannel(frameMerger, recordWrite);
+        IChannelHandlerContext decoderWrite = PipeWriteToChannelRead(decoder, mergerWrite);
+        IChannelHandlerContext encoderWrite = PipeWriteToChannel(encoder, decoderWrite);
+
+        for (int i = 0; i < TestLength; i++)
+        {
+            int size = 1 + Random.Shared.Next() % 1024;
+            reDecoded = Unpooled.Buffer(size);
+            byte[] input = new byte[size];
+            Random.Shared.NextBytes(input);
+
+            byte[] encByte = Rlp.Encode(input).Bytes;
+            using DisposableByteBuffer buffer = Unpooled.Buffer(encByte.Length + 1).AsDisposable();
+            buffer.WriteByte(0);
+            buffer.WriteBytes(encByte);
+            await splitter.WriteAsync(encoderWrite, buffer);
+
+            Assert.That(reDecoded.Array, Is.EqualTo(input));
+        }
+    }
+
+    private IChannelHandlerContext PipeWriteToChannel(IChannelHandler channelHandler, IChannelHandlerContext nextContext)
+    {
+        IChannelHandlerContext pipeWrite = Substitute.For<IChannelHandlerContext>();
+        pipeWrite.When((it) => it.WriteAsync(Arg.Any<object>()))
+            .Do((info =>
+            {
+                if (info[0] is IReferenceCounted refCount)
+                {
+                    refCount.Retain();
+                }
+                channelHandler.WriteAsync(nextContext, info[0]).Wait();
+            }));
+        pipeWrite.Allocator.Returns(UnpooledByteBufferAllocator.Default);
+        return pipeWrite;
+    }
+
+    private IChannelHandlerContext PipeWriteToChannelRead(IChannelHandler channelHandler, IChannelHandlerContext nextContext)
+    {
+        IChannelHandlerContext pipeWrite = Substitute.For<IChannelHandlerContext>();
+        pipeWrite.When((it) => it.WriteAsync(Arg.Any<object>()))
+            .Do((info =>
+            {
+                if (info[0] is IReferenceCounted refCount)
+                {
+                    refCount.Retain();
+                }
+                channelHandler.ChannelRead(nextContext, info[0]);
+            }));
+        pipeWrite.Allocator.Returns(UnpooledByteBufferAllocator.Default);
+        return pipeWrite;
+    }
+
+    private IChannelHandlerContext PipeReadToChannel(IChannelHandler channelHandler, IChannelHandlerContext nextContext)
+    {
+        IChannelHandlerContext pipeWrite = Substitute.For<IChannelHandlerContext>();
+        pipeWrite.When((it) => it.FireChannelRead(Arg.Any<object>()))
+            .Do((info =>
+            {
+                channelHandler.ChannelRead(nextContext, info[0]);
+            }));
+        pipeWrite.Allocator.Returns(UnpooledByteBufferAllocator.Default);
+        return pipeWrite;
+    }
+
+}

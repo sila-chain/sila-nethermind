@@ -1,0 +1,34 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using Nethermind.Abi;
+using Nethermind.Blockchain.Contracts;
+using Nethermind.Core;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Int256;
+
+namespace Nethermind.Merge.AuRa.Contracts;
+
+/// <summary>
+/// Represents the smart contract for withdrawals as defined in the
+/// <see href="https://github.com/gnosischain/specs/blob/master/execution/withdrawals.md#specification">specification</see>
+/// of the Gnosis Chain withdrawals.
+/// </summary>
+public class WithdrawalContract(
+    ITransactionProcessor transactionProcessor,
+    IAbiEncoder abiEncoder,
+    Address contractAddress) : CallableContract(transactionProcessor, abiEncoder, contractAddress), IWithdrawalContract
+{
+    private const ulong GasLimit = SystemTransactionGasLimit;
+
+    public void ExecuteWithdrawals(BlockHeader blockHeader, UInt256 failedMaxCount, IList<ulong> amounts, IList<Address> addresses)
+    {
+        ArgumentNullException.ThrowIfNull(blockHeader);
+        ArgumentNullException.ThrowIfNull(amounts);
+        ArgumentNullException.ThrowIfNull(addresses);
+
+        Call(blockHeader, "executeSystemWithdrawals", Address.SystemUser, GasLimit, failedMaxCount, amounts, addresses);
+    }
+}

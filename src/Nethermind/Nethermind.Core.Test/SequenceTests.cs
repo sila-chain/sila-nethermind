@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Buffers;
+using Nethermind.Core.Extensions;
+using NUnit.Framework;
+
+namespace Nethermind.Core.Test;
+
+public class SequenceTests
+{
+    [Test]
+    public void Sequence_whitespace_slice()
+    {
+        TestReadOnlySequenceSegment end = new("\r\nabc"u8.ToArray(), 2);
+        TestReadOnlySequenceSegment start = new("  "u8.ToArray(), 0, end);
+        ReadOnlySequence<byte> sequence = new(start, 0, end, 5);
+
+        Assert.That(sequence.TrimStart().ToArray(), Is.EqualTo("abc"u8.ToArray()));
+    }
+
+    private class TestReadOnlySequenceSegment : ReadOnlySequenceSegment<byte>
+    {
+        public TestReadOnlySequenceSegment(Memory<byte> memory, long runningIndex = 0, ReadOnlySequenceSegment<byte>? next = null)
+        {
+            Memory = memory;
+            Next = next;
+            RunningIndex = runningIndex;
+        }
+    }
+}

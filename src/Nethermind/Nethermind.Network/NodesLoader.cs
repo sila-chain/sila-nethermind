@@ -1,0 +1,126 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using Autofac.Features.AttributeFilters;
+using Nethermind.Config;
+using Nethermind.Db;
+using Nethermind.Logging;
+using Nethermind.Network.Config;
+using Nethermind.Stats;
+using Nethermind.Stats.Model;
+
+namespace Nethermind.Network
+{
+    /// <summary>
+    /// This class should be split into multiple sources
+    /// </summary>
+    public sealed record NodesLoaderOptions(bool LoadBootnodesAsPeerCandidates = true);
+
+    public class NodesLoader(
+        INetworkConfig networkConfig,
+        INodeStatsManager stats,
+        [KeyFilter(DbNames.PeersDb)] INetworkStorage peerStorage,
+        IEnode enode,
+        ILogManager logManager,
+        NodesLoaderOptions options) : INodeSource
+    {
+        private readonly INetworkConfig _networkConfig = networkConfig ?? throw new ArgumentNullException(nameof(networkConfig));
+        private readonly INodeStatsManager _stats = stats ?? throw new ArgumentNullException(nameof(stats));
+        private readonly INetworkStorage _peerStorage = peerStorage ?? throw new ArgumentNullException(nameof(peerStorage));
+        private readonly IEnode _enode = enode ?? throw new ArgumentNullException(nameof(enode));
+        private readonly ILogger _logger = logManager?.GetClassLogger<NodesLoader>() ?? throw new ArgumentNullException(nameof(logManager));
+        private readonly NodesLoaderOptions _options = options ?? throw new ArgumentNullException(nameof(options));
+
+        public IAsyncEnumerable<Node> DiscoverNodes(CancellationToken cancellationToken)
+        {
+            List<Node> allPeers = [];
+            LoadPeersFromDb(allPeers);
+
+            if (!_networkConfig.OnlyStaticPeers && _options.LoadBootnodesAsPeerCandidates)
+            {
+                LoadConfigPeers(allPeers, _networkConfig.Bootnodes, n =>
+                {
+                    n.IsBootnode = true;
+                    if (_logger.IsDebug) _logger.Debug($"Bootnode     : {n}");
+                });
+            }
+
+            LoadConfigPeers(allPeers, _networkConfig.StaticPeers, n =>
+            {
+                n.IsStatic = true;
+                if (_logger.IsInfo) _logger.Info($"Static node  : {n}");
+            });
+
+            IEnumerable<Node> combined = allPeers
+                .Where(p => p.Id != _enode.PublicKey)
+                .Where(p => !_networkConfig.OnlyStaticPeers || p.IsStatic);
+
+            return combined.ToAsyncEnumerable();
+        }
+
+        private void LoadPeersFromDb(List<Node> peers)
+        {
+            if (!_networkConfig.IsPeersPersistenceOn)
+            {
+                return;
+            }
+
+            NetworkNode[] networkNodes = _peerStorage.GetPersistedNodes();
+
+            if (_logger.IsDebug) _logger.Debug($"Initializing persisted peers: {networkNodes.Length}.");
+
+            foreach (NetworkNode networkNode in networkNodes)
+            {
+                Node node;
+                try
+                {
+                    node = new Node(networkNode);
+                }
+                catch (Exception)
+                {
+                    _logger.DebugError($"peer could not be loaded for {networkNode.NodeId}@{networkNode.Host}:{networkNode.Port}");
+                    continue;
+                }
+
+                INodeStats nodeStats = _stats.GetOrAdd(node);
+                nodeStats.CurrentPersistedNodeReputation = networkNode.Reputation;
+
+                peers.Add(node);
+
+                if (_logger.IsTrace) _logger.Trace($"Adding a new peer candidate {node}");
+            }
+        }
+
+        private void LoadConfigPeers(List<Node> peers, string? enodesString, Action<Node> nodeUpdate)
+        {
+            if (enodesString is null || enodesString.Length == 0)
+            {
+                return;
+            }
+
+            LoadConfigPeers(peers, NetworkNode.ParseNodes(enodesString, _logger), nodeUpdate);
+        }
+
+        private static void LoadConfigPeers(List<Node> peers, IEnumerable<NetworkNode> networkNodes, Action<Node> nodeUpdate)
+        {
+            foreach (NetworkNode networkNode in networkNodes)
+            {
+                if (!networkNode.IsEnode)
+                {
+                    continue;
+                }
+
+                Node node = new(networkNode);
+                nodeUpdate.Invoke(node);
+                peers.Add(node);
+            }
+        }
+
+
+        public event EventHandler<NodeEventArgs>? NodeRemoved { add { } remove { } }
+    }
+}

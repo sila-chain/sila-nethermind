@@ -1,0 +1,47 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+using Nethermind.Core.Specs;
+using Nethermind.Specs;
+using Nethermind.Savm.Precompiles;
+using NUnit.Framework;
+
+namespace Nethermind.Savm.Test;
+
+public class Sip152Tests : VirtualMachineTestsBase
+{
+    private const int InputLength = 213;
+
+    protected override ulong BlockNumber => AdjustBlockNumber(MainnetSpecProvider.IstanbulBlockNumber, _blockNumberAdjustment);
+
+    private long _blockNumberAdjustment;
+
+    [TearDown]
+    public override void TearDown()
+    {
+        base.TearDown();
+
+        _blockNumberAdjustment = 0;
+    }
+
+    [Test]
+    public void before_istanbul()
+    {
+        _blockNumberAdjustment = -1;
+        Address precompileAddress = Blake2FPrecompile.Address;
+        Assert.That(Spec.IsPrecompile(precompileAddress), Is.False);
+    }
+
+    [Test]
+    public void after_istanbul()
+    {
+        byte[] code = Prepare.SavmCode
+            .CallWithInput(Blake2FPrecompile.Address, 1000L, new byte[InputLength])
+            .Done;
+
+        TestAllTracerWithOutput result = Execute(code);
+
+        Assert.That(result.StatusCode, Is.EqualTo(StatusCode.Success));
+    }
+}

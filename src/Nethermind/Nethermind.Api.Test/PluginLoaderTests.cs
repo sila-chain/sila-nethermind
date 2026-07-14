@@ -1,0 +1,195 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.IO.Abstractions;
+using System.Threading.Tasks;
+using Nethermind.Api.Extensions;
+using Nethermind.Config;
+using Nethermind.Consensus.AuRa;
+using Nethermind.Consensus.Clique;
+using Nethermind.Consensus.Silash;
+using Nethermind.Core;
+using Nethermind.HealthChecks;
+using Nethermind.Hive;
+using Nethermind.Logging;
+using Nethermind.Merge.Plugin;
+using Nethermind.Specs.ChainSpecStyle;
+using NSubstitute;
+using NUnit.Framework;
+
+namespace Nethermind.Api.Test;
+
+public class PluginLoaderTests
+{
+    [Test]
+    public void full_lexicographical_order()
+    {
+        IFileSystem fileSystem = Substitute.For<IFileSystem>();
+        IPluginLoader loader = new PluginLoader(string.Empty, fileSystem, new TestLogManager().GetClassLogger<PluginLoaderTests>(),
+            typeof(AuRaPlugin),
+            typeof(CliquePlugin),
+            typeof(SilashPlugin),
+            typeof(NethDevPlugin),
+            typeof(HivePlugin),
+            typeof(TestPlugin));
+        loader.Load();
+        loader.OrderPlugins(new PluginConfig { PluginOrder = [] });
+        List<Type> expected =
+        [
+            typeof(AuRaPlugin),
+            typeof(CliquePlugin),
+            typeof(SilashPlugin),
+            typeof(HivePlugin),
+            typeof(NethDevPlugin),
+            typeof(TestPlugin)
+        ];
+        Assert.That(expected, Is.EqualTo(loader.PluginTypes).AsCollection);
+    }
+
+    [Test]
+    public void full_order()
+    {
+        IFileSystem fileSystem = Substitute.For<IFileSystem>();
+        IPluginLoader loader = new PluginLoader(string.Empty, fileSystem, new TestLogManager().GetClassLogger<PluginLoaderTests>(),
+            typeof(AuRaPlugin),
+            typeof(CliquePlugin),
+            typeof(SilashPlugin),
+            typeof(NethDevPlugin),
+            typeof(HivePlugin),
+            typeof(TestPlugin));
+        loader.Load();
+        IPluginConfig pluginConfig =
+            new PluginConfig { PluginOrder = ["Hive", "Test", "NethDev", "Silash", "Clique", "Aura"] };
+        loader.OrderPlugins(pluginConfig);
+
+        List<Type> expected =
+        [
+            typeof(HivePlugin),
+            typeof(TestPlugin),
+            typeof(NethDevPlugin),
+            typeof(SilashPlugin),
+            typeof(CliquePlugin),
+            typeof(AuRaPlugin),
+        ];
+        Assert.That(expected, Is.EqualTo(loader.PluginTypes).AsCollection);
+    }
+
+    [Test]
+    public void throws_when_multiple_consensus_plugin()
+    {
+        IFileSystem fileSystem = Substitute.For<IFileSystem>();
+        PluginLoader loader = new(
+            string.Empty,
+            fileSystem,
+            new TestLogManager().GetClassLogger<PluginLoaderTests>(),
+            typeof(AuRaPlugin),
+            typeof(AnotherAura),
+            typeof(CliquePlugin),
+            typeof(SilashPlugin),
+            typeof(NethDevPlugin),
+            typeof(HivePlugin),
+            typeof(TestPlugin));
+        loader.Load();
+        loader.OrderPlugins(new PluginConfig { PluginOrder = [] });
+
+        IConfigProvider configProvider = new ConfigProvider();
+        ChainSpec chainSpec = new();
+        chainSpec.SealEngineType = SealEngineType.AuRa;
+
+        Assert.That(async () => await loader.LoadPlugins(configProvider, chainSpec), Throws.TypeOf<InvalidOperationException>());
+    }
+
+    [Test]
+    public void partial_lexicographical_order()
+    {
+        IFileSystem fileSystem = Substitute.For<IFileSystem>();
+        IPluginLoader loader = new PluginLoader(string.Empty, fileSystem, new TestLogManager().GetClassLogger<PluginLoaderTests>(),
+            typeof(AuRaPlugin), typeof(CliquePlugin), typeof(SilashPlugin), typeof(NethDevPlugin), typeof(HivePlugin), typeof(TestPlugin));
+        loader.Load();
+        IPluginConfig pluginConfig =
+            new PluginConfig() { PluginOrder = ["Hive", "NethDev", "Silash"] };
+        loader.OrderPlugins(pluginConfig);
+
+        List<Type> expected =
+        [
+            typeof(HivePlugin),
+            typeof(NethDevPlugin),
+            typeof(SilashPlugin),
+            typeof(AuRaPlugin),
+            typeof(CliquePlugin),
+            typeof(TestPlugin)
+        ];
+        Assert.That(expected, Is.EqualTo(loader.PluginTypes).AsCollection);
+    }
+
+    [Test]
+    public void default_config()
+    {
+        IFileSystem fileSystem = Substitute.For<IFileSystem>();
+        IPluginLoader loader = new PluginLoader(string.Empty, fileSystem, new TestLogManager().GetClassLogger<PluginLoaderTests>(),
+            typeof(SilashPlugin), typeof(NethDevPlugin), typeof(HivePlugin), typeof(HealthChecksPlugin), typeof(MergePlugin));
+        loader.Load();
+        IPluginConfig pluginConfig =
+            new PluginConfig();
+        loader.OrderPlugins(pluginConfig);
+
+        List<Type> expected =
+        [
+            typeof(HealthChecksPlugin),
+            typeof(SilashPlugin),
+            typeof(MergePlugin),
+            typeof(HivePlugin),
+            typeof(NethDevPlugin)
+        ];
+        Assert.That(expected, Is.EqualTo(loader.PluginTypes).AsCollection);
+    }
+
+    [Test]
+    public async Task Can_PassInConfig_And_OnlyLoadEnabledPlugins()
+    {
+        PluginLoader loader = new(string.Empty, Substitute.For<IFileSystem>(), new TestLogManager().GetClassLogger<PluginLoaderTests>(),
+            typeof(TestPlugin1), typeof(TestPlugin2));
+        loader.Load();
+
+        IConfigProvider configProvider = new ConfigProvider();
+        IInitConfig initConfig = configProvider.GetConfig<IInitConfig>();
+        initConfig.DiscoveryEnabled = true;
+        initConfig.PeerManagerEnabled = false;
+        ChainSpec chainSpec = new();
+        chainSpec.ChainId = 999;
+
+        IList<INethermindPlugin> loadedPlugins = await loader.LoadPlugins(configProvider, chainSpec);
+        Assert.That(loadedPlugins, Has.Count.EqualTo(1));
+        Assert.That(loadedPlugins[0], Is.TypeOf<TestPlugin1>());
+        Assert.That(loadedPlugins[0].Enabled, Is.True);
+    }
+
+    private class TestPlugin1(ChainSpec chainSpec, IInitConfig initConfig) : INethermindPlugin
+    {
+        public string Name => "TestPlugin1";
+        public string Description => "TestPlugin1";
+        public string Author => "TestPlugin1";
+
+        // Just some arbitrary combination
+        public bool Enabled => chainSpec.ChainId == 999 && initConfig.DiscoveryEnabled && !initConfig.PeerManagerEnabled;
+    }
+
+    private class TestPlugin2() : INethermindPlugin
+    {
+        public string Name => "TestPlugin2";
+        public string Description => "TestPlugin2";
+        public string Author => "TestPlugin2";
+        public bool Enabled => false;
+    }
+
+
+    private class AnotherAura() : IConsensusPlugin
+    {
+        public string Name => "TestPlugin2";
+        public string Description => "TestPlugin2";
+        public string Author => "TestPlugin2";
+        public bool Enabled => true;
+    }
+}

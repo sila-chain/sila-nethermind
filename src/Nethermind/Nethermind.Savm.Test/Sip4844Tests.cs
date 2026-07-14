@@ -1,0 +1,58 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Specs;
+using NUnit.Framework;
+using Nethermind.Int256;
+using Nethermind.Core;
+
+namespace Nethermind.Savm.Test;
+
+[TestFixture]
+public class Sip4844Tests : VirtualMachineTestsBase
+{
+    protected override ulong BlockNumber => MainnetSpecProvider.ParisBlockNumber;
+    protected override ulong Timestamp => MainnetSpecProvider.CancunBlockTimestamp;
+
+    [TestCase(0, 0, Description = "Should return 0 when no hashes")]
+    [TestCase(1, 1, Description = "Should return 0 when out of range")]
+    [TestCase(2, 1, Description = "Should return 0 when way out of range")]
+    [TestCase(0, 1, Description = "Should return hash, when exists")]
+    [TestCase(1, 3, Description = "Should return hash, when exists")]
+    public void Test_blobhash_index_in_range(int index, int blobhashesCount)
+    {
+        byte[][] hashes = new byte[blobhashesCount][];
+        for (int i = 0; i < blobhashesCount; i++)
+        {
+            hashes[i] = new byte[32];
+            for (int n = 0; n < blobhashesCount; n++)
+            {
+                hashes[i][n] = (byte)((i * 3 + 10 * 7) % 256);
+            }
+        }
+        byte[] expectedOutput = blobhashesCount > index ? hashes[index] : new byte[32];
+
+        // Cost of transaction call + PUSH1 x4 + MSTORE (entry cost + 1 memory cell used)
+        const ulong gasCostOfCallingWrapper = GasCostOf.Transaction + GasCostOf.VeryLow * 5 + GasCostOf.Memory;
+
+        byte[] code = Prepare.SavmCode
+            .PushData(new UInt256((ulong)index))
+            .BLOBHASH()
+            .MSTORE(0)
+            .Return(32, 0)
+            .Done;
+
+        TestAllTracerWithOutput result = Execute(Activation, 50000, code, blobVersionedHashes: hashes);
+
+        Assert.That(result.StatusCode, Is.EqualTo(StatusCode.Success));
+        Assert.That(result.ReturnValue, Is.EqualTo(expectedOutput));
+        AssertGas(result, gasCostOfCallingWrapper + GasCostOf.BlobHash);
+    }
+
+    protected override TestAllTracerWithOutput CreateTracer()
+    {
+        TestAllTracerWithOutput tracer = base.CreateTracer();
+        tracer.IsTracingAccess = false;
+        return tracer;
+    }
+}

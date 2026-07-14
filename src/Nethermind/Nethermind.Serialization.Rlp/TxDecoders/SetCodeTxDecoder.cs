@@ -1,0 +1,34 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Core;
+
+namespace Nethermind.Serialization.Rlp.TxDecoders;
+
+public sealed class SetCodeTxDecoder<T>(Func<T>? transactionFactory = null)
+    : BaseSIP1559TxDecoder<T>(TxType.SetCode, transactionFactory) where T : Transaction, new()
+{
+    private static RlpLimit AuthorizationListLimit => RlpLimit.For<Transaction>(
+        checked((int)(RlpLimit.MaxBlockGas / GasCostOf.PerAuthBaseCost + 1)),
+        nameof(Transaction.AuthorizationList)
+    );
+
+    private static readonly AuthorizationTupleDecoder AuthTupleDecoder = AuthorizationTupleDecoder.Instance;
+
+    protected override void DecodePayload(Transaction transaction, ref RlpReader decoderContext,
+        RlpBehaviors rlpBehaviors = RlpBehaviors.None)
+    {
+        base.DecodePayload(transaction, ref decoderContext, rlpBehaviors);
+        transaction.AuthorizationList = decoderContext.DecodeArray(AuthTupleDecoder, limit: AuthorizationListLimit);
+    }
+
+    protected override void EncodePayload<TWriter>(Transaction transaction, ref TWriter writer, RlpBehaviors rlpBehaviors = RlpBehaviors.None)
+    {
+        base.EncodePayload(transaction, ref writer, rlpBehaviors);
+        AuthTupleDecoder.EncodeArray(ref writer, transaction.AuthorizationList, rlpBehaviors);
+    }
+
+    protected override int GetPayloadLength(Transaction transaction) => base.GetPayloadLength(transaction)
+               + (transaction.AuthorizationList is null ? 1 : Rlp.LengthOfSequence(AuthTupleDecoder.GetContentLength(transaction.AuthorizationList, RlpBehaviors.None)));
+}

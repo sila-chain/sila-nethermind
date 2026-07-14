@@ -1,0 +1,92 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using System.Security;
+using Nethermind.Core;
+using Nethermind.Core.Caching;
+using Nethermind.Core.Crypto;
+using Nethermind.Crypto;
+using Nethermind.KeyStore;
+using Nethermind.Logging;
+
+namespace Nethermind.Wallet
+{
+    public class ProtectedKeyStoreWallet(IKeyStore keyStore, IProtectedPrivateKeyFactory protectedPrivateKeyFactory, ITimestamper timestamper, ILogManager logManager) : IWallet
+    {
+        private static readonly TimeSpan DefaultExpirationTime = TimeSpan.FromMinutes(5);
+
+        private readonly IKeyStore _keyStore = keyStore ?? throw new ArgumentNullException(nameof(keyStore));
+        private readonly IProtectedPrivateKeyFactory _protectedPrivateKeyFactory = protectedPrivateKeyFactory ?? throw new ArgumentNullException(nameof(protectedPrivateKeyFactory));
+        private readonly ITimestamper _timestamper = timestamper ?? Timestamper.Default;
+        private readonly ILogger _logger = logManager?.GetClassLogger<ProtectedKeyStoreWallet>() ?? throw new ArgumentNullException(nameof(logManager));
+
+        private readonly LruCache<String, ProtectedPrivateKey> _unlockedAccounts = new(100, nameof(ProtectedKeyStoreWallet));
+        public event EventHandler<AccountLockedEventArgs> AccountLocked;
+        public event EventHandler<AccountUnlockedEventArgs> AccountUnlocked;
+
+        public void Import(byte[] keyData, SecureString passphrase) => _keyStore.StoreKey(new PrivateKey(keyData), passphrase);
+
+        public Address[] GetAccounts() => _keyStore.GetKeyAddresses().Addresses.ToArray();
+
+        public Address NewAccount(SecureString passphrase)
+        {
+            (PrivateKey privateKey, _) = _keyStore.GenerateKey(passphrase);
+            return privateKey.Address;
+        }
+
+        public bool UnlockAccount(Address address, SecureString passphrase, TimeSpan? timeSpan)
+        {
+            if (address == Address.Zero)
+            {
+                return false;
+            }
+            else if (IsUnlocked(address))
+            {
+                return true;
+            }
+            else
+            {
+                (PrivateKey key, Result result) = _keyStore.GetKey(address, passphrase);
+                if (result.ResultType == ResultType.Success)
+                {
+                    if (_logger.IsInfo) _logger.Info($"Unlocking account: {address}");
+                    _unlockedAccounts.Set(key.Address.ToString(), _protectedPrivateKeyFactory.Create(key));
+                    AccountUnlocked?.Invoke(this, new AccountUnlockedEventArgs(address));
+                    return true;
+                }
+
+                if (_logger.IsError) _logger.Error($"Failed to unlock the account: {address}");
+                return false;
+            }
+        }
+
+        public bool LockAccount(Address address)
+        {
+            AccountLocked?.Invoke(this, new AccountLockedEventArgs(address));
+            _unlockedAccounts.Delete(address.ToString());
+            return true;
+        }
+
+        public bool IsUnlocked(Address address) => _unlockedAccounts.Contains(address.ToString());
+
+        public bool TrySign(in ValueHash256 message, Address address, [NotNullWhen(true)] out Signature signature)
+        {
+            ProtectedPrivateKey protectedPrivateKey = (ProtectedPrivateKey)_unlockedAccounts.Get(address.ToString());
+            if (protectedPrivateKey is null)
+            {
+                signature = null;
+                return false;
+            }
+
+            using PrivateKey key = protectedPrivateKey.Unprotect();
+            signature = WalletSigner.Sign(in message, key);
+            return true;
+        }
+
+        public bool TrySign(in ValueHash256 message, Address address, SecureString passphrase, [NotNullWhen(true)] out Signature signature) =>
+            WalletSigner.TrySignWithPassphrase(_keyStore, in message, address, passphrase, out signature);
+    }
+}

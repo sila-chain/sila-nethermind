@@ -1,0 +1,55 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Consensus.Processing;
+using Nethermind.Core;
+using Nethermind.Core.Exceptions;
+using Nethermind.Logging;
+
+namespace Nethermind.Consensus.AuRa.Validators
+{
+    public abstract class AuRaValidatorBase(
+        IValidSealerStrategy validSealerStrategy,
+        IValidatorStore validatorStore,
+        ILogManager logManager,
+        ulong startBlockNumber,
+        bool forSealing) : IAuRaValidator
+    {
+        public const ulong DefaultStartBlockNumber = 1;
+
+        private readonly IValidSealerStrategy _validSealerStrategy = validSealerStrategy ?? throw new ArgumentNullException(nameof(validSealerStrategy));
+        private readonly ILogger _logger = logManager?.GetClassLogger<AuRaValidatorBase>() ?? throw new ArgumentNullException(nameof(logManager));
+
+        public Address[] Validators { get; protected internal set; }
+
+        protected ulong InitBlockNumber { get; } = startBlockNumber;
+        protected internal bool ForSealing { get; } = forSealing;
+        protected IValidatorStore ValidatorStore { get; } = validatorStore ?? throw new ArgumentNullException(nameof(validatorStore));
+
+        protected void InitValidatorStore()
+        {
+            if (!ForSealing && InitBlockNumber == DefaultStartBlockNumber)
+            {
+                ValidatorStore.SetValidators(InitBlockNumber, Validators);
+            }
+        }
+
+        public virtual void OnBlockProcessingStart(Block block, ProcessingOptions options = ProcessingOptions.None)
+        {
+            if (!options.ContainsFlag(ProcessingOptions.ProducingBlock) && !block.IsGenesis)
+            {
+                ulong auRaStep = block.Header.RequireAuRa().AuRaStep;
+                if (!_validSealerStrategy.IsValidSealer(Validators, block.Beneficiary, auRaStep, out Address expectedAddress))
+                {
+                    string reason = $"Incorrect proposer at step {auRaStep}, expected {expectedAddress}, but found {block.Beneficiary}";
+                    if (_logger.IsError) _logger.Error($"Proposed block is not valid {block.ToString(Block.Format.FullHashAndNumber)}. {reason}.");
+                    this.GetReportingValidator().ReportBenign(block.Beneficiary, block.Number, IReportingValidator.BenignCause.IncorrectProposer);
+                    throw new InvalidBlockException(block, reason);
+                }
+            }
+        }
+
+        public virtual void OnBlockProcessingEnd(Block block, TxReceipt[] receipts, ProcessingOptions options = ProcessingOptions.None) { }
+    }
+}

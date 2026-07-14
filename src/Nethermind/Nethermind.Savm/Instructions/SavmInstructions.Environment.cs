@@ -1,0 +1,796 @@
+// SPDX-FileCopyrightText: 2025 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Runtime.CompilerServices;
+using Nethermind.Core;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Crypto;
+using Nethermind.Savm.GasPolicy;
+using Nethermind.Savm.State;
+using static Nethermind.Savm.VirtualMachineStatics;
+
+namespace Nethermind.Savm;
+
+using Int256;
+
+public static partial class SavmInstructions
+{
+    /// <summary>
+    /// Defines an environment introspection operation that returns a byte span.
+    /// Implementations should provide a static gas cost and a static Operation method.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy type parameter.</typeparam>
+    public interface IOpBlkAddress<TGasPolicy> : IGasCost
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        /// <summary>
+        /// The gas cost for the operation.
+        /// </summary>
+        static ulong IGasCost.GasCost => GasCostOf.Base;
+        /// <summary>
+        /// Executes the operation and returns the result as address.
+        /// </summary>
+        /// <param name="vm">The current virtual machine instance.</param>
+        abstract static Address Operation(VirtualMachine<TGasPolicy> vm);
+    }
+
+    /// <summary>
+    /// Defines an environment introspection operation that returns a big endian word.
+    /// Implementations should provide a static gas cost and a static Operation method.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy type parameter.</typeparam>
+    public interface IOpEnv32Bytes<TGasPolicy> : IGasCost
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        /// <summary>
+        /// The gas cost for the operation.
+        /// </summary>
+        static ulong IGasCost.GasCost => GasCostOf.Base;
+        /// <summary>
+        /// Executes the operation and returns the result as ref to big endian word.
+        /// </summary>
+        /// <param name="vm">The current virtual machine instance.</param>
+        abstract static ref readonly ValueHash256 Operation(VirtualMachine<TGasPolicy> vm);
+    }
+
+    /// <summary>
+    /// Defines an environment introspection operation that returns an Address.
+    /// Implementations should provide a static gas cost and a static Operation method.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy type parameter.</typeparam>
+    public interface IOpEnvAddress<TGasPolicy> : IGasCost
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        /// <summary>
+        /// The gas cost for the operation.
+        /// </summary>
+        static ulong IGasCost.GasCost => GasCostOf.Base;
+        /// <summary>
+        /// Executes the operation and returns the result as address.
+        /// </summary>
+        /// <param name="vmState">The current virtual machine state.</param>
+        abstract static Address Operation(VmState<TGasPolicy> vmState);
+    }
+
+    /// <summary>
+    /// Defines an environment introspection operation that returns a 256-bit unsigned integer.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy type parameter.</typeparam>
+    public interface IOpEnvUInt256<TGasPolicy> : IGasCost
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        static ulong IGasCost.GasCost => GasCostOf.Base;
+        /// <summary>
+        /// Executes the operation and returns the result as a UInt256.
+        /// </summary>
+        /// <param name="vmState">The current virtual machine state.</param>
+        /// <param name="result">The resulting 256-bit unsigned integer.</param>
+        abstract static ref readonly UInt256 Operation(VmState<TGasPolicy> vmState);
+    }
+
+    /// <summary>
+    /// Defines an environment introspection operation that returns a 256-bit unsigned integer.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy type parameter.</typeparam>
+    public interface IOpBlkUInt256<TGasPolicy> : IGasCost
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        static ulong IGasCost.GasCost => GasCostOf.Base;
+        /// <summary>
+        /// Executes the operation and returns the result as a UInt256.
+        /// </summary>
+        /// <param name="vm">The current virtual machine instance.</param>
+        /// <param name="result">The resulting 256-bit unsigned integer.</param>
+        abstract static ref readonly UInt256 Operation(VirtualMachine<TGasPolicy> vm);
+    }
+
+    /// <summary>
+    /// Defines an environment introspection operation that returns a 32-bit unsigned integer.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy type parameter.</typeparam>
+    public interface IOpEnvUInt32<TGasPolicy> : IGasCost
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        static ulong IGasCost.GasCost => GasCostOf.Base;
+        /// <summary>
+        /// Executes the operation and returns the result as a UInt32.
+        /// </summary>
+        /// <param name="vmState">The current virtual machine state.</param>
+        abstract static uint Operation(VmState<TGasPolicy> vmState);
+    }
+
+    /// <summary>
+    /// Defines an environment introspection operation that returns a 64-bit unsigned integer.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy type parameter.</typeparam>
+    public interface IOpEnvUInt64<TGasPolicy> : IGasCost
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        static ulong IGasCost.GasCost => GasCostOf.Base;
+        /// <summary>
+        /// Executes the operation and returns the result as a UInt64.
+        /// </summary>
+        /// <param name="vmState">The current virtual machine state.</param>
+        abstract static ulong Operation(VmState<TGasPolicy> vmState);
+    }
+
+    /// <summary>
+    /// Defines an environment introspection operation that returns a 64-bit unsigned integer.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy type parameter.</typeparam>
+    public interface IOpBlkUInt64<TGasPolicy> : IGasCost
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        static ulong IGasCost.GasCost => GasCostOf.Base;
+        /// <summary>
+        /// Executes the operation and returns the result as a UInt64.
+        /// </summary>
+        /// <param name="vm">The current virtual machine instance.</param>
+        abstract static ulong Operation(VirtualMachine<TGasPolicy> vm);
+    }
+
+    /// <summary>
+    /// Executes an environment introspection opcode that returns an Address.
+    /// Generic parameter TOpEnv defines the concrete operation.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpEnv">The specific operation implementation.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>An SAVM exception type if an error occurs.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionEnvAddress<TGasPolicy, TOpEnv, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpEnv : struct, IOpEnvAddress<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        // Deduct the gas cost as defined by the operation implementation.
+        TGasPolicy.Consume<TOpEnv>(ref gas);
+
+        // Execute the operation and retrieve the result.
+        Address result = TOpEnv.Operation(vm.VmState);
+
+        // Push the resulting bytes onto the SAVM stack.
+        return stack.PushAddress<TTracingInst>(result);
+    }
+
+    /// <summary>
+    /// Executes an block introspection opcode that returns an Address.
+    /// Generic parameter TOpEnv defines the concrete operation.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpEnv">The specific operation implementation.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>An SAVM exception type if an error occurs.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionBlkAddress<TGasPolicy, TOpEnv, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpEnv : struct, IOpBlkAddress<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        // Deduct the gas cost as defined by the operation implementation.
+        TGasPolicy.Consume<TOpEnv>(ref gas);
+
+        // Execute the operation and retrieve the result.
+        Address result = TOpEnv.Operation(vm);
+
+        // Push the resulting bytes onto the SAVM stack.
+        return stack.PushAddress<TTracingInst>(result);
+    }
+
+    /// <summary>
+    /// Executes an environment introspection opcode that returns a UInt256 value.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpEnv">The specific operation implementation.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>An SAVM exception type if an error occurs.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionEnvUInt256<TGasPolicy, TOpEnv, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpEnv : struct, IOpEnvUInt256<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<TOpEnv>(ref gas);
+
+        ref readonly UInt256 result = ref TOpEnv.Operation(vm.VmState);
+
+        return stack.PushUInt256<TTracingInst>(in result);
+    }
+
+    /// <summary>
+    /// Executes an environment introspection opcode that returns a UInt256 value.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpEnv">The specific operation implementation.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>An SAVM exception type if an error occurs.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionBlkUInt256<TGasPolicy, TOpEnv, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpEnv : struct, IOpBlkUInt256<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<TOpEnv>(ref gas);
+
+        ref readonly UInt256 result = ref TOpEnv.Operation(vm);
+
+        return stack.PushUInt256<TTracingInst>(in result);
+    }
+
+    /// <summary>
+    /// Executes an environment introspection opcode that returns a UInt32 value.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpEnv">The specific operation implementation.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>An SAVM exception type if an error occurs.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionEnvUInt32<TGasPolicy, TOpEnv, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpEnv : struct, IOpEnvUInt32<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<TOpEnv>(ref gas);
+
+        uint result = TOpEnv.Operation(vm.VmState);
+
+        return stack.PushUInt32<TTracingInst>(result);
+    }
+
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionCodeSize<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<BaseGasCost>(ref gas);
+
+        uint result = (uint)stack.CodeLength;
+
+        return stack.PushUInt32<TTracingInst>(result);
+    }
+
+    /// <summary>
+    /// Executes an environment introspection opcode that returns a UInt64 value.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpEnv">The specific operation implementation.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>An SAVM exception type if an error occurs.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionEnvUInt64<TGasPolicy, TOpEnv, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpEnv : struct, IOpEnvUInt64<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<TOpEnv>(ref gas);
+
+        ulong result = TOpEnv.Operation(vm.VmState);
+
+        return stack.PushUInt64<TTracingInst>(result);
+    }
+
+    /// <summary>
+    /// Executes an environment introspection opcode that returns a UInt64 value.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpEnv">The specific operation implementation.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>An SAVM exception type if an error occurs.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionBlkUInt64<TGasPolicy, TOpEnv, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpEnv : struct, IOpBlkUInt64<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<TOpEnv>(ref gas);
+
+        ulong result = TOpEnv.Operation(vm);
+
+        return stack.PushUInt64<TTracingInst>(result);
+    }
+
+    /// <summary>
+    /// Executes an environment introspection opcode that returns a UInt64 value.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpEnv">The specific operation implementation.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>An SAVM exception type if an error occurs.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionEnv32Bytes<TGasPolicy, TOpEnv, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpEnv : struct, IOpEnv32Bytes<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<TOpEnv>(ref gas);
+
+        ref readonly ValueHash256 result = ref TOpEnv.Operation(vm);
+
+        return stack.Push32Bytes<TTracingInst>(in result);
+    }
+
+    /// <summary>
+    /// Returns the size of the transaction call data.
+    /// </summary>
+    public struct OpCallDataSize<TGasPolicy> : IOpEnvUInt32<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static uint Operation(VmState<TGasPolicy> vmState)
+            => (uint)vmState.Env.InputData.Length;
+    }
+
+    /// <summary>
+    /// Retrieves the length of the return data buffer and pushes it onto the stack.
+    /// </summary>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionReturnDataSize<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<BaseGasCost>(ref gas);
+        return stack.PushUInt32<TTracingInst>((uint)vm.ReturnDataBuffer.Length);
+    }
+
+    /// <summary>
+    /// Returns the timestamp of the current block.
+    /// </summary>
+    public struct OpTimestamp<TGasPolicy> : IOpBlkUInt64<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static ulong Operation(VirtualMachine<TGasPolicy> vm)
+            => vm.BlockExecutionContext.Header.Timestamp;
+    }
+
+    /// <summary>
+    /// Returns the block number of the current block.
+    /// </summary>
+    public struct OpNumber<TGasPolicy> : IOpBlkUInt64<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static ulong Operation(VirtualMachine<TGasPolicy> vm)
+            => vm.BlockExecutionContext.Number;
+    }
+
+    /// <summary>
+    /// Returns the gas limit of the current block.
+    /// </summary>
+    public struct OpGasLimit<TGasPolicy> : IOpBlkUInt64<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static ulong Operation(VirtualMachine<TGasPolicy> vm)
+            => vm.BlockExecutionContext.GasLimit;
+    }
+
+    /// <summary>
+    /// Returns the current size of the SAVM memory.
+    /// </summary>
+    public struct OpMSize<TGasPolicy> : IOpEnvUInt64<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static ulong Operation(VmState<TGasPolicy> vmState)
+            => vmState.Memory.Size;
+    }
+
+    /// <summary>
+    /// Returns the base fee per gas for the current block.
+    /// </summary>
+    public struct OpBaseFee<TGasPolicy> : IOpBlkUInt256<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+
+        public static ref readonly UInt256 Operation(VirtualMachine<TGasPolicy> vm)
+            => ref vm.BlockExecutionContext.Header.BaseFeePerGas;
+    }
+
+    /// <summary>
+    /// Implements the BLOBBASEFEE opcode.
+    /// Returns the blob base fee from the block header.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/>, or <see cref="SavmExceptionType.BadInstruction"/> if blob base fee not set.
+    /// </returns>
+    public static SavmExceptionType InstructionBlobBaseFee<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        ref readonly BlockExecutionContext context = ref vm.BlockExecutionContext;
+        // If the blob base fee is missing (no ExcessBlobGas set), this opcode is invalid.
+        if (!context.Header.ExcessBlobGas.HasValue) goto BadInstruction;
+
+        // Charge the base gas cost for this opcode.
+        TGasPolicy.Consume<BaseGasCost>(ref gas);
+        return stack.Push32Bytes<TTracingInst>(in context.BlobBaseFee);
+        // Jump forward to be unpredicted by the branch predictor.
+    BadInstruction:
+        return SavmExceptionType.BadInstruction;
+    }
+
+    /// <summary>
+    /// Returns the gas price for the transaction.
+    /// </summary>
+    public struct OpGasPrice<TGasPolicy> : IOpBlkUInt256<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static ref readonly UInt256 Operation(VirtualMachine<TGasPolicy> vm)
+            => ref vm.TxExecutionContext.GasPrice;
+    }
+
+    /// <summary>
+    /// Returns the value transferred with the current call.
+    /// </summary>
+    public struct OpCallValue<TGasPolicy> : IOpEnvUInt256<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static ref readonly UInt256 Operation(VmState<TGasPolicy> vmState)
+            => ref vmState.Env.Value;
+    }
+
+    /// <summary>
+    /// Returns the address of the currently executing account.
+    /// </summary>
+    public struct OpAddress<TGasPolicy> : IOpEnvAddress<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static Address Operation(VmState<TGasPolicy> vmState)
+            => vmState.Env.ExecutingAccount;
+    }
+
+    /// <summary>
+    /// Returns the address of the caller of the current execution context.
+    /// </summary>
+    public struct OpCaller<TGasPolicy> : IOpEnvAddress<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static Address Operation(VmState<TGasPolicy> vmState)
+            => vmState.Env.Caller;
+    }
+
+    /// <summary>
+    /// Returns the origin address of the transaction.
+    /// </summary>
+    public struct OpOrigin<TGasPolicy> : IOpEnv32Bytes<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static ref readonly ValueHash256 Operation(VirtualMachine<TGasPolicy> vm)
+            => ref vm.TxExecutionContext.Origin;
+    }
+
+    /// <summary>
+    /// Returns the coinbase (beneficiary) address for the current block.
+    /// </summary>
+    public struct OpCoinbase<TGasPolicy> : IOpBlkAddress<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static Address Operation(VirtualMachine<TGasPolicy> vm)
+            => vm.BlockExecutionContext.Coinbase;
+    }
+
+    /// <summary>
+    /// Returns the chain identifier.
+    /// </summary>
+    public struct OpChainId<TGasPolicy> : IOpEnv32Bytes<TGasPolicy>
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        public static ref readonly ValueHash256 Operation(VirtualMachine<TGasPolicy> vm)
+            => ref vm.ChainId;
+    }
+
+    /// <summary>
+    /// Retrieves and pushes the balance of an account.
+    /// The address is popped from the stack.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/> if gas is available,
+    /// <see cref="SavmExceptionType.OutOfGas"/> if the gas becomes negative
+    /// or <see cref="SavmExceptionType.StackUnderflow"/> if not enough items on stack.
+    /// </returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionBalance<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        IReleaseSpec spec = vm.Spec;
+        // Deduct gas cost for balance operation as per specification.
+        TGasPolicy.Consume<BalanceGasCost>(ref gas, spec);
+
+        Address address = stack.PopAddress(vm.AddressCache);
+        if (address is null) goto StackUnderflow;
+
+        // Charge gas for account access. If insufficient gas remains, abort.
+        if (!TGasPolicy.ConsumeAccountAccessGas(ref gas, spec, in vm.VmState.AccessTracker, vm.TxTracer.IsTracingAccess, address)) goto OutOfGas;
+
+        UInt256 result = vm.WorldState.GetBalance(address);
+        return stack.PushUInt256<TTracingInst>(in result);
+        // Jump forward to be unpredicted by the branch predictor.
+    OutOfGas:
+        return SavmExceptionType.OutOfGas;
+    StackUnderflow:
+        return SavmExceptionType.StackUnderflow;
+    }
+
+    /// <summary>
+    /// Pushes the balance of the executing account onto the stack.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/>
+    /// </returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionSelfBalance<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<SelfBalanceGasCost>(ref gas);
+
+        // Get balance for currently executing account.
+        UInt256 result = vm.WorldState.GetBalance(vm.VmState.Env.ExecutingAccount);
+        return stack.PushUInt256<TTracingInst>(in result);
+    }
+
+    /// <summary>
+    /// Retrieves the code hash of an external account.
+    /// Returns zero if the account does not exist or is considered dead.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/> if gas is available,
+    /// <see cref="SavmExceptionType.OutOfGas"/> if the gas becomes negative
+    /// or <see cref="SavmExceptionType.StackUnderflow"/> if not enough items on stack.
+    /// </returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionExtCodeHash<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        IReleaseSpec spec = vm.Spec;
+        TGasPolicy.Consume<ExtCodeHashGasCost>(ref gas, spec);
+
+        Address address = stack.PopAddress(vm.AddressCache);
+        if (address is null) goto StackUnderflow;
+        // Check if enough gas for account access and charge accordingly.
+        if (!TGasPolicy.ConsumeAccountAccessGas(ref gas, spec, in vm.VmState.AccessTracker, vm.TxTracer.IsTracingAccess, address)) goto OutOfGas;
+
+        IWorldState state = vm.WorldState;
+        // For dead accounts, the specification requires pushing zero.
+        if (state.IsDeadAccount(address))
+        {
+            return stack.PushZero<TTracingInst>();
+        }
+        ValueHash256 hash = state.GetCodeHash(address);
+        return stack.Push32Bytes<TTracingInst>(in hash);
+        // Jump forward to be unpredicted by the branch predictor.
+    OutOfGas:
+        return SavmExceptionType.OutOfGas;
+    StackUnderflow:
+        return SavmExceptionType.StackUnderflow;
+    }
+
+    /// <summary>
+    /// Implements the PREVRANDAO opcode.
+    /// Pushes the previous random value (post-merge) or block difficulty (pre-merge) onto the stack.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/>
+    /// </returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionPrevRandao<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        // Charge the base gas cost for this opcode.
+        TGasPolicy.Consume<BaseGasCost>(ref gas);
+        return stack.Push32Bytes<TTracingInst>(in vm.BlockExecutionContext.PrevRandao);
+    }
+
+    /// <summary>
+    /// Pushes the remaining gas onto the stack.
+    /// The gas available is decremented by the base cost, and if negative, an OutOfGas error is returned.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack where the gas value will be pushed.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The current program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/> if gas is available, or <see cref="SavmExceptionType.OutOfGas"/> if the gas becomes negative.
+    /// </returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionGas<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        // Deduct the base gas cost for reading gas.
+        TGasPolicy.Consume<BaseGasCost>(ref gas);
+
+        // If gas falls below zero after cost deduction, signal out-of-gas error.
+        if (TGasPolicy.IsOutOfGas(in gas)) goto OutOfGas;
+
+        // Push the remaining gas (as unsigned 64-bit) onto the stack.
+        return stack.PushUInt64<TTracingInst>(TGasPolicy.GetRemainingGas(in gas));
+        // Jump forward to be unpredicted by the branch predictor.
+    OutOfGas:
+        return SavmExceptionType.OutOfGas;
+    }
+
+    /// <summary>
+    /// Computes the blob hash from the provided blob versioned hashes.
+    /// Pops an index from the stack and uses it to select a blob hash from the versioned hashes array.
+    /// If the index is invalid, pushes zero.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack from which the index is popped and where the blob hash is pushed.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/> on success; otherwise, <see cref="SavmExceptionType.StackUnderflow"/>
+    /// if there are insufficient elements on the stack.
+    /// </returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionBlobHash<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        // Deduct the gas cost for blob hash operation.
+        TGasPolicy.Consume<BlobHashGasCost>(ref gas);
+
+        // Pop the blob index from the stack.
+        if (!stack.PopUInt256(out UInt256 result)) goto StackUnderflow;
+
+        // Retrieve the array of versioned blob hashes from the execution context.
+        byte[][] versionedHashes = vm.TxExecutionContext.BlobVersionedHashes;
+
+        // If versioned hashes are available and the index is within range, push the corresponding blob hash.
+        // Otherwise, push zero.
+        return versionedHashes is not null && result < versionedHashes.Length
+            ? stack.PushBytes<TTracingInst>(versionedHashes[result.u0])
+            : stack.PushZero<TTracingInst>();
+        // Jump forward to be unpredicted by the branch predictor.
+    StackUnderflow:
+        return SavmExceptionType.StackUnderflow;
+    }
+
+    /// <summary>
+    /// Retrieves a block hash for a given block number.
+    /// Pops a block number from the stack, validates it, and then pushes the corresponding block hash.
+    /// If no valid block hash exists, pushes a zero value.
+    /// Additionally, reports the block hash if block hash tracing is enabled.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack from which the block number is popped and where the block hash is pushed.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/> if the operation completes successfully;
+    /// otherwise, <see cref="SavmExceptionType.StackUnderflow"/> if there are insufficient stack elements.
+    /// </returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionBlockHash<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        // Deduct the gas cost for block hash operation.
+        TGasPolicy.Consume<BlockHashGasCost>(ref gas);
+
+        // Pop the block number from the stack.
+        if (!stack.PopUInt256(out UInt256 a)) goto StackUnderflow;
+
+        // Retrieve the block hash for the given block number.
+        BlockHeader header = vm.BlockExecutionContext.Header;
+        Hash256? blockHash = !a.IsUint64 || a.u0 >= header.Number
+            ? null // Current block, future block, or unrepresentable block number
+            : vm.BlockHashProvider.GetBlockhash(header, a.u0, vm.Spec);
+
+        // Push the block hash bytes if available; otherwise, push a 32-byte zero value.
+        SavmExceptionType pushResult = stack.PushBytes<TTracingInst>(blockHash is not null ? blockHash.Bytes : BytesZero32);
+
+        // If block hash tracing is enabled and a valid block hash was obtained, report it.
+        if (vm.TxTracer.IsTracingBlockHash && blockHash is not null)
+        {
+            vm.TxTracer.ReportBlockHash(blockHash);
+        }
+
+        return pushResult;
+        // Jump forward to be unpredicted by the branch predictor.
+    StackUnderflow:
+        return SavmExceptionType.StackUnderflow;
+    }
+
+    /// <summary>
+    /// Implements the SLOTNUM opcode.
+    /// Returns the slot number from the block header.
+    /// </summary>
+    /// <param name="vm">The virtual machine instance.</param>
+    /// <param name="stack">The execution stack.</param>
+    /// <param name="gasAvailable">The available gas which is reduced by the operation's cost.</param>
+    /// <param name="programCounter">The program counter.</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/>, or <see cref="SavmExceptionType.BadInstruction"/> if slot number not set.
+    /// </returns>
+    public static SavmExceptionType InstructionSlotNum<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        ref readonly BlockExecutionContext context = ref vm.BlockExecutionContext;
+
+        ulong? slotNumber = context.Header.SlotNumber;
+        // If the slot number is missing this opcode is invalid.
+        if (!slotNumber.HasValue) goto BadInstruction;
+
+        // Charge the base gas cost for this opcode.
+        TGasPolicy.Consume<BaseGasCost>(ref gas);
+        return stack.PushUInt64<TTracingInst>(slotNumber.Value);
+        // Jump forward to be unpredicted by the branch predictor.
+    BadInstruction:
+        return SavmExceptionType.BadInstruction;
+    }
+
+}

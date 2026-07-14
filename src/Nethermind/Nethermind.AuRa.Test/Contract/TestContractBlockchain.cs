@@ -1,0 +1,54 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.IO;
+using System.Threading.Tasks;
+using Autofac;
+using Nethermind.Blockchain;
+using Nethermind.Config;
+using Nethermind.Consensus.AuRa.InitializationSteps;
+using Nethermind.Core;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Test.Blockchain;
+using Nethermind.Logging;
+using Nethermind.Serialization.Json;
+using Nethermind.Specs.ChainSpecStyle;
+
+namespace Nethermind.AuRa.Test.Contract
+{
+    public class TestContractBlockchain : TestBlockchain
+    {
+        public ChainSpec? ChainSpecOverride { get; set; }
+
+        protected TestContractBlockchain() =>
+            SealEngineType = Nethermind.Core.SealEngineType.AuRa;
+
+        public static async Task<TTest> ForTest<TTest, TTestClass>(string? testSuffix = null) where TTest : TestContractBlockchain, new()
+        {
+            (ChainSpec ChainSpec, ISpecProvider SpecProvider) GetSpecProvider()
+            {
+                ChainSpecLoader loader = new(new SilaJsonSerializer(), LimboLogs.Instance);
+                string name = string.IsNullOrEmpty(testSuffix) ? $"{typeof(TTestClass).FullName}.json" : $"{typeof(TTestClass).FullName}.{testSuffix}.json";
+                using Stream? stream = typeof(TTestClass).Assembly.GetManifestResourceStream(name);
+                ChainSpec chainSpec = loader.Load(stream);
+                ChainSpecBasedSpecProvider chainSpecBasedSpecProvider = new(chainSpec);
+                return (chainSpec, chainSpecBasedSpecProvider);
+            }
+
+            (ChainSpec ChainSpec, ISpecProvider SpecProvider) provider = GetSpecProvider();
+            TTest test = new() { ChainSpecOverride = provider.ChainSpec };
+            return (TTest)await test.Build(builder =>
+                builder.AddSingleton<ISpecProvider>(provider.SpecProvider));
+        }
+
+        protected override ChainSpec CreateChainSpec() =>
+            ChainSpecOverride ?? base.CreateChainSpec();
+
+        protected override ContainerBuilder ConfigureContainer(
+            ContainerBuilder builder, IConfigProvider configProvider) =>
+            base.ConfigureContainer(builder, configProvider)
+                .AddScoped<IGenesisBuilder, GenesisBuilder>()
+                .AddScoped<IGenesisPostProcessor, AuraGenesisPostProcessor>()
+                ; // AuRa uses full genesis builder
+    }
+}

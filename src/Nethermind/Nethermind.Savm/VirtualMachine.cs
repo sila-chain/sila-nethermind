@@ -1,0 +1,1424 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using Nethermind.Config;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Savm.GasPolicy;
+using Nethermind.Savm.Precompiles;
+using Nethermind.Savm.Tracing;
+using Nethermind.Logging;
+using Nethermind.Savm.State;
+
+using static Nethermind.Savm.VirtualMachineStatics;
+
+[assembly: InternalsVisibleTo("Nethermind.Savm.Test")]
+namespace Nethermind.Savm;
+
+using Int256;
+
+public sealed class SilaVirtualMachine(
+    IBlockhashProvider? blockHashProvider,
+    ISpecProvider? specProvider,
+    ILogManager? logManager
+) : VirtualMachine<SilaGasPolicy>(blockHashProvider, specProvider, logManager), IVirtualMachine
+{
+}
+
+/// <summary>
+/// Static fields shared across all VirtualMachine generic instantiations.
+/// Moved out of the generic class to avoid duplication per type parameter.
+/// </summary>
+public static class VirtualMachineStatics
+{
+    public const int MaxCallDepth = 1024;
+    public static readonly UInt256 P255Int = new(0, 0, 0, 9223372036854775808); // 2^255
+    public static ref readonly UInt256 P255 => ref P255Int;
+    public static readonly UInt256 BigInt256 = 256;
+    public static readonly UInt256 BigInt32 = 32;
+
+    public static readonly byte[] BytesZero = [0];
+
+    public static readonly byte[] BytesZero32 =
+    {
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0
+    };
+
+    public static readonly byte[] BytesMax32 =
+    {
+        255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255
+    };
+
+    public static readonly PrecompileExecutionFailureException PrecompileExecutionFailureException = new();
+    public static readonly OutOfGasException PrecompileOutOfGasException = new();
+}
+
+public unsafe partial class VirtualMachine<TGasPolicy>(
+    IBlockhashProvider? blockHashProvider,
+    ISpecProvider? specProvider,
+    ILogManager? logManager) : IVirtualMachine<TGasPolicy>
+    where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+{
+    private readonly ValueHash256 _chainId = ((UInt256)specProvider.ChainId).ToValueHash();
+
+    private readonly IBlockhashProvider _blockHashProvider = blockHashProvider ?? throw new ArgumentNullException(nameof(blockHashProvider));
+    protected readonly ISpecProvider _specProvider = specProvider ?? throw new ArgumentNullException(nameof(specProvider));
+    protected readonly ILogger _logger = logManager?.GetClassLogger<VirtualMachine>() ?? throw new ArgumentNullException(nameof(logManager));
+    protected readonly Stack<VmState<TGasPolicy>> _stateStack = new(MaxCallDepth + 1);
+
+    protected IWorldState _worldState;
+    private (Address Address, bool ShouldDelete) _parityTouchBugAccount = (Address.FromNumber(3), false);
+
+    protected ITxTracer _txTracer = NullTxTracer.Instance;
+
+    private ICodeInfoRepository _codeInfoRepository;
+
+    private ReadOnlyMemory<byte> _returnDataBuffer = Array.Empty<byte>();
+    protected VmState<TGasPolicy> _currentState;
+    protected ReadOnlyMemory<byte>? _previousCallResult;
+    protected UInt256 _previousCallOutputDestination;
+
+    public ILogger Logger => _logger;
+    public ICodeInfoRepository CodeInfoRepository => _codeInfoRepository;
+    public IReleaseSpec Spec => _blockExecutionContext.Spec;
+    public ITxTracer TxTracer => _txTracer;
+    public IWorldState WorldState => _worldState;
+    public ref readonly ValueHash256 ChainId => ref _chainId;
+    public ref ReadOnlyMemory<byte> ReturnDataBuffer => ref _returnDataBuffer;
+    public object ReturnData { get; set; }
+    public PoppedAddressCache AddressCache { get; } = new();
+    public IBlockhashProvider BlockHashProvider => _blockHashProvider;
+    protected Stack<VmState<TGasPolicy>> StateStack => _stateStack;
+    // IsTracingActions is fixed per execution and read at several hot CALL/precompile sites, so cache it
+    // once in ExecuteTransaction and read the field rather than dispatching through the tracer each time.
+    private bool _isTracingActionsCached;
+
+    private BlockExecutionContext _blockExecutionContext;
+    public virtual void SetBlockExecutionContext(in BlockExecutionContext blockExecutionContext) => _blockExecutionContext = blockExecutionContext;
+    public ref readonly BlockExecutionContext BlockExecutionContext => ref _blockExecutionContext;
+
+    private TxExecutionContext _txExecutionContext;
+    public ref readonly TxExecutionContext TxExecutionContext => ref _txExecutionContext;
+    /// <summary>
+    /// Transaction context
+    /// </summary>
+    public void SetTxExecutionContext(in TxExecutionContext txExecutionContext) => _txExecutionContext = txExecutionContext;
+
+    public VmState<TGasPolicy> VmState { get => _currentState; protected set => _currentState = value; }
+    public int OpCodeCount { get; set; }
+    internal ExecutionMetricsCounters MetricsCounters;
+
+    public void FlushMetricsCounters() => MetricsCounters.Flush();
+
+    /// <summary>
+    /// Executes a transaction by iteratively processing call frames until a top-level call returns
+    /// or a failure condition is reached. This method handles both precompiled contracts and regular
+    /// SAVM calls, along with proper state management, tracing, and error handling.
+    /// </summary>
+    /// <typeparam name="TTracingInst">
+    /// The type of tracing instructions flag used to conditionally trace execution actions.
+    /// </typeparam>
+    /// <param name="vmState">The initial SAVM state to begin transaction execution.</param>
+    /// <param name="worldState">The current world state that may be modified during execution.</param>
+    /// <param name="txTracer">An object used to record execution details and trace transaction actions.</param>
+    /// <returns>
+    /// A <see cref="TransactionSubstate"/> representing the final state of the transaction execution.
+    /// </returns>
+    /// <exception cref="SavmException">
+    /// Thrown when an SAVM-specific error occurs during execution.
+    /// </exception>
+    public virtual TransactionSubstate ExecuteTransaction<TTracingInst>(
+
+        VmState<TGasPolicy> vmState,
+        IWorldState worldState,
+        ITxTracer txTracer)
+        where TTracingInst : struct, IFlag
+    {
+        // Initialize dependencies for transaction tracing and state access.
+        _txTracer = txTracer;
+        _isTracingActionsCached = txTracer.IsTracingActions;
+        _worldState = worldState;
+
+        // Reset Parity touch bug state to prevent cross-transaction leakage.
+        _parityTouchBugAccount.ShouldDelete = false;
+
+        // Prepare the specification and opcode mapping based on the current block header.
+        IReleaseSpec spec = BlockExecutionContext.Spec;
+        PrepareOpcodes<TTracingInst>(spec);
+        OpCodeCount = 0;
+        MetricsCounters = default;
+        // Initialize the code repository and set up the initial execution state.
+        _codeInfoRepository = TxExecutionContext.CodeInfoRepository;
+        _currentState = vmState;
+        _previousCallResult = null;
+        _previousCallOutputDestination = UInt256.Zero;
+        ZeroPaddedSpan previousCallOutput = ZeroPaddedSpan.Empty;
+
+        // Main execution loop: processes call frames until the top-level transaction completes.
+        while (true)
+        {
+            // For non-continuation frames, clear any previously stored return data.
+            if (!_currentState.IsContinuation)
+            {
+                ReturnDataBuffer = Array.Empty<byte>();
+            }
+
+            Exception? failure;
+            string? substateError;
+            try
+            {
+                CallResult callResult;
+
+                // If the current state represents a precompiled contract, handle it separately.
+                if (_currentState.IsPrecompile)
+                {
+                    callResult = ExecutePrecompile(_currentState, _isTracingActionsCached, out failure, out substateError);
+                    if (failure is not null)
+                    {
+                        // Jump to the failure handler if a precompile error occurred.
+                        goto Failure;
+                    }
+                }
+                else
+                {
+                    if (!_currentState.IsContinuation)
+                    {
+                        AddTransferLog(_currentState);
+
+                        // Start transaction tracing for non-continuation frames if tracing is enabled.
+                        if (_isTracingActionsCached)
+                        {
+                            TraceTransactionActionStart(_currentState);
+                        }
+                    }
+
+                    // Execute the regular SAVM call if valid code is present; otherwise, mark as invalid.
+                    if (_currentState.Env.CodeInfo is not null)
+                    {
+                        callResult = ExecuteCall<TTracingInst>(
+                            _previousCallResult,
+                            previousCallOutput,
+                            _previousCallOutputDestination);
+                    }
+                    else
+                    {
+                        callResult = new(SavmExceptionType.InvalidCode);
+                    }
+
+                    // If the call did not finish with a return, set up the next call frame and continue.
+                    if (!callResult.IsReturn)
+                    {
+                        PrepareNextCallFrame(in callResult, ref previousCallOutput);
+                        continue;
+                    }
+
+                    // Handle exceptions raised during the call execution.
+                    if (callResult.IsException)
+                    {
+                        TransactionSubstate substate = HandleException(in callResult, ref previousCallOutput, out bool terminate);
+                        if (terminate)
+                        {
+                            _currentState = null;
+                            return substate;
+                        }
+                        // Continue execution if the exception did not immediately finalize the transaction.
+                        continue;
+                    }
+                }
+
+                // If the current execution state is the top-level call, finalize tracing and return the result.
+                if (_currentState.IsTopLevel)
+                {
+                    if (_isTracingActionsCached)
+                    {
+                        TraceTransactionActionEnd(_currentState, callResult);
+                    }
+                    TransactionSubstate substate = PrepareTopLevelSubstate(in callResult);
+                    _currentState = null;
+                    return substate;
+                }
+
+                // For nested call frames, merge the results and restore the previous execution state.
+#pragma warning disable IDE0063 // Cannot simplify: the `goto Failure` above jumps past this scope, which a `using` declaration would forbid (CS8648)
+                using (VmState<TGasPolicy> previousState = _currentState)
+                {
+                    // Restore the previous state from the stack and mark it as a continuation.
+                    _currentState = _stateStack.Pop();
+                    _currentState.IsContinuation = true;
+                    bool previousStateSucceeded = true;
+
+                    if (!callResult.ShouldRevert)
+                    {
+                        bool isCreate = previousState.ExecutionType.IsAnyCreate();
+                        if (!isCreate)
+                        {
+                            IncorporateChildStateGasRefunds(previousState);
+                        }
+
+                        // Refund the remaining gas from the completed call frame (success path).
+                        TGasPolicy.Refund(ref _currentState.Gas, in previousState.Gas);
+                        ulong gasAvailableForCodeDeposit = TGasPolicy.GetRemainingGas(previousState.Gas);
+
+                        // Process contract creation calls differently from regular calls.
+                        if (isCreate)
+                        {
+                            PrepareCreateData(previousState, ref previousCallOutput);
+                            HandleCreate(
+                                in callResult,
+                                previousState,
+                                gasAvailableForCodeDeposit,
+                                ref previousStateSucceeded);
+                        }
+                        else
+                        {
+                            // Process a standard call return.
+                            previousCallOutput = HandleRegularReturn<TTracingInst>(in callResult, previousState);
+                        }
+
+                        // Commit the changes from the completed call frame if execution was successful.
+                        if (previousStateSucceeded)
+                        {
+                            previousState.CommitToParent(_currentState);
+                            if (isCreate)
+                            {
+                                IncorporateChildStateGasRefunds(previousState);
+                                // SIP-8037: refund the CREATE/CREATE2 up-front NEW_ACCOUNT state gas when the target
+                                // already existed — the code lands on an existing account leaf.
+                                if (previousState.IsCreateOnPreExistingAccount)
+                                {
+                                    CreditStateGasRefund(ref _currentState.Gas, TGasPolicy.GetCreateStateCost());
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // On revert, return remaining regular gas and restore state gas to parent reservoir.
+                        TGasPolicy.UpdateGasUp(ref _currentState.Gas, TGasPolicy.GetRemainingGas(in previousState.Gas));
+                        RemoveAdvancedStateGasRefund(previousState, ref previousState.Gas);
+                        TGasPolicy.RestoreChildStateGas(ref _currentState.Gas, in previousState.Gas);
+                        if (previousState.ExecutionType.IsAnyCreate())
+                        {
+                            CreditStateGasRefund(ref _currentState.Gas, TGasPolicy.GetCreateStateCost());
+                        }
+                        else if (previousState.NewAccountCharged)
+                        {
+                            // SIP-8037: the reverted *CALL did not create its (dead) recipient, so refund
+                            // the NEW_ACCOUNT state gas the parent charged up-front for the value transfer.
+                            CreditStateGasRefund(ref _currentState.Gas, TGasPolicy.GetNewAccountStateCost());
+                        }
+                        // Revert state changes for the previous call frame when a revert condition is signaled.
+                        HandleRevert(previousState, callResult, ref previousCallOutput);
+                    }
+                }
+#pragma warning restore IDE0063
+            }
+            // Handle specific SAVM or overflow exceptions by routing to the failure handling block.
+            catch (Exception ex) when (ex is SavmException or OverflowException)
+            {
+                failure = ex;
+                substateError = null;
+                goto Failure;
+            }
+
+            // Continue with the next iteration of the execution loop.
+            continue;
+
+            // Failure handling: attempts to process and possibly finalize the transaction after an error.
+        Failure:
+            TransactionSubstate failSubstate = HandleFailure<TTracingInst>(failure, substateError, ref previousCallOutput, out bool shouldExit);
+            if (shouldExit)
+            {
+                _currentState = null;
+                return failSubstate;
+            }
+        }
+    }
+
+    public TransactionSubstate ExecuteTransaction(VmState<TGasPolicy> vmState, IWorldState worldState, ITxTracer txTracer) =>
+        ExecuteTransaction<OffFlag>(vmState, worldState, txTracer);
+
+    protected void PrepareCreateData(VmState<TGasPolicy> previousState, ref ZeroPaddedSpan previousCallOutput)
+    {
+        _previousCallResult = previousState.Env.ExecutingAccount.Bytes.ToArray();
+        _previousCallOutputDestination = UInt256.Zero;
+        ReturnDataBuffer = Array.Empty<byte>();
+        previousCallOutput = ZeroPaddedSpan.Empty;
+    }
+
+    protected ZeroPaddedSpan HandleRegularReturn<TTracingInst>(scoped in CallResult callResult, VmState<TGasPolicy> previousState)
+        where TTracingInst : struct, IFlag
+    {
+        ZeroPaddedSpan previousCallOutput;
+        ReturnDataBuffer = callResult.Output;
+        _previousCallResult = callResult.PrecompileSuccess.HasValue
+            ? (callResult.PrecompileSuccess.Value ? StatusCode.SuccessBytes : StatusCode.FailureBytes)
+            : StatusCode.SuccessBytes;
+        previousCallOutput = callResult.Output.Span.SliceWithZeroPadding(0, Math.Min(callResult.Output.Length, (int)previousState.OutputLength));
+        _previousCallOutputDestination = (ulong)previousState.OutputDestination;
+        if (previousState.IsPrecompile)
+        {
+            // parity induced if else for vmtrace
+            if (TTracingInst.IsActive)
+            {
+                _txTracer.ReportMemoryChange(_previousCallOutputDestination, previousCallOutput);
+            }
+        }
+
+        if (_isTracingActionsCached)
+        {
+            _txTracer.ReportActionEnd(TGasPolicy.GetRemainingGas(previousState.Gas), ReturnDataBuffer);
+        }
+
+        return previousCallOutput;
+    }
+    /// <summary>
+    /// Handles the code deposit for a contract creation operation.
+    /// This method calculates code deposit gas,
+    /// validates the code, and either deposits the code or reverts the world state if the deposit fails.
+    /// </summary>
+    /// <param name="callResult">
+    /// The result of the contract creation call, which includes the output code intended for deposit.
+    /// </param>
+    /// <param name="previousState">
+    /// The SAVM state prior to the current call frame. It provides access to the snapshot, the executing account,
+    /// and flags indicating if the account pre-existed.
+    /// </param>
+    /// <param name="gasAvailableForCodeDeposit">
+    /// The amount of gas available for covering the cost of code deposit.
+    /// </param>
+    /// <param name="previousStateSucceeded">
+    /// A reference flag indicating whether the previous call frame executed successfully. This flag is set to false if the deposit fails.
+    /// </param>
+    protected void HandleCreate(
+        in CallResult callResult,
+        VmState<TGasPolicy> previousState,
+        ulong gasAvailableForCodeDeposit,
+        ref bool previousStateSucceeded)
+    {
+        IReleaseSpec spec = BlockExecutionContext.Spec;
+        if (!CodeDepositHandler.CalculateCost(spec, callResult.Output.Length, in previousState.Gas, out ulong regularDepositCost, out long stateDepositCost))
+        {
+            regularDepositCost = ulong.MaxValue;
+            stateDepositCost = long.MaxValue;
+        }
+
+        bool invalidCode = CodeDepositHandler.CodeIsInvalid(spec, callResult.Output);
+        TryChargeAndDepositCode(previousState, gasAvailableForCodeDeposit, ref previousStateSucceeded,
+            regularDepositCost, stateDepositCost, invalidCode, callResult.Output);
+    }
+
+    protected TransactionSubstate PrepareTopLevelSubstate(scoped in CallResult callResult)
+    {
+        if (callResult.ShouldRevert)
+        {
+            RefundRevertedTopLevelStateGas();
+        }
+
+        return new TransactionSubstate(
+            callResult.Output,
+            _currentState.Refund,
+            _currentState.AccessTracker.DestroyList,
+            _currentState.AccessTracker.Logs,
+            callResult.ShouldRevert,
+            isTracerConnected: _txTracer.IsTracing,
+            callResult.ExceptionType,
+            _logger);
+    }
+
+    private void TryChargeAndDepositCode(
+        VmState<TGasPolicy> previousState,
+        ulong gasAvailableForCodeDeposit,
+        ref bool previousStateSucceeded,
+        ulong regularDepositCost,
+        long stateDepositCost,
+        bool invalidCode,
+        ReadOnlyMemory<byte> code)
+    {
+        IReleaseSpec spec = BlockExecutionContext.Spec;
+        Address callCodeOwner = previousState.Env.ExecutingAccount;
+
+        ulong stateSpill = TGasPolicy.CalculateStateGasSpill(in previousState.Gas, stateDepositCost);
+        ulong codeDepositGasCost = regularDepositCost + stateSpill;
+        bool hasEnoughGas = gasAvailableForCodeDeposit >= regularDepositCost
+            && gasAvailableForCodeDeposit - regularDepositCost >= stateSpill;
+        bool chargedCodeDeposit = false;
+
+        if (hasEnoughGas && !invalidCode)
+        {
+            TGasPolicy gasAfterCodeDeposit = _currentState.Gas;
+            chargedCodeDeposit = TGasPolicy.TryConsumeStateAndRegularGas(ref gasAfterCodeDeposit, stateDepositCost, regularDepositCost);
+            if (chargedCodeDeposit)
+            {
+                _currentState.Gas = gasAfterCodeDeposit;
+                _codeInfoRepository.InsertCode(code, callCodeOwner, spec);
+                if (_isTracingActionsCached)
+                {
+                    _txTracer.ReportActionEnd(TGasPolicy.GetRemainingGas(previousState.Gas) - codeDepositGasCost, callCodeOwner, code);
+                }
+            }
+        }
+
+        if (!chargedCodeDeposit && (spec.FailOnOutOfGasCodeDeposit || invalidCode))
+        {
+            TGasPolicy.Consume(ref _currentState.Gas, gasAvailableForCodeDeposit);
+            // Code deposit failure is an exceptional halt of the child CREATE frame.
+            // Refund already merged the child's state gas (reservoir, stateGasUsed) into the parent,
+            // but halt semantics require restoring the full initial state reservoir and discarding
+            // the child's stateGasUsed (since the child's state changes are being reverted).
+            TGasPolicy.RevertRefundToHalt(ref _currentState.Gas, in previousState.Gas);
+            // The parent's up-front create state charge is refunded LIFO: a spilled charge
+            // returns to gas_left (burned by a later halt), not the reservoir (which survives it).
+            CreditStateGasRefund(ref _currentState.Gas, TGasPolicy.GetCreateStateCost());
+            RemoveAdvancedStateGasRefund(previousState, ref _currentState.Gas);
+            _worldState.Restore(previousState.Snapshot);
+            if (!previousState.IsCreateOnPreExistingAccount)
+            {
+                _worldState.DeleteAccount(callCodeOwner);
+            }
+
+            _previousCallResult = BytesZero;
+            previousStateSucceeded = false;
+
+            if (_isTracingActionsCached)
+            {
+                _txTracer.ReportActionError(invalidCode ? SavmExceptionType.InvalidCode : SavmExceptionType.OutOfGas);
+            }
+        }
+        else if (!chargedCodeDeposit && _isTracingActionsCached)
+        {
+            _txTracer.ReportActionEnd(0UL, callCodeOwner, code);
+        }
+    }
+
+    /// <summary>
+    /// Reverts the state changes made during the execution of a call frame.
+    /// This method restores the world state to a previous snapshot, sets appropriate
+    /// failure indicators and output data, and reports the revert action via the tracer.
+    /// </summary>
+    /// <param name="previousState">
+    /// The SAVM state prior to the current call, which contains the snapshot for restoration,
+    /// output length, output destination, and execution type.
+    /// </param>
+    /// <param name="callResult">
+    /// The result of the call that triggered the revert, containing output data and flags
+    /// indicating precompile success.
+    /// </param>
+    /// <param name="previousCallOutput">
+    /// A reference to the output data buffer that will be updated with the reverted call's output,
+    /// padded to match the expected length.
+    /// </param>
+    protected void HandleRevert(VmState<TGasPolicy> previousState, in CallResult callResult, ref ZeroPaddedSpan previousCallOutput)
+    {
+        // Restore the world state to the snapshot taken before the execution of the call.
+        _worldState.Restore(previousState.Snapshot);
+
+        // Cache the output bytes from the call result to avoid multiple property accesses.
+        ReadOnlyMemory<byte> outputBytes = callResult.Output;
+
+        // Set the return data buffer to the output bytes from the failed call.
+        ReturnDataBuffer = outputBytes;
+
+        _previousCallResult = StatusCode.FailureBytes;
+
+        // Slice the output bytes, zero-padding if necessary, to match the expected output length.
+        // This ensures that the returned data conforms to the caller's output length expectations.
+        previousCallOutput = outputBytes.Span.SliceWithZeroPadding(0, Math.Min(outputBytes.Length, (int)previousState.OutputLength));
+
+        // Record the output destination address for subsequent operations.
+        _previousCallOutputDestination = (ulong)previousState.OutputDestination;
+
+        // If transaction tracing is enabled, report the revert action along with the available gas and output bytes.
+        if (_isTracingActionsCached)
+        {
+            _txTracer.ReportActionRevert(TGasPolicy.GetRemainingGas(previousState.Gas), outputBytes);
+        }
+    }
+
+    /// <summary>
+    /// Handles a failure during transaction execution by restoring the world state,
+    /// reporting error details via the tracer, and either finalizing the top-level transaction
+    /// or preparing to revert to the parent call frame.
+    /// </summary>
+    /// <typeparam name="TTracingInst">
+    /// A type parameter representing tracing instructions. It must be a struct implementing <see cref="IFlag"/>.
+    /// </typeparam>
+    /// <param name="failure">The exception that caused the failure during execution.</param>
+    /// <param name="previousCallOutput">
+    /// A reference to the zero-padded span that holds the previous call's output; it will be reset upon failure.
+    /// </param>
+    /// <returns>
+    /// A <see cref="TransactionSubstate"/> if the failure occurs in the top-level call; otherwise, <c>null</c>
+    /// to indicate that execution should continue with the parent call frame.
+    /// </returns>
+    protected TransactionSubstate HandleFailure<TTracingInst>(Exception failure, string? substateError, scoped ref ZeroPaddedSpan previousCallOutput, out bool shouldExit)
+        where TTracingInst : struct, IFlag
+    {
+        // Log the exception if trace logging is enabled.
+        if (_logger.IsTrace)
+        {
+            _logger.Trace($"exception ({failure.GetType().Name}) in {_currentState.ExecutionType} at depth {_currentState.Env.CallDepth} - restoring snapshot");
+        }
+
+        // Revert the world state to the snapshot taken at the start of the current state's execution.
+        _worldState.Restore(_currentState.Snapshot);
+
+        // Revert any modifications specific to the Parity touch bug, if applicable.
+        RevertParityTouchBugAccount();
+
+        // Cache the transaction tracer for local use.
+        ITxTracer txTracer = _txTracer;
+
+        // Attempt to cast the exception to SavmException to extract a specific error type.
+        SavmException? savmException = failure as SavmException;
+        SavmExceptionType errorType = savmException?.ExceptionType ?? SavmExceptionType.Other;
+
+        // If the tracing instructions flag is active, report zero remaining gas and log the error.
+        if (TTracingInst.IsActive)
+        {
+            txTracer.ReportOperationRemainingGas(0);
+            txTracer.ReportOperationError(errorType);
+        }
+
+        // If action-level tracing is enabled, report the error associated with the action.
+        if (txTracer.IsTracingActions)
+        {
+            txTracer.ReportActionError(errorType);
+        }
+
+        // For a top-level call, immediately return a final transaction substate.
+        // The state-gas reset (ResetForHalt) is performed by TransactionProcessor.Refund,
+        // after reverted execution state-gas has been returned to the transaction frame.
+        if (_currentState.IsTopLevel)
+        {
+            // For an OverflowException, force the error type to a generic Other error.
+            SavmExceptionType finalErrorType = failure is OverflowException ? SavmExceptionType.Other : errorType;
+            shouldExit = true;
+            return new TransactionSubstate(finalErrorType, txTracer.IsTracing, substateError);
+        }
+
+        _previousCallResult = StatusCode.FailureBytes;
+        bool failedCreate = _currentState.ExecutionType.IsAnyCreate();
+        // Captured before the pop: the parent refunds NEW_ACCOUNT for the failed *CALL's uncreated recipient.
+        bool childNewAccountCharged = _currentState.NewAccountCharged;
+
+        // Reset output destination and return data.
+        _previousCallOutputDestination = UInt256.Zero;
+        ReturnDataBuffer = Array.Empty<byte>();
+        previousCallOutput = ZeroPaddedSpan.Empty;
+
+        PopAndRestoreParentState();
+        if (failedCreate)
+        {
+            // State-gas refunds are LIFO: spilled state gas returns to gas_left first, then
+            // the reservoir; refunding straight to the reservoir would survive a later halt.
+            CreditStateGasRefund(ref _currentState.Gas, TGasPolicy.GetCreateStateCost());
+        }
+        else if (childNewAccountCharged)
+        {
+            CreditStateGasRefund(ref _currentState.Gas, TGasPolicy.GetNewAccountStateCost());
+        }
+
+        shouldExit = false;
+        return default;
+    }
+
+    /// <summary>
+    /// Pops the exceptionally halted child state, restores state gas to the parent frame, and disposes the child.
+    /// Must be called before the child <see cref="VmState{TGasPolicy}"/> is disposed so that
+    /// spill/usage accounting is not lost.
+    /// </summary>
+    private void PopAndRestoreParentState()
+    {
+        VmState<TGasPolicy> childState = _currentState;
+        _currentState = _stateStack.Pop();
+        RemoveAdvancedStateGasRefund(childState, ref childState.Gas);
+        TGasPolicy.RestoreChildStateGasOnHalt(ref _currentState.Gas, in childState.Gas);
+        _currentState.IsContinuation = true;
+        childState.Dispose();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void RefundRevertedTopLevelStateGas()
+    {
+        // SIP-8037 top-level REVERT: gas_left is preserved, so the spilled portion of
+        // state_gas_used (originally drawn from gas_left) is still in the user's pocket.
+        // Refund the full state_gas_used — reservoir-portion AND spilled-portion — to the
+        // reservoir. The user is billed only the regular component.
+        long stateGasFloor = _currentState.InitialStateGasUsed;
+        long revertedStateGas = TGasPolicy.GetStateGasUsed(in _currentState.Gas);
+        if (revertedStateGas > stateGasFloor)
+        {
+            TGasPolicy.RefundStateGas(ref _currentState.Gas, revertedStateGas, stateGasFloor);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void CreditStateGasRefund(ref TGasPolicy gas, long amount, bool trackSpillRefund = true)
+    {
+        if (!Spec.IsSip8037Enabled || amount == 0)
+        {
+            return;
+        }
+
+        VmState<TGasPolicy> vmState = VmState;
+        long stateGasFloor = vmState.InitialStateGasUsed;
+        long refundableStateGas = Math.Max(0, TGasPolicy.GetStateGasUsed(in gas) - stateGasFloor);
+        long appliedRefund = Math.Min(amount, refundableStateGas);
+
+        if (appliedRefund > 0)
+        {
+            TGasPolicy.RefundStateGas(ref gas, appliedRefund, stateGasFloor, trackSpillRefund);
+        }
+
+        long pendingRefund = amount - appliedRefund;
+        if (pendingRefund > 0)
+        {
+            // Restored state gas paid by an ancestor frame stays spendable here; the
+            // state-gas-used reduction must propagate upward separately.
+            TGasPolicy.AddStateGasRefundToReservoir(ref gas, pendingRefund, trackSpillRefund);
+            vmState.StateGasRefundAdvanced += pendingRefund;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void IncorporateChildStateGasRefunds(VmState<TGasPolicy> childState)
+    {
+        if (childState.StateGasRefundAdvanced > 0)
+        {
+            long unappliedRefund = TGasPolicy.DiscardStateGas(
+                ref _currentState.Gas,
+                childState.StateGasRefundAdvanced,
+                _currentState.InitialStateGasUsed);
+
+            if (unappliedRefund > 0)
+            {
+                _currentState.StateGasRefundAdvanced += unappliedRefund;
+            }
+
+            childState.StateGasRefundAdvanced = 0;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void RemoveAdvancedStateGasRefund(VmState<TGasPolicy> vmState, ref TGasPolicy gas)
+    {
+        if (vmState.StateGasRefundAdvanced > 0)
+        {
+            TGasPolicy.RemoveStateGasRefundFromReservoir(ref gas, vmState.StateGasRefundAdvanced);
+            vmState.StateGasRefundAdvanced = 0;
+        }
+    }
+
+    /// <summary>
+    /// Prepares the execution environment for the next call frame by updating the current state
+    /// and resetting relevant output fields.
+    /// </summary>
+    /// <param name="callResult">
+    /// The result object from the current call, which contains the state to be executed next.
+    /// </param>
+    /// <param name="previousCallOutput">
+    /// A reference to the buffer holding the previous call's output, which is cleared in preparation for the new call.
+    /// </param>
+    protected void PrepareNextCallFrame(in CallResult callResult, ref ZeroPaddedSpan previousCallOutput)
+    {
+        // Push the current execution state onto the state stack so it can be restored later.
+        _stateStack.Push(_currentState);
+
+        // Transition to the next call frame's state provided by the call result.
+        _currentState = callResult.StateToExecute;
+
+        // Clear the previous call result as the execution context is moving to a new frame.
+        _previousCallResult = null;
+
+        // Reset the return data buffer to ensure no residual data persists across call frames.
+        ReturnDataBuffer = Array.Empty<byte>();
+
+        // Clear the previous call output, preparing for new output data in the next call frame.
+        previousCallOutput = ZeroPaddedSpan.Empty;
+    }
+
+    /// <summary>
+    /// Handles exceptions that occur during the execution of a call frame by restoring the world state,
+    /// reverting known side effects, and either finalizing the transaction (for top-level calls) or
+    /// preparing to resume execution in a parent call frame (for nested calls).
+    /// </summary>
+    /// <param name="callResult">
+    /// The result object that contains the exception type and any output data from the failed call.
+    /// </param>
+    /// <param name="previousCallOutput">
+    /// A reference to the zero-padded span that holds the previous call's output, which is reset on exception.
+    /// </param>
+    /// <returns>
+    /// A <see cref="TransactionSubstate"/> instance if the failure occurred in a top-level call,
+    /// otherwise <c>null</c> to indicate that execution should continue in the parent frame.
+    /// </returns>
+    protected TransactionSubstate HandleException(scoped in CallResult callResult, scoped ref ZeroPaddedSpan previousCallOutput, out bool shouldExit)
+    {
+        // Cache the tracer to minimize repeated field accesses.
+        ITxTracer txTracer = _txTracer;
+
+        // Report the error for action-level tracing if enabled.
+        if (txTracer.IsTracingActions)
+        {
+            txTracer.ReportActionError(callResult.ExceptionType);
+        }
+
+        // Restore the world state to its snapshot before the current call execution.
+        _worldState.Restore(_currentState.Snapshot);
+
+        // Revert any modifications that might have been applied due to the Parity touch bug.
+        RevertParityTouchBugAccount();
+
+        // If this is the top-level call, return a final transaction substate encapsulating the error.
+        // The state-gas reset is performed by TransactionProcessor.Refund (see top-level halt
+        // path above for rationale).
+        if (_currentState.IsTopLevel)
+        {
+            shouldExit = true;
+            return new TransactionSubstate(callResult.ExceptionType, txTracer.IsTracing);
+        }
+
+        _previousCallResult = StatusCode.FailureBytes;
+        bool failedCreate = _currentState.ExecutionType.IsAnyCreate();
+        // Captured before the pop: the parent refunds NEW_ACCOUNT for the halted *CALL's uncreated recipient.
+        bool childNewAccountCharged = _currentState.NewAccountCharged;
+
+        // Reset output destination and clear return data.
+        _previousCallOutputDestination = UInt256.Zero;
+        ReturnDataBuffer = Array.Empty<byte>();
+        previousCallOutput = ZeroPaddedSpan.Empty;
+
+        PopAndRestoreParentState();
+        if (failedCreate)
+        {
+            CreditStateGasRefund(ref _currentState.Gas, TGasPolicy.GetCreateStateCost());
+        }
+        else if (childNewAccountCharged)
+        {
+            CreditStateGasRefund(ref _currentState.Gas, TGasPolicy.GetNewAccountStateCost());
+        }
+
+        // Return null to indicate that the failure was handled and execution should continue in the parent frame.
+        shouldExit = false;
+        return default;
+    }
+
+    /// <summary>
+    /// Executes a precompiled contract operation based on the current execution state.
+    /// If tracing is enabled, reports the precompile action. It then runs the precompile operation,
+    /// checks for failure conditions, and adjusts the execution state accordingly.
+    /// </summary>
+    /// <param name="currentState">The current SAVM state containing execution parameters for the precompile.</param>
+    /// <param name="isTracingActions">
+    /// A boolean indicating whether detailed tracing actions should be reported during execution.
+    /// </param>
+    /// <param name="failure">
+    /// An output parameter that is set to the encountered exception if the precompile fails; otherwise, <c>null</c>.
+    /// </param>
+    /// <param name="substateError">
+    /// An output parameter that is set to detailed error if the precompile fails; otherwise, <c>null</c>.
+    /// </param>
+    /// <returns>
+    /// A <see cref="CallResult"/> containing the results of the precompile execution. In case of a failure,
+    /// returns the default value of <see cref="CallResult"/>.
+    /// </returns>
+    protected virtual CallResult ExecutePrecompile(VmState<TGasPolicy> currentState, bool isTracingActions, out Exception? failure, out string? substateError)
+    {
+        AddTransferLog(currentState);
+
+        // Report the precompile action if tracing is enabled.
+        if (isTracingActions)
+        {
+            _txTracer.ReportAction(
+                TGasPolicy.GetRemainingGas(currentState.Gas),
+                currentState.Env.Value,
+                currentState.From,
+                currentState.To,
+                currentState.Env.InputData,
+                currentState.ExecutionType,
+                true);
+        }
+
+        // Execute the precompile operation with the current state.
+        CallResult callResult = RunPrecompile(currentState);
+
+        // If the precompile did not succeed, handle the failure conditions.
+        if (callResult.PrecompileSuccess == false)
+        {
+            substateError = callResult.SubstateError;
+
+            // If the failure is due to an exception (e.g., out-of-gas), set the corresponding failure exception.
+            if (callResult.IsException)
+            {
+                failure = PrecompileOutOfGasException;
+                goto Failure;
+            }
+
+            // If running a precompile on a top-level call frame, and it fails, assign a general execution failure.
+            if (currentState.IsPrecompile && currentState.IsTopLevel)
+            {
+                failure = VirtualMachineStatics.PrecompileExecutionFailureException;
+                goto Failure;
+            }
+
+            // Otherwise, if no exception but precompile did not succeed, exhaust the remaining gas.
+            TGasPolicy.SetOutOfGas(ref currentState.Gas);
+        }
+
+        // If execution reaches here, the precompile operation is considered successful.
+        failure = null;
+        substateError = null;
+        return callResult;
+
+    Failure:
+        // Return the default CallResult to signal failure, with the failure exception set via the out parameter.
+        return default;
+    }
+
+    /// <summary>
+    /// Whether a STATICCALL into the precompile at <paramref name="codeSource"/> may be executed inline
+    /// instead of building a full child call frame.
+    /// </summary>
+    /// <remarks>
+    /// The Parity touch-bug account (RIPEMD-160) is excluded because <see cref="RunPrecompile"/> records its
+    /// SIP-161 empty-account deletion, which the inline path does not replay.
+    /// </remarks>
+    protected internal virtual bool CanExecutePrecompileCallDirectly(IPrecompile precompile, Address codeSource) =>
+        !codeSource.Equals(_parityTouchBugAccount.Address);
+
+    /// <summary>
+    /// Runs a precompile outside of a call frame for the inline STATICCALL fast path, applying the same
+    /// exception handling as <see cref="ExecutePrecompileCall"/>.
+    /// </summary>
+    /// <returns><c>false</c> when the precompile threw a non-fatal exception; otherwise <c>true</c> with its result in <paramref name="output"/>.</returns>
+    internal bool TryRunPrecompileDirectly(IPrecompile precompile, ReadOnlyMemory<byte> callData, IReleaseSpec spec, out Result<byte[]> output)
+    {
+        try
+        {
+            output = precompile.Run(callData, spec);
+            return true;
+        }
+        catch (Exception exception) when (exception is DllNotFoundException or { InnerException: DllNotFoundException })
+        {
+            if (_logger.IsError) LogMissingDependency(precompile, (exception as DllNotFoundException ?? exception.InnerException as DllNotFoundException)!);
+            Environment.Exit(ExitCodes.MissingPrecompile);
+            throw; // Unreachable
+        }
+        catch (Exception exception)
+        {
+            if (_logger.IsError) LogExecutionException(precompile, exception);
+            output = default;
+            return false;
+        }
+    }
+
+    protected void TraceTransactionActionStart(VmState<TGasPolicy> currentState)
+    {
+        _txTracer.ReportAction(TGasPolicy.GetRemainingGas(currentState.Gas),
+            currentState.Env.Value,
+            currentState.From,
+            currentState.To,
+            currentState.ExecutionType.IsAnyCreate()
+                ? currentState.Env.CodeInfo.Code
+                : currentState.Env.InputData,
+            currentState.ExecutionType);
+
+        if (_txTracer.IsTracingCode) _txTracer.ReportByteCode(currentState.Env.CodeInfo?.Code ?? default);
+    }
+
+    /// <summary>
+    /// Prepares the opcode methods to be used during SAVM execution,
+    /// based on the provided release specification.
+    /// </summary>
+    /// <typeparam name="TTracingInst">
+    /// A value type implementing <see cref="IFlag"/> that indicates whether tracing-specific opcodes
+    /// should be used.
+    /// </typeparam>
+    /// <param name="spec">
+    /// The release specification, which is used to prepare the appropriate opcodes.
+    /// </param>
+    private partial void PrepareOpcodes<TTracingInst>(IReleaseSpec spec) where TTracingInst : struct, IFlag;
+
+    /// <summary>
+    /// Reports the final outcome of a transaction action to the transaction tracer, taking into account
+    /// various conditions such as exceptions, reverts, and contract creation flows. For contract creation,
+    /// the method adjusts the available gas by the code deposit cost and validates the deployed code.
+    /// </summary>
+    /// <param name="currentState">
+    /// The current SAVM state, which contains the available gas, execution type, and target address.
+    /// </param>
+    /// <param name="spec">
+    /// The release specification that provides rules and parameters such as code deposit cost and code validation.
+    /// </param>
+    /// <param name="callResult">
+    /// The result of the executed call, including output bytes, exception and revert flags, and additional metadata.
+    /// </param>
+    protected void TraceTransactionActionEnd(VmState<TGasPolicy> currentState, in CallResult callResult)
+    {
+        IReleaseSpec spec = BlockExecutionContext.Spec;
+        // Calculate the gas cost required for depositing the contract code based on the length of the output.
+        ulong regularDepositCost = 0;
+        long stateDepositCost = 0;
+        ulong codeDepositGasCost = 0;
+        bool hasEnoughGasForCodeDeposit = true;
+        if (currentState.ExecutionType.IsAnyCreate())
+        {
+            if (CodeDepositHandler.CalculateCost(spec, callResult.Output.Length, in currentState.Gas, out regularDepositCost, out stateDepositCost))
+            {
+                ulong remainingGas = TGasPolicy.GetRemainingGas(currentState.Gas);
+                ulong stateSpill = TGasPolicy.CalculateStateGasSpill(in currentState.Gas, stateDepositCost);
+                codeDepositGasCost = regularDepositCost + stateSpill;
+                hasEnoughGasForCodeDeposit = remainingGas >= regularDepositCost
+                    && remainingGas - regularDepositCost >= stateSpill;
+            }
+            else
+            {
+                codeDepositGasCost = ulong.MaxValue;
+                hasEnoughGasForCodeDeposit = false;
+            }
+        }
+
+        // Cache the output bytes for reuse in the tracing reports.
+        ReadOnlyMemory<byte> outputBytes = callResult.Output;
+
+        // If an exception occurred during execution, report the error immediately.
+        if (callResult.IsException)
+        {
+            _txTracer.ReportActionError(callResult.ExceptionType);
+        }
+        // If the call is set to revert, report a revert action, adjusting the reported gas for creation operations.
+        else if (callResult.ShouldRevert)
+        {
+            // For creation operations, subtract the code deposit cost from the available gas; otherwise, use full gas.
+            ulong gasAvailable = TGasPolicy.GetRemainingGas(currentState.Gas);
+            ulong reportedGas = currentState.ExecutionType.IsAnyCreate() ? gasAvailable.SaturatingSub(codeDepositGasCost) : gasAvailable;
+            _txTracer.ReportActionRevert(reportedGas, outputBytes);
+        }
+        // Process contract creation flows.
+        else if (currentState.ExecutionType.IsAnyCreate())
+        {
+            ulong gasAvailable = TGasPolicy.GetRemainingGas(currentState.Gas);
+            // If available gas is insufficient to cover the code deposit cost...
+            if (!hasEnoughGasForCodeDeposit)
+            {
+                // When the spec mandates charging for top-level creation, report an out-of-gas error.
+                if (spec.ChargeForTopLevelCreate)
+                {
+                    _txTracer.ReportActionError(SavmExceptionType.OutOfGas);
+                }
+                // Otherwise, report a successful action end with the remaining gas.
+                else
+                {
+                    _txTracer.ReportActionEnd(gasAvailable, currentState.To, outputBytes);
+                }
+            }
+            // If the generated code is invalid (e.g., violates SIP-3541 by starting with 0xEF), report an invalid code error.
+            else if (CodeDepositHandler.CodeIsInvalid(spec, outputBytes))
+            {
+                _txTracer.ReportActionError(SavmExceptionType.InvalidCode);
+            }
+            // In the successful contract creation case, deduct the code deposit gas cost and report a normal action end.
+            else
+            {
+                _txTracer.ReportActionEnd(gasAvailable - codeDepositGasCost, currentState.To, outputBytes);
+            }
+        }
+        // For non-creation calls, report the action end using the current available gas and the standard return data.
+        else
+        {
+            _txTracer.ReportActionEnd(TGasPolicy.GetRemainingGas(currentState.Gas), ReturnDataBuffer);
+        }
+    }
+
+    private void RevertParityTouchBugAccount()
+    {
+        if (_parityTouchBugAccount.ShouldDelete)
+        {
+            if (_worldState.AccountExists(_parityTouchBugAccount.Address))
+            {
+                _worldState.AddToBalance(_parityTouchBugAccount.Address, UInt256.Zero, BlockExecutionContext.Spec);
+            }
+
+            _parityTouchBugAccount.ShouldDelete = false;
+        }
+    }
+
+    private CallResult RunPrecompile(VmState<TGasPolicy> state)
+    {
+        ReadOnlyMemory<byte> callData = state.Env.InputData;
+        ref readonly UInt256 transferValue = ref state.ExecutionType.GetBalanceCredit(in state.Env.Value);
+        TGasPolicy gas = state.Gas;
+
+        IPrecompile precompile = state.Env.CodeInfo.Precompile!;
+
+        IReleaseSpec spec = BlockExecutionContext.Spec;
+
+        bool wasCreated = _worldState.AddToBalanceAndCreateIfNotExists(state.Env.ExecutingAccount, in transferValue, spec);
+
+        // https://github.com/sila-chain/SIPs/blob/master/SIPS/sip-161.md
+        // An additional issue was found in Parity,
+        // where the Parity client incorrectly failed
+        // to revert empty account deletions in a more limited set of contexts
+        // involving out-of-gas calls to precompiled contracts;
+        // the new Geth behavior matches Parity's,
+        // and empty accounts will cease to be a source of concern in general
+        // in about one week once the state clearing process finishes.
+        if (!wasCreated &&
+            transferValue.IsZero &&
+            spec.ClearEmptyAccountWhenTouched &&
+            state.Env.ExecutingAccount.Equals(_parityTouchBugAccount.Address))
+        {
+            _parityTouchBugAccount.ShouldDelete = true;
+        }
+
+        // The policy reads the precompile's own base/data cost (with the overflow guard inside).
+        if (!TGasPolicy.ConsumePrecompileGas(ref gas, precompile, callData, spec))
+        {
+            return new(default, precompileSuccess: false, shouldRevert: true, SavmExceptionType.OutOfGas);
+        }
+
+        state.Gas = gas;
+
+        return ExecutePrecompileCall(state, precompile, callData, spec);
+    }
+
+    /// <summary>
+    /// Executes a precompile's <see cref="IPrecompile.Run"/> method after base and data gas have been deducted.
+    /// Subclasses may override this to support precompile variants that compute and report their own dynamic
+    /// gas consumption after execution.
+    /// </summary>
+    protected virtual CallResult ExecutePrecompileCall(
+        VmState<TGasPolicy> state,
+        IPrecompile precompile,
+        ReadOnlyMemory<byte> callData,
+        IReleaseSpec spec)
+    {
+        try
+        {
+            Result<byte[]> output = precompile.Run(callData, spec);
+            bool success = output;
+            return new(
+                success ? output.Data : [],
+                precompileSuccess: success,
+                shouldRevert: !success,
+                exceptionType: !success ? SavmExceptionType.PrecompileFailure : SavmExceptionType.None
+            )
+            {
+                SubstateError = success ? null : GetErrorString(precompile, output.Error)
+            };
+        }
+        catch (Exception exception) when (exception is DllNotFoundException or { InnerException: DllNotFoundException })
+        {
+            if (_logger.IsError) LogMissingDependency(precompile, exception as DllNotFoundException ?? exception.InnerException as DllNotFoundException);
+            Environment.Exit(ExitCodes.MissingPrecompile);
+            throw; // Unreachable
+        }
+        catch (Exception exception)
+        {
+            if (_logger.IsError) LogExecutionException(precompile, exception);
+            return new(default, precompileSuccess: false, shouldRevert: true);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    protected void LogExecutionException(IPrecompile precompile, Exception exception)
+        => _logger.Error($"Precompiled contract ({precompile.GetType()}) execution exception", exception);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    protected void LogMissingDependency(IPrecompile precompile, DllNotFoundException exception)
+        => _logger.Error($"Failed to load one of the dependencies of {precompile.GetType()} precompile", exception);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    protected static string GetErrorString(IPrecompile precompile, string? error)
+        => $"Precompile {precompile.GetStaticName()} failed with error: {error}";
+
+    /// <summary>
+    /// Executes an SAVM call by preparing the execution environment, including account balance adjustments,
+    /// stack initialization, and memory updates. It then dispatches the bytecode execution using a
+    /// specialized interpreter that is optimized at compile time based on the tracing instructions flag.
+    /// </summary>
+    /// <typeparam name="TTracingInst">
+    /// A struct implementing <see cref="IFlag"/> that indicates, via a compile-time constant,
+    /// whether tracing-specific opcodes and behavior should be used.
+    /// </typeparam>
+    /// <param name="vmState">
+    /// The current SAVM state containing the execution environment, gas, memory, and stack information.
+    /// </param>
+    /// <param name="previousCallResult">
+    /// An optional read-only memory buffer containing the output of a previous call; if provided, its bytes
+    /// will be pushed onto the stack for further processing.
+    /// </param>
+    /// <param name="previousCallOutput">
+    /// A zero-padded span containing output from the previous call used for updating the memory state.
+    /// </param>
+    /// <param name="previousCallOutputDestination">
+    /// The memory destination address where the previous call's output should be stored.
+    /// </param>
+    /// <returns>
+    /// A <see cref="CallResult"/> that encapsulates the result of executing the SAVM call, including success,
+    /// failure, or out-of-gas conditions.
+    /// </returns>
+    /// <remarks>
+    /// The generic struct parameter is used to eliminate runtime if-statements via compile-time evaluation
+    /// of <c>TTracingInst.IsActive</c>.
+    /// </remarks>
+    [SkipLocalsInit]
+    protected CallResult ExecuteCall<TTracingInst>(
+        ReadOnlyMemory<byte>? previousCallResult,
+        ZeroPaddedSpan previousCallOutput,
+        scoped in UInt256 previousCallOutputDestination)
+        where TTracingInst : struct, IFlag
+    {
+        VmState<TGasPolicy> vmState = _currentState;
+        // Obtain a reference to the execution environment for convenience.
+        ExecutionEnvironment env = vmState.Env;
+
+        // If this is the first call frame (not a continuation), adjust account balances and nonces.
+        if (!vmState.IsContinuation)
+        {
+            IReleaseSpec spec = BlockExecutionContext.Spec;
+            // Ensure the executing account has sufficient balance and exists in the world state.
+            _worldState.AddToBalanceAndCreateIfNotExists(env.ExecutingAccount, vmState.ExecutionType, in env.Value, spec);
+
+            // For contract creation calls, increment the nonce if the specification requires it.
+            if (vmState.ExecutionType.IsAnyCreate() && spec.ClearEmptyAccountWhenTouched)
+            {
+                _worldState.IncrementNonce(env.ExecutingAccount);
+            }
+        }
+
+        ReadOnlySpan<byte> codeSpan = env.CodeInfo.CodeSpan;
+        // If no machine code is present, treat the call as empty.
+        if (codeSpan.Length == 0)
+        {
+            if (!vmState.IsTopLevel)
+            {
+                MetricsCounters.IncrementEmptyCalls();
+            }
+            goto Empty;
+        }
+
+        // Initialize the internal stacks for the current call frame.
+        SavmStack stack;
+        if (TTracingInst.IsActive)
+        {
+            vmState.InitializeStacks(_txTracer, codeSpan, out stack);
+        }
+        else
+        {
+            vmState.InitializeStacks(codeSpan, out stack);
+        }
+
+        // Operate on the frame gas by reference so exceptional halts keep the latest
+        // gas/state-gas accounting without needing interpreter-wide exception handling.
+        ref TGasPolicy gas = ref vmState.Gas;
+
+        // If a previous call result exists, push its bytes onto the stack.
+        if (previousCallResult is not null)
+        {
+            SavmExceptionType pushResult = stack.PushBytes<TTracingInst>(previousCallResult.Value.Span);
+            if (pushResult != SavmExceptionType.None) return new(pushResult);
+
+            // Report the remaining gas if tracing instructions are enabled.
+            if (TTracingInst.IsActive)
+            {
+                _txTracer.ReportOperationRemainingGas(TGasPolicy.GetRemainingGas(vmState.Gas));
+            }
+        }
+
+        // If there is previous call output, update the memory cost and save the output.
+        if (previousCallOutput.Length > 0)
+        {
+            // Use a local variable for the destination to simplify passing it by reference.
+            UInt256 localPreviousDest = previousCallOutputDestination;
+
+            // Attempt to update the memory cost; if insufficient gas is available, jump to the out-of-gas handler.
+            if (!TGasPolicy.UpdateMemoryCost(ref gas, in localPreviousDest, (ulong)previousCallOutput.Length, ref vmState.Memory))
+            {
+                goto OutOfGas;
+            }
+
+            vmState.Memory.SaveAfterGas(in localPreviousDest, in previousCallOutput);
+        }
+
+        // Dispatch the bytecode interpreter.
+        // The second generic parameter is selected based on whether the transaction tracer is cancelable:
+        // - OffFlag is used when cancellation is not needed.
+        // - OnFlag is used when cancellation is enabled.
+        // This leverages the compile-time evaluation of TTracingInst to optimize away runtime checks.
+        return _txTracer.IsCancelable switch
+        {
+            false => RunByteCode<TTracingInst, OffFlag>(ref stack, ref gas),
+            true => RunByteCode<TTracingInst, OnFlag>(ref stack, ref gas),
+        };
+
+    Empty:
+        // Return an empty CallResult if there is no machine code to execute.
+        return CallResult.Empty();
+
+    OutOfGas:
+        // Return an out-of-gas CallResult if updating the memory cost fails.
+        return new(SavmExceptionType.OutOfGas);
+    }
+
+    /// <summary>
+    /// Runs the frame's bytecode through the dispatch loop (see VirtualMachine.DispatchSpecialized),
+    /// lifting the two opcode-availability flags it gates on into compile-time <see cref="IFlag"/>
+    /// type args so the JIT folds them. One loop body serves all forks.
+    /// </summary>
+    [SkipLocalsInit]
+    protected virtual CallResult RunByteCode<TTracingInst, TCancelable>(
+        scoped ref SavmStack stack,
+        scoped ref TGasPolicy gas)
+        where TTracingInst : struct, IFlag
+        where TCancelable : struct, IFlag
+    {
+        IReleaseSpec spec = Spec;
+        // Engage the stream only in cancelable call contexts (sil_call/estimateGas/simulate). Block
+        // processing runs a non-cancelable tracer, where the stream is pure overhead with no compute
+        // payoff; gating it out there removes both the throughput regression and the retained StreamOp[].
+        if (spec.IncludePush0Instruction && StreamInterpreter.Enabled && !TTracingInst.IsActive
+            && (TCancelable.IsActive || StreamInterpreter.ForceAllContexts)
+            && VmState.Env.CodeInfo.GetOrBuildStream() is { } stream)
+        {
+            return RunStream<TCancelable>(stream, ref stack, ref gas);
+        }
+
+        return (spec.ShiftOpcodesEnabled, spec.IncludePush0Instruction) switch
+        {
+            (true, true) => RunByteCodeCore<TTracingInst, TCancelable, OnFlag, OnFlag>(ref stack, ref gas),
+            (true, false) => RunByteCodeCore<TTracingInst, TCancelable, OnFlag, OffFlag>(ref stack, ref gas),
+            (false, true) => RunByteCodeCore<TTracingInst, TCancelable, OffFlag, OnFlag>(ref stack, ref gas),
+            (false, false) => RunByteCodeCore<TTracingInst, TCancelable, OffFlag, OffFlag>(ref stack, ref gas),
+        };
+    }
+
+
+    private CallResult GetFailureReturn(ulong gasAvailable, SavmExceptionType exceptionType)
+    {
+        if (_txTracer.IsTracingInstructions) EndInstructionTraceError(gasAvailable, exceptionType);
+
+        return exceptionType switch
+        {
+            SavmExceptionType.OutOfGas or
+            SavmExceptionType.BadInstruction or
+            SavmExceptionType.StaticCallViolation or
+            SavmExceptionType.StackOverflow or
+            SavmExceptionType.StackUnderflow or
+            SavmExceptionType.InvalidJumpDestination or
+            SavmExceptionType.AccessViolation => new(exceptionType),
+            _ => throw new ArgumentOutOfRangeException(nameof(exceptionType), exceptionType, "")
+        };
+    }
+
+    private void UpdateCurrentState(int pc, in TGasPolicy gas, int stackHead)
+    {
+        VmState<TGasPolicy> state = VmState;
+
+        state.ProgramCounter = pc;
+        state.Gas = gas;
+        state.DataStackHead = stackHead;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void StartInstructionTrace(Instruction instruction, ulong gasAvailable, int programCounter, in SavmStack stackValue)
+    {
+        VmState<TGasPolicy> vmState = VmState;
+        _txTracer.StartOperation(programCounter, instruction, gasAvailable, vmState.Env);
+        if (_txTracer.IsTracingMemory)
+        {
+            _txTracer.SetOperationMemory(vmState.Memory.GetTrace());
+            _txTracer.SetOperationMemorySize(vmState.Memory.Size);
+        }
+
+        if (_txTracer.IsTracingStack)
+        {
+            _txTracer.SetOperationStack(new TraceStack(vmState.MemoryStacks(stackValue.Head)));
+        }
+
+        if (_txTracer.IsTracingReturnData)
+        {
+            _txTracer.SetOperationReturnData(ReturnDataBuffer);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal void EndInstructionTrace(ulong gasAvailable) => _txTracer.ReportOperationRemainingGas(gasAvailable);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void EndInstructionTraceError(ulong gasAvailable, SavmExceptionType savmExceptionType)
+    {
+        _txTracer.ReportOperationRemainingGas(gasAvailable);
+        _txTracer.ReportOperationError(savmExceptionType);
+    }
+
+    internal void AddLog(LogEntry logEntry)
+    {
+        VmState.AccessTracker.Logs.Add(logEntry);
+
+        // Optionally report the log if tracing is enabled.
+        if (TxTracer.IsTracingLogs)
+        {
+            TxTracer.ReportLog(logEntry);
+        }
+    }
+
+    private void AddTransferLog(VmState<TGasPolicy> currentState)
+    {
+        // DELEGATECALL: no value transfer (inherits from parent)
+        // CALLCODE: value is transferred from ExecutingAccount to ExecutingAccount (self-transfer), so no log
+        if (currentState.ExecutionType is not (ExecutionType.DELEGATECALL or ExecutionType.CALLCODE))
+        {
+            // Runtime check acceptable here — called once per frame entry, not per instruction.
+            if (Spec.IsSip7708Enabled && currentState.Env.Value != 0UL && currentState.From != currentState.To)
+                AddLog(TransferLog.CreateTransfer(currentState.From, currentState.To, currentState.Env.Value));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void AddTransferLog<TSip7708>(Address from, Address to, in UInt256 value)
+        where TSip7708 : struct, IFlag
+    {
+        if (TSip7708.IsActive && !value.IsZero && from != to)
+            AddLog(TransferLog.CreateTransfer(from, to, value));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void AddSelfDestructLog<TSip8037, TSip7708>(Address executingAccount, Address inheritor, in UInt256 value)
+        where TSip8037 : struct, IFlag
+        where TSip7708 : struct, IFlag
+    {
+        if (!TSip7708.IsActive || value.IsZero) return;
+
+        if (executingAccount == inheritor)
+        {
+            AddLog(TSip8037.IsActive
+                ? TransferLog.CreateBurn(executingAccount, value)
+                : TransferLog.CreateSelfDestruct(executingAccount, value));
+        }
+        else
+        {
+            AddLog(TransferLog.CreateTransfer(executingAccount, inheritor, value));
+        }
+    }
+}
+
+/// <summary>
+/// Non-generic VirtualMachine for backward compatibility with SilaGasPolicy.
+/// </summary>
+public sealed class VirtualMachine(
+    IBlockhashProvider? blockHashProvider,
+    ISpecProvider? specProvider,
+    ILogManager? logManager) : VirtualMachine<SilaGasPolicy>(blockHashProvider, specProvider, logManager), IVirtualMachine;

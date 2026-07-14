@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindSil/core-scripts/refs/heads/main/schemas/config.json",
+  "Init": {
+    "ChainSpecPath": "chainspec/worldchain-sepolia.json.zst",
+    "GenesisHash": "0xf1deb67ee953f94d8545d2647918687fa8ba1f30fa6103771f11b7c483984070",
+    "BaseDbPath": "nethermind_db/worldchain-sepolia",
+    "LogFileName": "worldchain-sepolia.log"
+  },
+  "TxPool": {
+    "BlobsSupport": "Disabled"
+  },
+  "Sync": {
+    "FastSync": true,
+    "SnapSync": true,
+    "PivotNumber": 31620000,
+    "PivotHash": "0x7f4231aa751afd2d09308567978d28a947bd9606d0f6fc2d4a86a7f2148fa493"
+  },
+  "Discovery": {
+    "DiscoveryVersion": "V5"
+  },
+  "JsonRpc": {
+    "Enabled": true,
+    "Port": 8545,
+    "EnginePort": 8551
+  },
+  "Pruning": {
+    "PruningBoundary": 256
+  },
+  "Blocks": {
+    "SecondsPerSlot": 2
+  },
+  "Merge": {
+    "Enabled": true
+  },
+  "Optimism": {
+    "SequencerUrl": "https://worldchain-sepolia-sequencer.g.alchemy.com"
+  }
+}

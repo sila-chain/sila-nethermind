@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NethermindSil/core-scripts/refs/heads/main/schemas/config.json",
+  "Init": {
+    "ChainSpecPath": "chainspec/worldchain-sila-mainnet.json.zst",
+    "GenesisHash": "0x70d316d2e0973b62332ba2e9768dd7854298d7ffe77f0409ffdb8d859f2d3fa3",
+    "BaseDbPath": "nethermind_db/worldchain-sila-mainnet",
+    "LogFileName": "worldchain-sila-mainnet.log"
+  },
+  "TxPool": {
+    "BlobsSupport": "Disabled"
+  },
+  "Sync": {
+    "FastSync": true,
+    "SnapSync": true,
+    "PivotNumber": 32230000,
+    "PivotHash": "0xeb6c989e298b5dea35a3a27e7e2dd6b14ec8a7b09441d440017598aae09d410b"
+  },
+  "Discovery": {
+    "DiscoveryVersion": "V5"
+  },
+  "JsonRpc": {
+    "Enabled": true,
+    "Port": 8545,
+    "EnginePort": 8551
+  },
+  "Pruning": {
+    "PruningBoundary": 256
+  },
+  "Blocks": {
+    "SecondsPerSlot": 2
+  },
+  "Merge": {
+    "Enabled": true
+  },
+  "Optimism": {
+    "SequencerUrl": "https://worldchain-sila-mainnet-sequencer.g.alchemy.com"
+  }
+}

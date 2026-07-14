@@ -1,0 +1,74 @@
+// SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Core;
+using Nethermind.Core.Specs;
+using Nethermind.Int256;
+
+namespace Nethermind.Optimism;
+
+/// <remarks>
+/// See <see href="https://specs.optimism.io/protocol/holocene/exec-engine.html#base-fee-computation"/>
+/// </remarks>
+public sealed class OptimismBaseFeeCalculator(
+    ulong? holoceneTimestamp,
+    ulong? jovianTimestamp,
+    IBaseFeeCalculator baseFeeCalculator
+) : IBaseFeeCalculator
+{
+    public UInt256 Calculate(BlockHeader parent, ISip1559Spec specFor1559)
+    {
+        ISip1559Spec spec = specFor1559;
+        SIP1559Parameters sip1559Params = default;
+
+        if (parent.Timestamp >= holoceneTimestamp)
+        {
+            // NOTE: This operation should never fail since headers should be valid at this point.
+            if (!parent.TryDecodeSIP1559Parameters(out sip1559Params, out string? error))
+            {
+                throw new InvalidOperationException($"{nameof(BlockHeader)} was not properly validated: {error}");
+            }
+
+            spec = new OverridableSip1559Spec(specFor1559)
+            {
+                ElasticityMultiplier = sip1559Params.Elasticity,
+                BaseFeeMaxChangeDenominator = sip1559Params.Denominator
+            };
+        }
+
+        if (parent.Timestamp >= jovianTimestamp)
+        {
+            if (parent.BlobGasUsed is null)
+                throw new InvalidOperationException($"{nameof(parent.BlobGasUsed)} does not store DA footprint in post-Jovian block.");
+
+            ulong daFootprint = parent.BlobGasUsed.Value;
+
+            // Override gas used for calculation if the DA footprint is larger
+            UInt256 baseFee = daFootprint > parent.GasUsed
+                ? CalculateWithGasUsedOverride(parent, spec, daFootprint)
+                : baseFeeCalculator.Calculate(parent, spec);
+
+            if (sip1559Params.MinBaseFee > 0)
+                baseFee = UInt256.Max(baseFee, sip1559Params.MinBaseFee);
+
+            return baseFee;
+        }
+
+        return baseFeeCalculator.Calculate(parent, spec);
+    }
+
+    private UInt256 CalculateWithGasUsedOverride(BlockHeader parent, ISip1559Spec spec, ulong gasOverride)
+    {
+        ulong prevGasUsed = parent.GasUsed;
+        try
+        {
+            parent.GasUsed = gasOverride;
+            return baseFeeCalculator.Calculate(parent, spec);
+        }
+        finally
+        {
+            parent.GasUsed = prevGasUsed;
+        }
+    }
+}

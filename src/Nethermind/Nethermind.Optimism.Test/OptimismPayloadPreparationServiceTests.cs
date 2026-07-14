@@ -1,0 +1,108 @@
+// SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Threading.Tasks;
+using System.Collections.Generic;
+using NUnit.Framework;
+using NSubstitute;
+using Nethermind.Savm.State;
+using Nethermind.Optimism.Rpc;
+using Nethermind.Merge.Plugin.BlockProduction;
+using Nethermind.Logging;
+using Nethermind.Int256;
+using Nethermind.Savm.Tracing;
+using Nethermind.Core.Timers;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Core.Specs;
+using Nethermind.Core.Crypto;
+using Nethermind.Core;
+using Nethermind.Consensus.Transactions;
+using Nethermind.Consensus.Processing;
+using Nethermind.Consensus;
+using Nethermind.Config;
+using Nethermind.Blockchain;
+using Nethermind.Crypto;
+using System.Threading;
+using Nethermind.Consensus.Producers;
+using Nethermind.TxPool;
+
+namespace Nethermind.Optimism.Test;
+
+[Parallelizable(ParallelScope.All)]
+public class OptimismPayloadPreparationServiceTests
+{
+    private static IEnumerable<(OptimismPayloadAttributes, SIP1559Parameters?)> TestCases()
+    {
+        foreach (bool noTxPool in (bool[])[true, false])
+        {
+            // V0
+            yield return (new() { SIP1559Params = [0, 0, 0, 8, 0, 0, 0, 2], NoTxPool = noTxPool }, new SIP1559Parameters(0, 8, 2));
+            yield return (new() { SIP1559Params = [0, 0, 0, 2, 0, 0, 0, 2], NoTxPool = noTxPool }, new SIP1559Parameters(0, 2, 2));
+            yield return (new() { SIP1559Params = [0, 0, 0, 2, 0, 0, 0, 10], NoTxPool = noTxPool }, new SIP1559Parameters(0, 2, 10));
+            yield return (new() { SIP1559Params = [0, 0, 0, 0, 0, 0, 0, 0], NoTxPool = noTxPool }, new SIP1559Parameters(0, 250, 6));
+
+            // V1
+            yield return (new() { SIP1559Params = [0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0], NoTxPool = noTxPool }, new SIP1559Parameters(1, 8, 2, 0));
+            yield return (new() { SIP1559Params = [0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 255], NoTxPool = noTxPool }, new SIP1559Parameters(1, 2, 2, 255));
+            yield return (new() { SIP1559Params = [0, 0, 0, 2, 0, 0, 0, 10, 255, 255, 255, 255, 255, 255, 255, 255], NoTxPool = noTxPool }, new SIP1559Parameters(1, 2, 10, ulong.MaxValue));
+            yield return (new() { SIP1559Params = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], NoTxPool = noTxPool }, new SIP1559Parameters(1, 250, 6, 0));
+        }
+    }
+    [TestCaseSource(nameof(TestCases))]
+    public async Task Writes_SIP1559Params_Into_HeaderExtraData((OptimismPayloadAttributes Attributes, SIP1559Parameters? ExpectedSIP1559Parameters) testCase)
+    {
+        BlockHeader parent = Build.A.BlockHeader.TestObject;
+
+        IOptimismReleaseSpec releaseSpec = OptimismReleaseSpecSubstitute.Create();
+        releaseSpec.IsOpHoloceneEnabled.Returns(true);
+        releaseSpec.BaseFeeMaxChangeDenominator.Returns((UInt256)250);
+        releaseSpec.ElasticityMultiplier.Returns(6UL);
+        ISpecProvider? specProvider = Substitute.For<ISpecProvider>();
+        specProvider.GetSpec(parent).Returns(releaseSpec);
+
+        IWorldState? stateProvider = Substitute.For<IWorldState>();
+        stateProvider.HasStateForBlock(Arg.Any<BlockHeader>()).Returns(true);
+
+        Block block = Build.A.Block
+            .WithExtraData([])
+            .TestObject;
+        IBlockchainProcessor processor = Substitute.For<IBlockchainProcessor>();
+        processor.Process(Arg.Any<Block>(), ProcessingOptions.ProducingBlock, Arg.Any<IBlockTracer>(), Arg.Any<CancellationToken>()).Returns(block);
+
+        OptimismPayloadPreparationService service = new(
+            blockProducer: new PostMergeBlockProducer(
+                processor: processor,
+                specProvider: specProvider,
+                stateProvider: stateProvider,
+                txSource: Substitute.For<ITxSource>(),
+                blockTree: Substitute.For<IBlockTree>(),
+                gasLimitCalculator: Substitute.For<IGasLimitCalculator>(),
+                sealEngine: Substitute.For<ISealEngine>(),
+                timestamper: Substitute.For<ITimestamper>(),
+                blocksConfig: Substitute.For<IBlocksConfig>(),
+                logManager: TestLogManager.Instance
+            ),
+            txPool: Substitute.For<ITxPool>(),
+            specProvider: specProvider,
+            blockImprovementContextFactory: NoBlockImprovementContextFactory.Instance,
+            blocksConfig: new BlocksConfig
+            {
+                SecondsPerSlot = 1
+            },
+            timerFactory: Substitute.For<ITimerFactory>(),
+            logManager: TestLogManager.Instance
+        );
+
+        testCase.Attributes.PrevRandao = Hash256.Zero;
+        testCase.Attributes.SuggestedFeeRecipient = TestItem.AddressA;
+
+        string payloadId = service.StartPreparingPayload(parent, testCase.Attributes);
+        IBlockProductionContext context = (await service.GetPayload(payloadId))!;
+        Block currentBestBlock = context.CurrentBestBlock!;
+
+        Assert.That(currentBestBlock, Is.EqualTo(block));
+        Assert.That(currentBestBlock.Header.TryDecodeSIP1559Parameters(out SIP1559Parameters parameters, out _), Is.True);
+        Assert.That(parameters, Is.EqualTo(testCase.ExpectedSIP1559Parameters));
+        Assert.That(currentBestBlock.Header.Hash, Is.EqualTo(currentBestBlock.Header.CalculateHash()));
+    }
+}

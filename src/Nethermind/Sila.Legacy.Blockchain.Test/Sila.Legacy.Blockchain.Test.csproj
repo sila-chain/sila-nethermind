@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="../tests.props" />
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\tests\LegacyTests\SilaCancun\GeneralStateTests\st*\**\*.*">
+      <Link>%(RecursiveDir)%(FileName)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\tests\LegacyTests\SilaCancun\GeneralStateTests\SilaCancun\st*\**\*.*">
+      <Link>%(RecursiveDir)%(FileName)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\tests\LegacyTests\SilaCancun\GeneralStateTests\SilaShanghai\st*\**\*.*">
+      <Link>%(RecursiveDir)%(FileName)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </EmbeddedResource>
+  </ItemGroup>
+  
+  <ItemGroup>
+    <ProjectReference Include="..\Sila.Test.Base\Sila.Test.Base.csproj" />
+  </ItemGroup>
+
+</Project>

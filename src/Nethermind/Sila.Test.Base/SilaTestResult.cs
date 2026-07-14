@@ -1,0 +1,58 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Text.Json.Serialization;
+using Nethermind.Core.Crypto;
+
+namespace Sila.Test.Base
+{
+    public class SilaTestResult
+    {
+        public SilaTestResult(string? name, string? fork, bool pass)
+        {
+            Name = name ?? "unnamed";
+            Fork = fork ?? "unknown";
+            Pass = pass;
+        }
+
+        public SilaTestResult(string? name, string? fork, string loadFailure)
+        {
+            Name = name ?? "unnamed";
+            Fork = fork ?? "unknown";
+            Pass = false;
+            LoadFailure = loadFailure;
+            Error = loadFailure;
+        }
+
+        public SilaTestResult(string? name, string? loadFailure)
+            : this(name, null, loadFailure)
+        {
+        }
+
+        [JsonIgnore]
+        public string? LoadFailure { get; set; }
+        public string Name { get; set; }
+        public bool Pass { get; set; }
+        public string Fork { get; set; }
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? Error { get; set; }
+
+        [JsonIgnore]
+        public double TimeInMs { get; set; }
+
+        /// <summary>
+        /// Post-execution state root. Only populated by state tests; blockchain/engine and
+        /// transaction results leave it null, so the field is omitted from their JSON.
+        /// </summary>
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public Hash256? StateRoot { get; set; }
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public Hash256? LastBlockHash { get; set; }
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? LastPayloadStatus { get; set; }
+
+    }
+}

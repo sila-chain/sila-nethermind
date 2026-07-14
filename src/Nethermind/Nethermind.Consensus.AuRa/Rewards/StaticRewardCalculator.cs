@@ -1,0 +1,51 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using System.Linq;
+using Nethermind.Consensus.Rewards;
+using Nethermind.Core;
+using Nethermind.Int256;
+
+namespace Nethermind.Consensus.AuRa.Rewards
+{
+    public class StaticRewardCalculator(IDictionary<ulong, UInt256>? blockRewards) : IRewardCalculator
+    {
+        private readonly IList<BlockRewardInfo> _blockRewards = CreateBlockRewards(blockRewards);
+
+        public BlockReward[] CalculateRewards(Block block)
+        {
+            _blockRewards.TryGetForActivation(block.Number, out BlockRewardInfo blockReward);
+            return new[] { new BlockReward(block.Beneficiary, blockReward.Reward) };
+        }
+
+        private static IList<BlockRewardInfo> CreateBlockRewards(IDictionary<ulong, UInt256>? blockRewards)
+        {
+            List<BlockRewardInfo> blockRewardInfos = [];
+            if (blockRewards?.Count > 0)
+            {
+                if (blockRewards.First().Key > 0)
+                {
+                    blockRewardInfos.Add(new BlockRewardInfo(0, 0));
+                }
+                foreach (KeyValuePair<ulong, UInt256> threshold in blockRewards)
+                {
+                    blockRewardInfos.Add(new BlockRewardInfo(threshold.Key, threshold.Value));
+                }
+            }
+            else
+            {
+                blockRewardInfos.Add(new BlockRewardInfo(0, 0));
+            }
+            return blockRewardInfos;
+        }
+
+        private class BlockRewardInfo(ulong blockNumber, in UInt256 reward) : IActivatedAt
+        {
+            public ulong BlockNumber { get; } = blockNumber;
+            public UInt256 Reward { get; } = reward;
+
+            ulong IActivatedAt<ulong>.Activation => BlockNumber;
+        }
+    }
+}

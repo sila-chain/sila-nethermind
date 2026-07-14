@@ -1,0 +1,1111 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Specs;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Crypto;
+using Nethermind.Savm.Tracing;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Logging;
+using Nethermind.Specs.Forks;
+using Nethermind.Savm.State;
+using NUnit.Framework;
+using System.Collections.Generic;
+using Nethermind.Core.Crypto;
+using System;
+using System.Linq;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Tracing;
+using Nethermind.Core.Test;
+using Nethermind.Int256;
+
+namespace Nethermind.Savm.Test;
+
+[TestFixture]
+[Parallelizable(ParallelScope.All)]
+[FixtureLifeCycle(LifeCycle.InstancePerTestCase)]
+internal class TransactionProcessorSip7702Tests
+{
+    private ISpecProvider _specProvider;
+    private ISilaEcdsa _silaEcdsa;
+    private ITransactionProcessor _transactionProcessor;
+    private IWorldState _stateProvider;
+    private IDisposable _worldStateCloser;
+
+    [SetUp]
+    public void Setup() => Initialize(SilaPrague.Instance);
+
+    private void UseSpec(IReleaseSpec spec)
+    {
+        _worldStateCloser.Dispose();
+        Initialize(spec);
+    }
+
+    private void Initialize(IReleaseSpec spec)
+    {
+        _specProvider = new TestSpecProvider(spec);
+        _stateProvider = TestWorldStateFactory.CreateForTest();
+        _worldStateCloser = _stateProvider.BeginScope(IWorldState.PreGenesis);
+        SilaCodeInfoRepository codeInfoRepository = new(_stateProvider);
+        SilaVirtualMachine virtualMachine = new(new TestBlockhashProvider(_specProvider), _specProvider, LimboLogs.Instance);
+        _transactionProcessor = new SilaTransactionProcessor(BlobBaseFeeCalculator.Instance, _specProvider, _stateProvider, virtualMachine, codeInfoRepository, LimboLogs.Instance);
+        _silaEcdsa = new SilaEcdsa(_specProvider.ChainId);
+    }
+
+    [TearDown]
+    public void TearDown() => _worldStateCloser.Dispose();
+
+    public enum AuthorityPreState
+    {
+        Nonexistent,
+        ExistingLeaf,
+        ExistingDelegation
+    }
+
+    public static IEnumerable<TestCaseData> Sip8037AuthRefundCases()
+    {
+        yield return new TestCaseData(AuthorityPreState.Nonexistent, false, 0UL, 0L)
+            .SetName("Nonexistent authority - no auth state refund");
+        yield return new TestCaseData(AuthorityPreState.Nonexistent, true, 0UL, GasCostOf.PerAuthBaseState)
+            .SetName("Nonexistent authority clear - refunds auth-base state gas");
+        yield return new TestCaseData(AuthorityPreState.ExistingLeaf, false, 0UL, GasCostOf.NewAccountState)
+            .SetName("Existing authority leaf - refunds new account state gas");
+        yield return new TestCaseData(AuthorityPreState.ExistingLeaf, true, 0UL, GasCostOf.NewAccountState + GasCostOf.PerAuthBaseState)
+            .SetName("Existing authority leaf clear - refunds full auth state gas");
+        yield return new TestCaseData(AuthorityPreState.ExistingDelegation, false, 1UL, GasCostOf.NewAccountState + GasCostOf.PerAuthBaseState)
+            .SetName("Existing delegation overwrite - refunds full auth state gas");
+        yield return new TestCaseData(AuthorityPreState.ExistingDelegation, true, 1UL, GasCostOf.NewAccountState + GasCostOf.PerAuthBaseState)
+            .SetName("Existing delegation clear - refunds full auth state gas");
+    }
+
+    [TestCaseSource(nameof(Sip8037AuthRefundCases))]
+    public void Execute_Sip8037AuthRefunds_UpdateReceiptAndBlockGas(
+        AuthorityPreState authorityPreState,
+        bool clearDelegation,
+        ulong authorityNonce,
+        long expectedStateGasRefund)
+    {
+        UseSpec(SilaAmsterdam.Instance);
+
+        PrivateKey authority = TestItem.PrivateKeyA;
+        PrivateKey sender = TestItem.PrivateKeyB;
+        Address previousDelegation = TestItem.AddressC;
+        Address newDelegation = TestItem.AddressD;
+        Address authTarget = clearDelegation ? Address.Zero : newDelegation;
+
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+        DeployCode(previousDelegation, Prepare.SavmCode.Op(Instruction.STOP).Done);
+        DeployCode(newDelegation, Prepare.SavmCode.Op(Instruction.STOP).Done);
+
+        if (authorityPreState is not AuthorityPreState.Nonexistent)
+        {
+            UInt256 authorityBalance = authorityPreState is AuthorityPreState.ExistingLeaf ? UInt256.One : UInt256.Zero;
+            _stateProvider.CreateAccount(authority.Address, authorityBalance, authorityNonce);
+        }
+
+        if (authorityPreState is AuthorityPreState.ExistingDelegation)
+        {
+            byte[] delegation = [.. Sip7702Constants.DelegationHeader, .. previousDelegation.Bytes];
+            _stateProvider.InsertCode(authority.Address, ValueKeccak.Compute(delegation), delegation, SilaAmsterdam.Instance);
+        }
+
+        ulong intrinsicStateGas = GasCostOf.NewAccountState + GasCostOf.PerAuthBaseState;
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(newDelegation)
+            .WithGasLimit(Sip7825Constants.DefaultTxGasLimitCap + intrinsicStateGas)
+            .WithAuthorizationCode(_silaEcdsa.Sign(authority, _specProvider.ChainId, authTarget, authorityNonce))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(ulong.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.AmsterdamBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(Sip7825Constants.DefaultTxGasLimitCap + intrinsicStateGas)
+            .TestObject;
+
+        BlockReceiptsTracer receiptsTracer = new();
+        receiptsTracer.StartNewBlockTrace(block);
+        using ITxTracer txTracer = receiptsTracer.StartNewTxTrace(tx);
+        TransactionResult result = _transactionProcessor.Execute(
+            tx,
+            new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)),
+            receiptsTracer);
+        receiptsTracer.EndTxTrace();
+
+        Assert.That(result.TransactionExecuted, Is.True);
+        Assert.That(result.SavmExceptionType, Is.EqualTo(SavmExceptionType.None));
+        // Intrinsic regular = TX base + value-bearing recipient touch + SIP-7702 per-auth regular;
+        // existing authorities refund ACCOUNT_WRITE, capped at before/5.
+        ulong intrinsicRegularGas = GasCostOf.TransactionSip2780 + Sip8038Constants.ColdAccountAccess
+            + GasCostOf.TransferLogSip2780 + GasCostOf.TxValueCostSip2780 + Sip8038Constants.PerAuthBaseRegular;
+        ulong stateGasRefund = (ulong)expectedStateGasRefund;
+        ulong beforeRegularRefund = intrinsicRegularGas + intrinsicStateGas - stateGasRefund;
+        ulong regularRefund = authorityPreState == AuthorityPreState.Nonexistent
+            ? 0
+            : Math.Min(beforeRegularRefund / 5, Sip8038Constants.AccountWrite);
+        ulong expectedSpentGas = beforeRegularRefund - regularRefund;
+        Assert.That(tx.SpentGas, Is.EqualTo(expectedSpentGas));
+        Assert.That(receiptsTracer.LastReceipt.GasUsedTotal, Is.EqualTo(expectedSpentGas));
+        Assert.That(block.Header.GasUsed, Is.EqualTo(Math.Max(intrinsicRegularGas, intrinsicStateGas - stateGasRefund)));
+        Assert.That(_stateProvider.GetNonce(authority.Address), Is.EqualTo(authorityNonce + 1));
+
+        byte[] expectedCode = clearDelegation
+            ? []
+            : [.. Sip7702Constants.DelegationHeader, .. newDelegation.Bytes];
+        Assert.That(_stateProvider.GetCode(authority.Address), Is.EqualTo(expectedCode));
+    }
+
+    [Test]
+    public void Execute_TxHasAuthorizationWithCodeThatSavesCallerAddress_ExpectedAddressIsSaved()
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+        //Save caller in storage slot 0
+        byte[] code = Prepare.SavmCode
+            .Op(Instruction.CALLER)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SSTORE)
+            .Done;
+        DeployCode(codeSource, code);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(signer, _specProvider.ChainId, codeSource, 0))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), NullTxTracer.Instance);
+
+        ReadOnlySpan<byte> cell = _stateProvider.Get(new StorageCell(signer.Address, 0));
+
+        Assert.That(new Address(cell), Is.EqualTo(sender.Address));
+    }
+
+    public static IEnumerable<TestCaseData> DelegatedAndNotDelegatedCodeCases()
+    {
+        byte[] delegatedCode = new byte[23];
+        Sip7702Constants.DelegationHeader.CopyTo(delegatedCode);
+        yield return new TestCaseData(delegatedCode, true).SetName("Delegated code - should insert");
+        yield return new TestCaseData(Prepare.SavmCode.Op(Instruction.GAS).Done, false).SetName("Non-delegated code - should not insert");
+    }
+    [TestCaseSource(nameof(DelegatedAndNotDelegatedCodeCases))]
+    public void Execute_TxHasAuthorizationCodeButAuthorityHasCode_OnlyInsertIfExistingCodeIsDelegated(byte[] authorityCode, bool shouldInsert)
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+        //Save caller in storage slot 0
+        byte[] code = Prepare.SavmCode
+            .Op(Instruction.CALLER)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SSTORE)
+            .Done;
+        DeployCode(codeSource, code);
+        DeployCode(signer.Address, authorityCode);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(60_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(signer, _specProvider.ChainId, codeSource, 0))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), NullTxTracer.Instance);
+
+        ReadOnlySpan<byte> signerCode = _stateProvider.GetCode(signer.Address);
+
+        byte[] expectedCode = shouldInsert ? [.. Sip7702Constants.DelegationHeader, .. codeSource.Bytes] : authorityCode;
+
+        Assert.That(signerCode.ToArray(), Is.EqualTo(expectedCode));
+    }
+
+    public static IEnumerable<TestCaseData> SenderSignerCases()
+    {
+        yield return new TestCaseData(TestItem.PrivateKeyA, TestItem.PrivateKeyB, 0ul).SetName("Different sender and signer, nonce 0");
+        yield return new TestCaseData(TestItem.PrivateKeyA, TestItem.PrivateKeyA, 1ul).SetName("Same sender and signer, nonce 1");
+    }
+    [TestCaseSource(nameof(SenderSignerCases))]
+    public void Execute_SenderAndSignerIsTheSameOrNotWithCodeThatSavesCallerAddress_SenderAddressIsSaved(PrivateKey sender, PrivateKey signer, ulong nonce)
+    {
+        Address codeSource = TestItem.AddressC;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+        //Save caller in storage slot 0
+        byte[] code = Prepare.SavmCode
+            .Op(Instruction.CALLER)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SSTORE)
+            .Done;
+        DeployCode(codeSource, code);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(600_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(signer, _specProvider.ChainId, codeSource, nonce))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), NullTxTracer.Instance);
+
+        ReadOnlySpan<byte> cellValue = _stateProvider.Get(new StorageCell(signer.Address, 0));
+
+        Assert.That(cellValue.ToArray(), Is.EqualTo(sender.Address.Bytes.ToArray()));
+    }
+
+    public static IEnumerable<TestCaseData> DifferentAuthorityTupleValues()
+    {
+        yield return new TestCaseData(1ul, 0ul, true).SetName("Base case - correct chainId and nonce, expects delegation");
+        yield return new TestCaseData(1ul, 1ul, false).SetName("Wrong nonce - no delegation");
+        yield return new TestCaseData(2ul, 0ul, false).SetName("Wrong chainId - no delegation");
+        yield return new TestCaseData(2ul, ulong.MaxValue, false).SetName("Nonce too high - no delegation");
+    }
+
+    [TestCaseSource(nameof(DifferentAuthorityTupleValues))]
+    public void Execute_AuthorityTupleHasDifferentData_EOACodeIsEmptyOrAsExpected(ulong chainId, ulong nonce, bool expectDelegation)
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+        //Save caller in storage slot 0
+        byte[] code = Prepare.SavmCode
+            .Op(Instruction.CALLER)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SSTORE)
+            .Done;
+        DeployCode(codeSource, code);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(signer, chainId, codeSource, nonce))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), NullTxTracer.Instance);
+
+        byte[]? actual = _stateProvider.GetCode(signer.Address);
+        Assert.That(Sip7702Constants.IsDelegatedCode(actual), Is.EqualTo(expectDelegation));
+    }
+
+    [TestCase(ulong.MaxValue, false)]
+    [TestCase(ulong.MaxValue - 1, true)]
+    public void Execute_AuthorityNonceHasMaxValueOrBelow_MaxValueNonceIsNotAllowed(ulong nonce, bool expectDelegation)
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+        _stateProvider.CreateAccount(signer.Address, 0, nonce);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(signer, 0, codeSource, nonce))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), NullTxTracer.Instance);
+
+        byte[]? actual = _stateProvider.GetCode(signer.Address);
+        Assert.That(Sip7702Constants.IsDelegatedCode(actual), Is.EqualTo(expectDelegation));
+    }
+
+    [TestCase(1ul)]
+    [TestCase(10ul)]
+    [TestCase(99ul)]
+    public void Execute_TxHasDifferentAmountOfAuthorizedCode_UsedGasIsExpected(ulong count)
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(GasCostOf.Transaction + GasCostOf.NewAccount * count)
+            .WithAuthorizationCode(Enumerable.Range(0, (int)count)
+                                             .Select(i => _silaEcdsa.Sign(
+                                                 signer,
+                                                 _specProvider.ChainId,
+                                                 TestItem.AddressC,
+                                                 0)).ToArray())
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(ulong.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(100000000).TestObject;
+
+        CallOutputTracer tracer = new();
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), tracer);
+
+        Assert.That(tracer.GasSpent, Is.EqualTo(GasCostOf.Transaction + GasCostOf.NewAccount * count));
+    }
+
+    public void Execute_TxHasDifferentAmount()
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(Enumerable.Range(0, 2)
+                                             .Select(i => _silaEcdsa.Sign(
+                                                 signer,
+                                                 _specProvider.ChainId,
+                                                 TestItem.AddressC,
+                                                 0)).ToArray())
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(100000000).TestObject;
+
+        CallOutputTracer tracer = new();
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), tracer);
+
+    }
+
+    private static IEnumerable<object> SavmExecutionErrorCases()
+    {
+        byte[] runOutOfGasCode = Prepare.SavmCode
+          .Op(Instruction.CALLER)
+          .Op(Instruction.BALANCE)
+          .Op(Instruction.PUSH0)
+          .Op(Instruction.JUMP)
+          .Done;
+        yield return new object[] { runOutOfGasCode };
+        byte[] revertExecution = Prepare.SavmCode
+          .Op(Instruction.REVERT)
+          .Done;
+        yield return new object[] { revertExecution };
+    }
+    [TestCaseSource(nameof(SavmExecutionErrorCases))]
+    public void Execute_TxWithDelegationRunsOutOfGas_DelegationRefundIsStillApplied(byte[] executionErrorCode)
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        Address codeSource = TestItem.AddressB;
+
+        _stateProvider.CreateAccount(codeSource, 0);
+        _stateProvider.InsertCode(codeSource, executionErrorCode, SilaPrague.Instance);
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        const long gasLimit = 10_000_000;
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(codeSource)
+            .WithGasLimit(gasLimit)
+            .WithAuthorizationCode(
+            _silaEcdsa.Sign(
+                sender,
+                _specProvider.ChainId,
+                Address.Zero,
+                1)
+            )
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(long.MaxValue).TestObject;
+
+        CallOutputTracer tracer = new();
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), tracer);
+
+        Assert.That(tracer.GasSpent, Is.EqualTo(gasLimit - GasCostOf.NewAccount + GasCostOf.PerAuthBaseCost));
+    }
+
+    [Test]
+    public void Execute_TxAuthorizationListWithBALANCE_WarmAccountReadGasIsCharged()
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        byte[] code = Prepare.SavmCode
+            .PushData(signer.Address)
+            .Op(Instruction.BALANCE)
+            .Done;
+        DeployCode(codeSource, code);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(60_000)
+            .WithAuthorizationCode(
+                _silaEcdsa.Sign(
+                    signer,
+                    _specProvider.ChainId,
+                    codeSource,
+                    0))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(100000000).TestObject;
+
+        CallOutputTracer tracer = new();
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), tracer);
+        //Tx should only be charged for warm state read
+        Assert.That(tracer.GasSpent, Is.EqualTo(GasCostOf.Transaction
+            + GasCostOf.NewAccount
+            + SilaPrague.Instance.GasCosts.BalanceCost
+            + GasCostOf.WarmStateRead
+            + GasCostOf.VeryLow));
+    }
+
+    [TestCase(2)]
+    [TestCase(1)]
+    public void Execute_AuthorizationListHasSameAuthorityButDifferentCode_OnlyLastInstanceIsUsed(int expectedStoredValue)
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        Address firstCodeSource = TestItem.AddressC;
+        Address secondCodeSource = TestItem.AddressD;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        byte[] firstCode = Prepare.SavmCode
+            .PushData(0)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SSTORE)
+            .Done;
+        DeployCode(firstCodeSource, firstCode);
+
+        byte[] secondCode = Prepare.SavmCode
+            .PushData(expectedStoredValue)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SSTORE)
+            .Done;
+        DeployCode(secondCodeSource, secondCode);
+
+        AuthorizationTuple[] authList = [
+            _silaEcdsa.Sign(
+                    signer,
+                    _specProvider.ChainId,
+                    firstCodeSource,
+                    0),
+            _silaEcdsa.Sign(
+                    signer,
+                    _specProvider.ChainId,
+                    secondCodeSource,
+                    1),
+        ];
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(authList)
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+
+        _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), NullTxTracer.Instance);
+
+        Assert.That(_stateProvider.Get(new StorageCell(signer.Address, 0)).ToArray(), Is.EqualTo(new[] { expectedStoredValue }));
+    }
+
+    [TestCase]
+    public void Execute_FirstTxHasAuthorizedCodeThatIncrementsAndSecondDoesNot_StorageSlotIsOnlyIncrementedOnce()
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        PrivateKey signer = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+        // Increment by 1 every time it's called
+        byte[] code = Prepare.SavmCode
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SLOAD)
+            .PushData(1)
+            .Op(Instruction.ADD)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SSTORE)
+            .Done;
+        DeployCode(codeSource, code);
+
+        Transaction tx1 = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(
+                    signer,
+                    _specProvider.ChainId,
+                    codeSource,
+                    0))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        // tx2 clears the delegation by authorizing address(0), then calls signer — no code runs
+        Transaction tx2 = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithNonce(1)
+            .WithTo(signer.Address)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(signer, _specProvider.ChainId, Address.Zero, 1))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx1, tx2)
+            .WithGasLimit(10000000).TestObject;
+
+        BlockExecutionContext blkCtx = new(block.Header, _specProvider.GetSpec(block.Header));
+        _transactionProcessor.Execute(tx1, blkCtx, NullTxTracer.Instance);
+        _transactionProcessor.Execute(tx2, blkCtx, NullTxTracer.Instance);
+
+        Assert.That(_stateProvider.Get(new StorageCell(signer.Address, 0)).ToArray(), Is.EqualTo(new[] { 1 }));
+    }
+
+    public static IEnumerable<TestCaseData> OpcodesWithEXTCODE()
+    {
+        //EXTCODESIZE should return 23
+        yield return new TestCaseData(
+            Prepare.SavmCode
+            .PushData(TestItem.AddressA)
+            .Op(Instruction.EXTCODESIZE)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.MSTORE8)
+            .PushData(1)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.RETURN)
+            .Done,
+            new byte[] { (byte)Sip7702Constants.DelegationDesignatorLength }).SetName("EXTCODESIZE returns delegation designator length");
+        byte[] delegationCode = [.. Sip7702Constants.DelegationHeader, .. TestItem.AddressC.Bytes];
+
+        yield return new TestCaseData(
+            Prepare.SavmCode
+            .PushData(TestItem.AddressA)
+            .Op(Instruction.EXTCODEHASH)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.MSTORE)
+            .PushData(32)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.RETURN)
+            .Done,
+            Keccak.Compute(delegationCode).Bytes.ToArray()).SetName("EXTCODEHASH returns hash of delegation code");
+        //EXTCODECOPY should copy the delegation designator
+        byte[] code = Prepare.SavmCode
+            .PushData(TestItem.AddressA)
+            .Op(Instruction.DUP1)
+            .Op(Instruction.EXTCODESIZE)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.DUP4)
+            .Op(Instruction.EXTCODECOPY)
+            .PushData(23)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.RETURN)
+            .Done;
+        yield return new TestCaseData(
+            code,
+            delegationCode).SetName("EXTCODECOPY copies delegation designator");
+    }
+    [TestCaseSource(nameof(OpcodesWithEXTCODE))]
+    public void Execute_DelegatedCodeUsesEXTOPCODES_ReturnsExpectedValue(byte[] code, byte[] expectedValue)
+    {
+        PrivateKey signer = TestItem.PrivateKeyA;
+        PrivateKey sender = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        DeployCode(codeSource, code);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(signer.Address)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(
+                    signer,
+                    _specProvider.ChainId,
+                    codeSource,
+                    0))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+        CallOutputTracer callOutputTracer = new();
+        _ = _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), callOutputTracer);
+
+        Assert.That(callOutputTracer.ReturnValue?.ToArray(), Is.EqualTo(expectedValue));
+    }
+
+    public static IEnumerable<TestCaseData> EXTCODEHASHAccountSetup()
+    {
+        yield return new TestCaseData(static (IWorldState state, Address account) =>
+            {
+                //Account does not exists
+            },
+            new byte[] { 0x0 }
+        ).SetName("Account does not exist - returns zero");
+        byte[] code = [.. Sip7702Constants.DelegationHeader, .. TestItem.AddressD.Bytes];
+        yield return new TestCaseData(
+            static (IWorldState state, Address account) =>
+            {
+                //Account is delegated
+                byte[] code = [.. Sip7702Constants.DelegationHeader, .. TestItem.AddressD.Bytes];
+                state.CreateAccountIfNotExists(account, 0);
+                state.InsertCode(account, ValueKeccak.Compute(code), code, SilaPrague.Instance);
+
+            },
+            ValueKeccak.Compute(code).Bytes.ToArray()
+        ).SetName("Account is delegated - returns delegation code hash");
+        yield return new TestCaseData(static (IWorldState state, Address account) =>
+            {
+                //Account exists but is not delegated
+                state.CreateAccountIfNotExists(account, 1);
+            },
+            Keccak.OfAnEmptyString.ValueHash256.ToByteArray()
+        ).SetName("Account exists not delegated - returns empty string hash");
+        yield return new TestCaseData(static (IWorldState state, Address account) =>
+            {
+                //Account is dead
+                state.CreateAccountIfNotExists(account, 0);
+            },
+            new byte[] { 0x0 }
+        ).SetName("Account is dead - returns zero");
+    }
+
+    [TestCaseSource(nameof(EXTCODEHASHAccountSetup))]
+    public void Execute_CodeSavesEXTCODEHASHWhenAccountIsDelegatedOrNot_SavesExpectedValue(Action<IWorldState, Address> setupAccount, byte[] expected)
+    {
+        PrivateKey signer = TestItem.PrivateKeyA;
+        PrivateKey sender = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+
+        setupAccount(_stateProvider, signer.Address);
+
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        byte[] code = Prepare.SavmCode
+            .PushData(signer.Address)
+            .Op(Instruction.EXTCODEHASH)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.SSTORE)
+            .Done;
+
+        DeployCode(codeSource, code);
+
+        _stateProvider.Commit(SilaPrague.Instance, true);
+
+        Transaction tx = Build.A.Transaction
+            .WithTo(codeSource)
+            .WithGasLimit(100_000)
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+        _ = _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), NullTxTracer.Instance);
+
+        ReadOnlySpan<byte> actual = _stateProvider.Get(new StorageCell(codeSource, 0));
+        Assert.That(actual.ToArray(), Is.EqualTo(expected));
+    }
+    public static IEnumerable<TestCaseData> AccountAccessGasCases()
+    {
+        byte[] extcodesizeCode =
+            Prepare.SavmCode
+            .PushData(TestItem.AddressA)
+            .Op(Instruction.EXTCODESIZE)
+            .Done;
+        yield return new TestCaseData(
+            extcodesizeCode,
+            GasCostOf.Transaction
+            + GasCostOf.ColdAccountAccess
+            + GasCostOf.VeryLow,
+            true,
+            100_000ul,
+            false
+        ).SetName("EXTCODESIZE delegated - cold access");
+        yield return new TestCaseData(
+            extcodesizeCode,
+            23602ul,
+            true,
+            //Gas limit is set so it doesn't have enough for accessing the account
+            23602ul,
+            true
+        ).SetName("EXTCODESIZE delegated - out of gas");
+        yield return new TestCaseData(
+            extcodesizeCode,
+            GasCostOf.Transaction
+            + GasCostOf.ColdAccountAccess
+            + GasCostOf.VeryLow,
+            false,
+            100_000ul,
+            false
+        ).SetName("EXTCODESIZE not delegated - cold access");
+        byte[] extcodecopyCode =
+            Prepare.SavmCode
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.PUSH0)
+            .PushData(TestItem.AddressA)
+            .Op(Instruction.EXTCODECOPY)
+            .Done;
+        yield return new TestCaseData(
+            extcodecopyCode,
+            GasCostOf.Transaction
+            + GasCostOf.ColdAccountAccess
+            + GasCostOf.VeryLow
+            + GasCostOf.Base * 3,
+            true,
+            100_000ul,
+            false
+        ).SetName("EXTCODECOPY delegated - cold access");
+        yield return new TestCaseData(
+            extcodecopyCode,
+            GasCostOf.Transaction
+            + GasCostOf.ColdAccountAccess
+            + GasCostOf.VeryLow
+            + GasCostOf.Base * 3,
+            false,
+            100_000ul,
+            false
+        ).SetName("EXTCODECOPY not delegated - cold access");
+        byte[] extcodehashCode =
+            Prepare.SavmCode
+            .PushData(TestItem.AddressA)
+            .Op(Instruction.EXTCODEHASH)
+            .Done;
+        yield return new TestCaseData(
+            extcodehashCode,
+            GasCostOf.Transaction
+            + GasCostOf.ColdAccountAccess
+            + GasCostOf.VeryLow,
+            true,
+            100_000ul,
+            false
+        ).SetName("EXTCODEHASH delegated - cold access");
+        yield return new TestCaseData(
+            extcodehashCode,
+            GasCostOf.Transaction
+            + GasCostOf.ColdAccountAccess
+            + GasCostOf.VeryLow,
+            false,
+            100_000ul,
+            false
+        ).SetName("EXTCODEHASH not delegated - cold access");
+        byte[] callOpcode =
+            Prepare.SavmCode
+            .PushData(0)
+            .PushData(0)
+            .PushData(0)
+            .PushData(0)
+            .PushData(0)
+            .PushData(TestItem.AddressA)
+            .PushData(0)
+            .Op(Instruction.CALL)
+            .Done;
+        yield return new TestCaseData(
+            callOpcode,
+            GasCostOf.Transaction
+            + GasCostOf.WarmStateRead
+            + GasCostOf.ColdAccountAccess
+            + GasCostOf.VeryLow * 7,
+            true,
+            100_000ul,
+            false
+        ).SetName("CALL delegated - cold access");
+        yield return new TestCaseData(
+            callOpcode,
+            23621ul,
+            true,
+            //Gas limit is set so it doesn't have enough for accessing the account
+            23621ul,
+            true
+        ).SetName("CALL delegated - out of gas");
+        yield return new TestCaseData(
+            callOpcode,
+            GasCostOf.Transaction
+            + GasCostOf.ColdAccountAccess
+            + GasCostOf.VeryLow * 7,
+            false,
+            100_000ul,
+            false
+        ).SetName("CALL not delegated - cold access");
+    }
+    [TestCaseSource(nameof(AccountAccessGasCases))]
+    public void Execute_DifferentAccountAccessOpcodes_ChargesCorrectAccountAccessGas(byte[] code, ulong expectedGas, bool isDelegated, ulong gasLimit, bool shouldRunOutOfGas)
+    {
+        PrivateKey signer = TestItem.PrivateKeyA;
+        PrivateKey sender = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+        Address secondDelegation = TestItem.AddressD;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+        _stateProvider.CreateAccount(signer.Address, 0);
+        if (isDelegated)
+        {
+            //Delegation points to nothing
+            byte[] delegation = [.. Sip7702Constants.DelegationHeader, .. TestItem.AddressC.Bytes];
+            _stateProvider.InsertCode(signer.Address, delegation, SilaPrague.Instance);
+        }
+
+        DeployCode(codeSource, code);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SIP1559)
+            .WithTo(codeSource)
+            .WithGasLimit(gasLimit)
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(ulong.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+        EstimateGasTracer estimateGasTracer = new();
+        _ = _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), estimateGasTracer);
+
+        Assert.That(estimateGasTracer.GasSpent, Is.EqualTo(expectedGas));
+        if (shouldRunOutOfGas)
+        {
+            Assert.That(estimateGasTracer.Error, Is.EqualTo(SavmExceptionType.OutOfGas.ToString()));
+        }
+    }
+
+    public static IEnumerable<TestCaseData> CountsAsAccessedCases()
+    {
+        SilaEcdsa silaEcdsa = new(BlockchainIds.GenericNonRealNetwork);
+
+        yield return new TestCaseData(
+             new AuthorizationTuple[]
+             {
+                 silaEcdsa.Sign(TestItem.PrivateKeyA, 1, TestItem.AddressF, 0),
+                 silaEcdsa.Sign(TestItem.PrivateKeyB, 1, TestItem.AddressF, 0),
+             },
+             new Address[]
+             {
+                 TestItem.AddressA,
+                 TestItem.AddressB
+             }
+        ).SetName("Two valid tuples - both addresses accessed");
+        yield return new TestCaseData(
+             new AuthorizationTuple[]
+             {
+                 silaEcdsa.Sign(TestItem.PrivateKeyA, 1, TestItem.AddressF, 0),
+                 silaEcdsa.Sign(TestItem.PrivateKeyB, 2, TestItem.AddressF, 0),
+             },
+             new Address[]
+             {
+                 TestItem.AddressA,
+             }
+        ).SetName("One valid and one wrong chainId - only valid address accessed");
+        yield return new TestCaseData(
+             new AuthorizationTuple[]
+             {
+                 silaEcdsa.Sign(TestItem.PrivateKeyA, 1, TestItem.AddressF, 0),
+                 //Bad signature
+                 new(1, TestItem.AddressF, 0, new Signature(new byte[65]), TestItem.AddressA)
+             },
+             new Address[]
+             {
+                 TestItem.AddressA,
+             }
+        ).SetName("One valid and one bad signature - only valid address accessed");
+    }
+
+    [TestCaseSource(nameof(CountsAsAccessedCases))]
+    public void Execute_CombinationOfValidAndInvalidTuples_AddsTheCorrectAddressesToAccessedAddresses(AuthorizationTuple[] tuples, Address[] shouldCountAsAccessed)
+    {
+        PrivateKey sender = TestItem.PrivateKeyA;
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(TestItem.AddressB)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(tuples)
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+
+        AccessTxTracer txTracer = new();
+        TransactionResult result = _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), txTracer);
+        Assert.That(txTracer.AccessList?.Select(static a => a.Address), Is.SupersetOf(shouldCountAsAccessed));
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void Execute_AuthorityAccountExistsOrNot_NonceIsIncrementedByOne(bool accountExists)
+    {
+        PrivateKey authority = TestItem.PrivateKeyA;
+        PrivateKey sender = TestItem.PrivateKeyB;
+
+        if (accountExists)
+            _stateProvider.CreateAccount(authority.Address, 0);
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        AuthorizationTuple[] tuples =
+        {
+            _silaEcdsa.Sign(authority, 1, sender.Address, 0),
+        };
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(TestItem.AddressB)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(tuples)
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+        _ = _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), NullTxTracer.Instance);
+
+        Assert.That(_stateProvider.GetNonce(authority.Address), Is.EqualTo(1ul));
+    }
+
+
+    [Test]
+    public void Execute_SetNormalDelegationAndThenSetDelegationWithZeroAddress_AccountCodeIsReset()
+    {
+        PrivateKey authority = TestItem.PrivateKeyA;
+        PrivateKey sender = TestItem.PrivateKeyB;
+
+        _stateProvider.CreateAccount(authority.Address, 0);
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        AuthorizationTuple[] tuples =
+        {
+            _silaEcdsa.Sign(authority, 1, sender.Address, 0),
+        };
+
+        Transaction tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithTo(TestItem.AddressB)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(tuples)
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue - 1)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+        BlockExecutionContext blkCtx = new(block.Header, _specProvider.GetSpec(block.Header));
+        _transactionProcessor.Execute(tx, blkCtx, NullTxTracer.Instance);
+        _stateProvider.CommitTree(block.Number);
+
+        byte[]? actual = _stateProvider.GetCode(authority.Address);
+        Assert.That(Sip7702Constants.IsDelegatedCode(actual), Is.True);
+
+        tx = Build.A.Transaction
+            .WithType(TxType.SetCode)
+            .WithNonce(1)
+            .WithTo(TestItem.AddressB)
+            .WithGasLimit(100_000)
+            .WithAuthorizationCode(_silaEcdsa.Sign(authority, 1, Address.Zero, 1))
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+
+        _transactionProcessor.Execute(tx, blkCtx, NullTxTracer.Instance);
+        actual = _stateProvider.GetCode(authority.Address);
+
+        Assert.That(actual, Is.EqualTo(Array.Empty<byte>()));
+        Assert.That(_stateProvider.HasCode(authority.Address), Is.False);
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void Execute_EXTCODESIZEOnDelegatedThatTriggersOptimization_ReturnsZeroIfDelegated(bool isDelegated)
+    {
+        PrivateKey signer = TestItem.PrivateKeyA;
+        PrivateKey sender = TestItem.PrivateKeyB;
+        Address codeSource = TestItem.AddressC;
+
+        _stateProvider.CreateAccount(sender.Address, 1.Sila);
+
+        byte[] code = Prepare.SavmCode
+            .Op(Instruction.PUSH0)
+            .PushData(signer.Address)
+            .Op(Instruction.EXTCODESIZE)
+            .Op(Instruction.EQ)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.MSTORE8)
+            .PushData(1)
+            .Op(Instruction.PUSH0)
+            .Op(Instruction.RETURN)
+            .Done;
+
+        DeployCode(codeSource, code);
+
+        if (isDelegated)
+        {
+            byte[] delegation = [.. Sip7702Constants.DelegationHeader, .. codeSource.Bytes];
+            DeployCode(signer.Address, delegation);
+        }
+
+        _stateProvider.Commit(SilaPrague.Instance, true);
+
+        Transaction tx = Build.A.Transaction
+            .WithTo(codeSource)
+            .WithGasLimit(100_000)
+            .SignedAndResolved(_silaEcdsa, sender, true)
+            .TestObject;
+        Block block = Build.A.Block.WithNumber(long.MaxValue)
+            .WithTimestamp(MainnetSpecProvider.PragueBlockTimestamp)
+            .WithTransactions(tx)
+            .WithGasLimit(10000000).TestObject;
+        CallOutputTracer tracer = new();
+        _ = _transactionProcessor.Execute(tx, new BlockExecutionContext(block.Header, _specProvider.GetSpec(block.Header)), tracer);
+
+        Assert.That(tracer.ReturnValue, Is.EqualTo(new byte[] { Convert.ToByte(!isDelegated) }));
+    }
+
+    private void DeployCode(Address codeSource, byte[] code)
+    {
+        _stateProvider.CreateAccountIfNotExists(codeSource, 0);
+        _stateProvider.InsertCode(codeSource, ValueKeccak.Compute(code), code, _specProvider.GetSpec(MainnetSpecProvider.PragueActivation));
+    }
+}

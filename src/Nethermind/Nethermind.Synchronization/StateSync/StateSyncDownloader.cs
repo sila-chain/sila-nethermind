@@ -1,0 +1,220 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Logging;
+using Nethermind.Network.Contract.P2P;
+using Nethermind.Serialization.Rlp;
+using Nethermind.State.Snap;
+using Nethermind.Synchronization.FastSync;
+using Nethermind.Synchronization.ParallelSync;
+using Nethermind.Synchronization.Peers;
+using Nethermind.Trie;
+
+namespace Nethermind.Synchronization.StateSync
+{
+    public class StateSyncDownloader(ILogManager logManager) : ISyncDownloader<StateSyncBatch>
+    {
+        private readonly ILogger Logger = logManager.GetClassLogger<StateSyncDownloader>();
+
+        public async Task Dispatch(PeerInfo peerInfo, StateSyncBatch batch, CancellationToken cancellationToken)
+        {
+            if (batch?.RequestedNodes is null || batch.RequestedNodes.Count == 0)
+            {
+                return;
+            }
+
+            ISyncPeer peer = peerInfo.SyncPeer;
+            Task<IByteArrayList>? task = null;
+            HashList? hashList = null;
+            GetTrieNodesRequest? getTrieNodesRequest = null;
+            if (ProtocolSupportsNodeData(peer))
+            {
+                if (Logger.IsTrace) Logger.Trace($"Requested NodeData via SilProtocol from peer {peer}");
+                hashList = HashList.Rent(batch.RequestedNodes);
+                task = peer.GetNodeData(hashList, cancellationToken);
+            }
+            // If GetNodeData is not supported, fall back to the Snap protocol
+            else if (peer.TryGetSatelliteProtocol(Protocol.Snap, out ISnapSyncPeer snapHandler))
+            {
+                if (batch.NodeDataType == NodeDataType.Code)
+                {
+                    if (Logger.IsTrace) Logger.Trace($"Requested ByteCodes via SnapProtocol from peer {peer}");
+                    hashList = HashList.Rent(batch.RequestedNodes);
+                    task = snapHandler.GetByteCodes(new KeccakToValueKeccakList(hashList), cancellationToken);
+                }
+                else
+                {
+                    if (Logger.IsTrace) Logger.Trace($"Requested TrieNodes via SnapProtocol from peer {peer}");
+                    getTrieNodesRequest = GetGroupedRequest(batch);
+                    task = snapHandler.GetTrieNodes(getTrieNodesRequest, cancellationToken);
+                }
+            }
+
+            if (task is null)
+            {
+                throw new InvalidOperationException("State sync dispatch was scheduled to a peer unable to serve state sync.");
+            }
+
+            try
+            {
+                batch.Responses = await task;
+            }
+            catch (Exception e)
+            {
+                Logger.TraceError("Error after dispatching the state sync request", e);
+            }
+            finally
+            {
+                if (hashList is not null) HashList.Return(hashList);
+                getTrieNodesRequest?.Dispose();
+            }
+        }
+
+        protected virtual bool ProtocolSupportsNodeData(ISyncPeer peer) => peer.ProtocolVersion < SilVersions.Sil67;
+
+        /// <summary>
+        /// SNAP protocol allows grouping of storage requests by account path.
+        /// The grouping decrease requests size.
+        /// </summary>
+        private GetTrieNodesRequest GetGroupedRequest(StateSyncBatch batch)
+        {
+            GetTrieNodesRequest request = new() { RootHash = batch.StateRoot };
+
+            Dictionary<Hash256AsKey?, List<(TreePath path, StateSyncItem syncItem)>> itemsGroupedByAccount = [];
+            List<(TreePath path, StateSyncItem syncItem)> accountTreePaths = [];
+
+            foreach (StateSyncItem? item in batch.RequestedNodes)
+            {
+                if (item.Address is not null)
+                {
+                    if (!itemsGroupedByAccount.TryGetValue(item.Address, out List<(TreePath path, StateSyncItem syncItem)> storagePaths))
+                    {
+                        storagePaths = [];
+                        itemsGroupedByAccount[item.Address] = storagePaths;
+                    }
+
+                    storagePaths.Add((item.Path, item));
+                }
+                else
+                {
+                    accountTreePaths.Add((item.Path, item));
+                }
+            }
+
+            using DeferredRlpItemList.Builder builder = new();
+            DeferredRlpItemList.Builder.Writer rootWriter = builder.BeginRootContainer();
+
+            int requestedNodeIndex = 0;
+            for (int i = 0; i < accountTreePaths.Count; i++)
+            {
+                (TreePath path, StateSyncItem syncItem) = accountTreePaths[i];
+                using DeferredRlpItemList.Builder.Writer groupWriter = rootWriter.BeginContainer();
+                groupWriter.WriteValue(Nibbles.EncodePath(path));
+
+                // We validate the order of the response later and it has to be the same as RequestedNodes
+                batch.RequestedNodes[requestedNodeIndex] = syncItem;
+                requestedNodeIndex++;
+            }
+
+            foreach (KeyValuePair<Hash256AsKey?, List<(TreePath path, StateSyncItem syncItem)>> kvp in itemsGroupedByAccount)
+            {
+                using DeferredRlpItemList.Builder.Writer groupWriter = rootWriter.BeginContainer();
+                groupWriter.WriteValue(kvp.Key?.Value.Bytes.ToArray());
+
+                for (int groupIndex = 0; groupIndex < kvp.Value.Count; groupIndex++)
+                {
+                    (TreePath path, StateSyncItem syncItem) = kvp.Value[groupIndex];
+                    groupWriter.WriteValue(Nibbles.EncodePath(path));
+
+                    // We validate the order of the response later and it has to be the same as RequestedNodes
+                    batch.RequestedNodes[requestedNodeIndex] = syncItem;
+                    requestedNodeIndex++;
+                }
+            }
+
+            rootWriter.Dispose();
+
+            if (batch.RequestedNodes.Count != requestedNodeIndex)
+            {
+                Logger.Warn($"INCORRECT number of paths RequestedNodes.Length:{batch.RequestedNodes.Count} <> requestedNodeIndex:{requestedNodeIndex}");
+            }
+
+            request.AccountAndStoragePaths = new RlpPathGroupList(builder.ToRlpItemList());
+            return request;
+        }
+
+        /// <summary>
+        /// Present an array of StateSyncItem[] as IReadOnlyList<Keccak> to avoid allocating secondary array
+        /// Also Rent and Return cache for single item to try and avoid allocating the HashList in common case
+        /// </summary>
+        private sealed class HashList : IReadOnlyList<Hash256>
+        {
+            private static HashList s_cache;
+
+            private IList<StateSyncItem> _items;
+
+            public static HashList Rent(IList<StateSyncItem> items)
+            {
+                HashList hashList = Interlocked.Exchange(ref s_cache, null) ?? new HashList();
+                hashList.Initialize(items);
+                return hashList;
+            }
+
+            public static void Return(HashList hashList)
+            {
+                hashList.Reset();
+                Volatile.Write(ref s_cache, hashList);
+            }
+
+            public void Initialize(IList<StateSyncItem> items) => _items = items;
+
+            public void Reset() => _items = null;
+
+            public Hash256 this[int index] => _items[index].Hash;
+
+            public int Count => _items.Count;
+
+            public IEnumerator<Hash256> GetEnumerator()
+            {
+                foreach (StateSyncItem item in _items)
+                {
+                    yield return item.Hash;
+                }
+            }
+
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+        }
+
+        /// <summary>
+        /// Transition class to prevent even larger change. Need to be removed later.
+        /// </summary>
+        private sealed class KeccakToValueKeccakList : IReadOnlyList<ValueHash256>
+        {
+            private readonly HashList _innerList;
+
+            internal KeccakToValueKeccakList(HashList innerList) => _innerList = innerList;
+
+            public IEnumerator<ValueHash256> GetEnumerator()
+            {
+                foreach (Hash256 keccak in _innerList)
+                {
+                    yield return keccak;
+                }
+            }
+
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+            public int Count => _innerList.Count;
+
+            public ValueHash256 this[int index] => _innerList[index];
+        }
+    }
+}

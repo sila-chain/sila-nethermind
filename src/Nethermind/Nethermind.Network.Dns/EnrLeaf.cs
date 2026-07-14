@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+namespace Nethermind.Network.Dns;
+
+/// <summary>
+/// enr:[node-record] is a leaf containing a node record. The node record is encoded as a URL-safe base64 string.
+/// Note that this type of entry matches the canonical ENR text encoding. It may only appear in the enr-root subtree.
+/// </summary>
+public class EnrLeaf : EnrTreeNode
+{
+    private string _nodeRecord = string.Empty;
+    private string[]? _records;
+
+    public string NodeRecord
+    {
+        get => _nodeRecord;
+        set
+        {
+            _nodeRecord = value;
+            _records = null;
+        }
+    }
+
+    public override string ToString() => $"enr:{NodeRecord}";
+
+    public override string[] Links => [];
+
+    public override string[] Refs => [];
+
+    public override string[] Records => _records ??= [ToString()];
+}

@@ -1,0 +1,90 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Blockchain;
+using Nethermind.Consensus.AuRa.Validators;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Crypto;
+using Nethermind.Logging;
+using Nethermind.Serialization.Rlp;
+
+namespace Nethermind.Consensus.AuRa
+{
+    public class AuRaSealer(
+        IBlockTree blockTree,
+        IValidatorStore validatorStore,
+        IAuRaStepCalculator auRaStepCalculator,
+        ISigner signer,
+        IValidSealerStrategy validSealerStrategy,
+        ILogManager logManager) : ISealer
+    {
+        private readonly IBlockTree _blockTree = blockTree ?? throw new ArgumentNullException(nameof(blockTree));
+        private readonly IValidatorStore _validatorStore = validatorStore ?? throw new ArgumentNullException(nameof(validatorStore));
+        private readonly IAuRaStepCalculator _auRaStepCalculator = auRaStepCalculator ?? throw new ArgumentNullException(nameof(auRaStepCalculator));
+        private readonly ISigner _signer = signer ?? throw new ArgumentNullException(nameof(signer));
+        private readonly IValidSealerStrategy _validSealerStrategy = validSealerStrategy ?? throw new ArgumentNullException(nameof(validSealerStrategy));
+        private readonly ILogger _logger = logManager?.GetClassLogger<AuRaSealer>() ?? throw new ArgumentNullException(nameof(logManager));
+
+        public Task<Block> SealBlock(Block block, CancellationToken cancellationToken)
+        {
+            Block sealedBlock = Seal(block);
+            if (sealedBlock is not null)
+            {
+                sealedBlock.Header.Hash = sealedBlock.Header.CalculateHash();
+            }
+
+            return Task.FromResult(sealedBlock);
+        }
+
+        private Block Seal(Block block)
+        {
+            // Bail out if we're unauthorized to sign a block
+            if (!CanSeal(block.Number, block.ParentHash))
+            {
+                if (_logger.IsInfo) _logger.Info($"Not authorized to seal the block {block.ToString(Block.Format.Short)}");
+                return null;
+            }
+
+            ValueHash256 headerHash = block.Header.CalculateValueHash(RlpBehaviors.ForSealing);
+            if (!_signer.TrySign(in headerHash, out Signature signature))
+            {
+                if (_logger.IsWarn) _logger.Warn($"AuRa signer {_signer.Address} could not sign block {block.Number} — skipping seal.");
+                return null;
+            }
+            block.Header.RequireAuRa().AuRaSignature = signature.BytesWithRecovery;
+
+            return block;
+        }
+
+        public bool CanSeal(ulong blockNumber, Hash256 parentHash)
+        {
+            bool StepNotYetProduced(ulong step) => _blockTree.Head.Header.GetAuRaStep() is { } headStep
+                ? headStep < step
+                : throw new InvalidOperationException("Head block doesn't have AuRaStep specified.'");
+
+            bool IsThisNodeTurn(ulong step)
+            {
+                Address[] validators = _validatorStore.GetValidators();
+                return _validSealerStrategy.IsValidSealer(validators, _signer.Address, step, out _);
+            }
+
+            ulong currentStep = _auRaStepCalculator.CurrentStep;
+            bool stepNotYetProduced = StepNotYetProduced(currentStep);
+            bool isThisNodeTurn = IsThisNodeTurn(currentStep);
+            if (isThisNodeTurn)
+            {
+                if (_logger.IsWarn && !stepNotYetProduced) _logger.Warn($"Cannot seal block {blockNumber}: AuRa step {currentStep} already produced.");
+                else if (_logger.IsDebug && stepNotYetProduced) _logger.Debug($"Can seal block {blockNumber}: {_signer.Address} is correct proposer of AuRa step {currentStep}.");
+            }
+            else if (_logger.IsDebug) _logger.Debug($"Skip seal block {blockNumber}: {_signer.Address} is not proposer of AuRa step {currentStep}.");
+
+            return _signer.CanSign && stepNotYetProduced && isThisNodeTurn;
+        }
+
+        public Address Address => _signer.Address;
+    }
+}

@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+# SPDX-License-Identifier: LGPL-3.0-only
+
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0.301-resolute@sha256:fe81f048c2ff6cdbcc16ad4c1690c5a4f383edab8fdabdf02b3b782591b656c5 AS build
+
+ARG BUILD_CONFIG=release
+ARG CI=true
+ARG COMMIT_HASH
+ARG SOURCE_DATE_EPOCH
+ARG TARGETARCH
+
+WORKDIR /nethermind
+
+COPY src/Nethermind src/Nethermind
+COPY Directory.*.props .
+COPY Directory.Build.targets .
+COPY global.json .
+COPY nuget.config .
+
+RUN arch=$([ "$TARGETARCH" = "amd64" ] && echo "x64" || echo "$TARGETARCH") && \
+  cd src/Nethermind/Nethermind.Runner && \
+  dotnet restore --locked-mode && \
+  dotnet publish -c $BUILD_CONFIG -a $arch -o /publish --no-restore --no-self-contained \
+    -p:SourceRevisionId=$COMMIT_HASH
+
+# Creating these directories here is needed to ensure the correct permissions
+RUN cd /publish && \
+  mkdir keystore && \
+  mkdir logs && \
+  mkdir nethermind_db
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0.9-resolute-chiseled@sha256:d942d0db45f473ca68a9a9adcb1b2d8886a75d3586a8a08eedbb42046f0dab7c
+
+WORKDIR /nethermind
+
+# For large pages
+# ENV DOTNET_GCLargePages=1
+# ENV DOTNET_GCRegionRange=0x800000000
+
+VOLUME /nethermind/keystore
+VOLUME /nethermind/logs
+VOLUME /nethermind/nethermind_db
+
+EXPOSE 8545 8551 30303
+
+COPY --from=build --chown=app /publish .
+
+USER app
+
+ENTRYPOINT ["./nethermind"]

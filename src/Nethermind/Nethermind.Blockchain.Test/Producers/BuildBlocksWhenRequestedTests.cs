@@ -1,0 +1,21 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Consensus.Producers;
+using NUnit.Framework;
+
+namespace Nethermind.Blockchain.Test.Producers;
+
+[Parallelizable(ParallelScope.All)]
+public class BuildBlocksWhenRequestedTests
+{
+    [Test, MaxTime(Timeout.MaxTestTime)]
+    public void Manual_trigger_works()
+    {
+        bool triggered = false;
+        BuildBlocksWhenRequested trigger = new();
+        trigger.TriggerBlockProduction += (s, e) => triggered = true;
+        trigger.BuildBlock();
+        Assert.That(triggered, Is.True);
+    }
+}

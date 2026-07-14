@@ -1,0 +1,71 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Autofac.Features.AttributeFilters;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Int256;
+using Nethermind.Synchronization.FastBlocks;
+
+namespace Nethermind.Synchronization.ParallelSync
+{
+    public class SyncProgressResolver(
+        IBlockTree blockTree,
+        IFullStateFinder fullStateFinder,
+        ISyncConfig syncConfig,
+        [KeyFilter(nameof(HeadersSyncFeed))] ISyncFeed<HeadersSyncBatch?> headersSyncFeed,
+        ISyncFeed<BodiesSyncBatch?> bodiesSyncFeed,
+        ISyncFeed<ReceiptsSyncBatch?> receiptsSyncFeed,
+        ISyncFeed<BlockAccessListsSyncBatch?> blockAccessListsSyncFeed)
+        : ISyncProgressResolver
+    {
+        private readonly IBlockTree _blockTree = blockTree ?? throw new ArgumentNullException(nameof(blockTree));
+        private readonly ISyncConfig _syncConfig = syncConfig ?? throw new ArgumentNullException(nameof(syncConfig));
+        private readonly IFullStateFinder _fullStateFinder = fullStateFinder ?? throw new ArgumentNullException(nameof(fullStateFinder));
+
+        public ulong FindBestFullState() => _fullStateFinder.FindBestFullState();
+        public ulong FindBestHeader() => _blockTree.BestSuggestedHeader?.Number ?? _blockTree.Head?.Number ?? 0UL;
+        public ulong FindBestFullBlock()
+        {
+            ulong headNumber = _blockTree.Head?.Number ?? 0UL;
+            return Math.Min(
+                _blockTree.BestSuggestedHeader?.Number ?? headNumber,
+                _blockTree.BestSuggestedBody?.Number ?? headNumber); // header and body suggestions advance independently
+        }
+        public bool IsLoadingBlocksFromDb() => !_blockTree.CanAcceptNewBlocks;
+        public ulong FindBestProcessedBlock() => _blockTree.Head?.Number ?? ulong.MaxValue;
+        public UInt256 ChainDifficulty => _blockTree.BestSuggestedBody?.TotalDifficulty ?? _blockTree.Head?.TotalDifficulty ?? UInt256.Zero;
+
+        public UInt256? GetTotalDifficulty(Hash256 blockHash)
+        {
+            BlockHeader best = _blockTree.BestSuggestedHeader;
+
+            if (best is not null)
+            {
+                if (best.Hash == blockHash)
+                {
+                    return best.TotalDifficulty;
+                }
+
+                if (best.ParentHash == blockHash)
+                {
+                    return best.TotalDifficulty - best.Difficulty;
+                }
+            }
+
+            UInt256? totalDifficulty = _blockTree.FindHeader(blockHash)?.TotalDifficulty;
+            return totalDifficulty?.IsZero == true ? null : totalDifficulty;
+        }
+
+        public bool IsFastBlocksHeadersFinished() => !IsFastBlocks() || !_syncConfig.DownloadHeadersInFastSync || headersSyncFeed.IsFinished;
+        public bool IsFastBlocksBodiesFinished() => !IsFastBlocks() || !_syncConfig.DownloadBodiesInFastSync || bodiesSyncFeed.IsFinished;
+        public bool IsFastBlocksReceiptsFinished() => !IsFastBlocks() || !_syncConfig.DownloadReceiptsInFastSync || receiptsSyncFeed.IsFinished;
+        public bool IsFastBlockAccessListsFinished() => !IsFastBlocks() || !_syncConfig.DownloadBlockAccessListsInFastSync || blockAccessListsSyncFeed.IsFinished;
+        public void RecalculateProgressPointers() => _blockTree.RecalculateTreeLevels();
+        public (ulong BlockNumber, Hash256 BlockHash) SyncPivot => _blockTree.SyncPivot;
+        private bool IsFastBlocks() => _syncConfig.FastSync && _blockTree.SyncPivot.BlockNumber != 0UL; // if pivot number is 0 then it is equivalent to fast blocks disabled
+    }
+}

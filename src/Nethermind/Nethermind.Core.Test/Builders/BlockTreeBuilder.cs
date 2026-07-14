@@ -1,0 +1,536 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Blocks;
+using Nethermind.Blockchain.Find;
+using Nethermind.Blockchain.BlockAccessLists;
+using Nethermind.Blockchain.Headers;
+using Nethermind.Blockchain.Receipts;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Specs;
+using Nethermind.Crypto;
+using Nethermind.Db;
+using Nethermind.Logging;
+using Nethermind.Serialization.Rlp;
+using Nethermind.State.Proofs;
+using Nethermind.State.Repositories;
+using Nethermind.Int256;
+using NUnit.Framework;
+
+namespace Nethermind.Core.Test.Builders
+{
+    public class BlockTreeBuilder(Block genesisBlock, ISpecProvider specProvider) : BuilderBase<BlockTree>
+    {
+        private static readonly ReceiptMessageDecoder ReceiptDecoder = new();
+
+        private ISpecProvider _specProvider = specProvider;
+        private IReceiptStorage? _receiptStorage;
+        private ISilaEcdsa? _ecdsa;
+        private Hash256? _stateRoot;
+        private Func<Block, Hash256>? _stateRootGen;
+        private Func<Block, Transaction, IEnumerable<LogEntry>>? _logCreationFunction;
+
+        private bool _onlyHeaders;
+        private bool _noHead = false;
+
+        public BlockTreeBuilder(ISpecProvider specProvider)
+            : this(Build.A.Block.Genesis.TestObject, specProvider)
+        {
+        }
+
+        public BlockTreeBuilder WithoutSettingHead
+        {
+            get
+            {
+                _noHead = true;
+                return this;
+            }
+        }
+
+        public BlockTree? _blockTree;
+        public BlockTree BlockTree
+        {
+            get
+            {
+                if (_blockTree is null)
+                {
+                    if (!_noHead)
+                    {
+                        // so we automatically include in all tests my questionable decision of storing Head block header at 00...
+                        BlocksDb.Set(Keccak.Zero, Rlp.Encode(Build.A.BlockHeader.TestObject).Bytes);
+                    }
+
+                    _blockTree = new BlockTree(
+                        BlockStore,
+                        HeaderStore,
+                        BlockInfoDb,
+                        MetadataDb,
+                        BadBlockStore,
+                        BlockAccessListStore,
+                        ChainLevelInfoRepository,
+                        _specProvider,
+                        SyncConfig,
+                        StateBoundary,
+                        LimboLogs.Instance);
+                }
+
+                return _blockTree;
+            }
+        }
+
+        protected override void BeforeReturn()
+        {
+            base.BeforeReturn();
+
+            TestObjectInternal ??= BlockTree;
+        }
+
+        public ISyncConfig SyncConfig { get; set; } = new SyncConfig();
+
+        public TestStateBoundary StateBoundary { get; set; } = new();
+
+        public IDb BlocksDb { get; set; } = new TestMemDb();
+        public IDb BadBlocksDb { get; set; } = new TestMemDb();
+
+        private IBlockStore? _blockStore;
+        public IBlockStore BlockStore
+        {
+            get
+            {
+                return _blockStore ??= new BlockStore(BlocksDb);
+            }
+            set
+            {
+                _blockStore = value;
+            }
+        }
+
+        public IDb HeadersDb { get; set; } = new TestMemDb();
+        public IDb BlockNumbersDb { get; set; } = new TestMemDb();
+        public IDb BlockAccessListsDb { get; set; } = new TestMemDb();
+
+        private IHeaderStore? _headerStore;
+        public IHeaderStore HeaderStore
+        {
+            get
+            {
+                return _headerStore ??= new HeaderStore(HeadersDb, BlockNumbersDb);
+            }
+            set
+            {
+                _headerStore = value;
+            }
+        }
+
+        private IBlockAccessListStore? _balStore;
+        public IBlockAccessListStore BlockAccessListStore
+        {
+            get
+            {
+                return _balStore ??= new BlockAccessListStore(BlockAccessListsDb);
+            }
+            set
+            {
+                _balStore = value;
+            }
+        }
+
+        public IDb BlockInfoDb { get; set; } = new TestMemDb();
+
+        public IDb MetadataDb { get; set; } = new TestMemDb();
+
+        private IBadBlockStore? _badBlockStore;
+        public IBadBlockStore BadBlockStore
+        {
+            get
+            {
+                return _badBlockStore ??= new BadBlockStore(BadBlocksDb, 100);
+            }
+            set
+            {
+                _badBlockStore = value;
+            }
+        }
+        private IChainLevelInfoRepository? _chainLevelInfoRepository;
+
+        public IChainLevelInfoRepository ChainLevelInfoRepository
+        {
+            get
+            {
+                return _chainLevelInfoRepository ??= new ChainLevelInfoRepository(BlockInfoDb);
+            }
+            private set
+            {
+                _chainLevelInfoRepository = value;
+            }
+        }
+
+        public BlockTreeBuilder OfHeadersOnly
+        {
+            get
+            {
+                _onlyHeaders = true;
+                return this;
+            }
+        }
+
+        public BlockTreeBuilder WithPostMergeRules()
+        {
+            PostMergeBlockTree = true;
+            return this;
+        }
+
+        public bool PostMergeBlockTree { get; set; }
+
+
+        public BlockTreeBuilder WithStateRoot(Hash256 stateRoot)
+        {
+            _stateRoot = stateRoot;
+            return this;
+        }
+
+        public BlockTreeBuilder WithStateRoot(Func<Block, Hash256> stateRootGen)
+        {
+            _stateRootGen = stateRootGen;
+            return this;
+        }
+
+        public BlockTreeBuilder OfChainLength(ulong chainLength, int splitVariant = 0, int splitFrom = 0, bool withWithdrawals = false, params Address[] blockBeneficiaries)
+        {
+            OfChainLength(out _, (int)chainLength, splitVariant, splitFrom, withWithdrawals, blockBeneficiaries);
+            return this;
+        }
+
+        public BlockTreeBuilder OfChainLength(out Block headBlock, ulong chainLength, int splitVariant = 0, int splitFrom = 0, bool withWithdrawals = false, params Address[] blockBeneficiaries) =>
+            OfChainLength(out headBlock, (int)chainLength, splitVariant, splitFrom, withWithdrawals, blockBeneficiaries);
+
+        public BlockTreeBuilder OfChainLength(int chainLength, int splitVariant = 0, int splitFrom = 0, bool withWithdrawals = false, params Address[] blockBeneficiaries)
+        {
+            OfChainLength(out _, chainLength, splitVariant, splitFrom, withWithdrawals, blockBeneficiaries);
+            return this;
+        }
+
+        public BlockTreeBuilder OfChainLength(out Block headBlock, int chainLength, int splitVariant = 0, int splitFrom = 0, bool withWithdrawals = false, params Address[] blockBeneficiaries)
+        {
+            Block current = genesisBlock;
+            headBlock = genesisBlock;
+
+            bool skipGenesis = BlockTree.Genesis is not null;
+            for (int i = 0; i < chainLength; i++)
+            {
+                Address beneficiary = blockBeneficiaries.Length == 0 ? Address.Zero : blockBeneficiaries[i % blockBeneficiaries.Length];
+                headBlock = current;
+                if (_onlyHeaders)
+                {
+                    if (!(current.IsGenesis && skipGenesis))
+                    {
+                        BlockTree.SuggestHeader(current.Header);
+                    }
+
+                    Block parent = current;
+                    current = CreateBlock(splitVariant, splitFrom, i, parent, withWithdrawals, beneficiary);
+                }
+                else
+                {
+                    if (!(current.IsGenesis && skipGenesis))
+                    {
+                        AddBlockResult result = BlockTree.SuggestBlock(current);
+                        Assert.That(result, Is.EqualTo(AddBlockResult.Added), $"Adding {current.ToString(Block.Format.Short)} at split variant {splitVariant}");
+
+                        BlockTree.TryUpdateMainChain(current.Header, true, preloadedBlocks: new[] { current });
+                    }
+
+                    Block parent = current;
+
+                    current = CreateBlock(splitVariant, splitFrom, i, parent, withWithdrawals, beneficiary);
+                }
+            }
+
+            return this;
+        }
+
+        public BlockTreeBuilder OfChainLengthWithSharedSplits(out Block headBlock, int chainLength, int splitVariant = 0, int splitFrom = 0, bool withWithdrawals = false, params Address[] blockBeneficiaries)
+        {
+            bool fromGenesis = splitFrom == 0;
+            Block current = fromGenesis
+                ? genesisBlock
+                : BlockTree.FindBlock((ulong)splitFrom, BlockTreeLookupOptions.RequireCanonical) ?? throw new ArgumentException("Cannot find split block");
+            bool skipGenesis = BlockTree.Genesis is not null;
+            for (int i = 0; i < chainLength; i++)
+            {
+                Address beneficiary = blockBeneficiaries.Length == 0 ? Address.Zero : blockBeneficiaries[i % blockBeneficiaries.Length];
+                if ((fromGenesis || i > 0) && !(current.IsGenesis && skipGenesis))
+                {
+                    if (_onlyHeaders)
+                    {
+                        BlockTree.SuggestHeader(current.Header);
+                    }
+                    else
+                    {
+                        AddBlockResult result = BlockTree.SuggestBlock(current);
+                        Assert.That(result, Is.EqualTo(AddBlockResult.Added), $"Adding {current.ToString(Block.Format.Short)} at split variant {splitVariant}");
+                        BlockTree.TryUpdateMainChain(current.Header, true, preloadedBlocks: new[] { current });
+                    }
+                }
+
+                if (i < chainLength - 1)
+                {
+                    current = CreateBlock(splitVariant, splitFrom, i, current, withWithdrawals, beneficiary);
+                }
+            }
+
+            headBlock = current;
+
+            return this;
+        }
+
+        private Block CreateBlock(int splitVariant, int splitFrom, int blockIndex, Block parent, bool withWithdrawals, Address beneficiary)
+        {
+            Block currentBlock;
+            BlockBuilder currentBlockBuilder = Build.A.Block
+                .WithNumber(blockIndex + 1)
+                .WithParent(parent)
+                .WithWithdrawals(withWithdrawals ? [TestItem.WithdrawalA_1Eth] : null)
+                .WithBaseFeePerGas(withWithdrawals ? UInt256.One : UInt256.Zero)
+                .WithBeneficiary(beneficiary);
+
+            if (_stateRoot is not null)
+            {
+                currentBlockBuilder.WithStateRoot(_stateRoot);
+            }
+
+            if (PostMergeBlockTree)
+            {
+                currentBlockBuilder.WithPostMergeRules();
+            }
+            else
+            {
+                currentBlockBuilder.WithDifficulty(BlockHeaderBuilder.DefaultDifficulty -
+                                                   ((ulong)splitFrom > parent.Number ? 0 : (ulong)splitVariant));
+            }
+
+            if (_receiptStorage is not null && blockIndex % 3 == 0)
+            {
+                Transaction[] transactions =
+                [
+                    Build.A.Transaction
+                        .WithValue(1)
+                        .WithData(Rlp.Encode(blockIndex).Bytes)
+                        .WithGasLimit(GasCostOf.Transaction * 2)
+                        .Signed(_ecdsa!, TestItem.PrivateKeyA, _specProvider.GetSpec((ulong)(blockIndex + 1), null).IsSip155Enabled)
+                        .TestObject,
+                    Build.A.Transaction
+                        .WithValue(2)
+                        .WithData(Rlp.Encode(blockIndex + 1).Bytes)
+                        .WithGasLimit(GasCostOf.Transaction * 2)
+                        .Signed(_ecdsa!, TestItem.PrivateKeyA, _specProvider.GetSpec((ulong)(blockIndex + 1), null).IsSip155Enabled)
+                        .TestObject
+                ];
+
+                currentBlock = currentBlockBuilder
+                    .WithTransactions(transactions)
+                    .WithBloom(new Bloom())
+                    .TestObject;
+
+                List<TxReceipt> receipts = [];
+                foreach (Transaction transaction in currentBlock.Transactions)
+                {
+                    LogEntry[] logEntries = _logCreationFunction?.Invoke(currentBlock, transaction).ToArray() ?? [];
+                    TxReceipt receipt = new()
+                    {
+                        Logs = logEntries,
+                        TxHash = transaction.Hash,
+                        Bloom = new Bloom(logEntries),
+                        BlockNumber = currentBlock.Number,
+                        BlockHash = currentBlock.Hash
+                    };
+
+                    receipts.Add(receipt);
+                    currentBlock.Bloom!.Add(receipt.Logs);
+                }
+
+                currentBlock.Header.TxRoot = TxTrie.CalculateRoot(currentBlock.Transactions);
+                TxReceipt[] txReceipts = receipts.ToArray();
+                currentBlock.Header.ReceiptsRoot =
+                    ReceiptTrie.CalculateRoot(_specProvider.GetSpec(currentBlock.Header), txReceipts, ReceiptDecoder);
+                currentBlock.Header.Hash = currentBlock.CalculateHash();
+                foreach (TxReceipt txReceipt in txReceipts)
+                {
+                    txReceipt.BlockHash = currentBlock.Hash;
+                }
+
+                _receiptStorage.Insert(currentBlock, txReceipts);
+            }
+            else
+            {
+                currentBlock = currentBlockBuilder
+                    .TestObject;
+            }
+
+            if (_stateRootGen is not null)
+            {
+                currentBlock.Header.StateRoot = _stateRootGen(currentBlock);
+            }
+
+            return currentBlock;
+        }
+
+        public BlockTreeBuilder WithOnlySomeBlocksProcessed(int chainLength, int processedChainLength)
+        {
+            Block current = genesisBlock;
+            for (int i = 0; i < chainLength; i++)
+            {
+                BlockTree.SuggestBlock(current);
+                if (current.Number < (ulong)processedChainLength)
+                {
+                    BlockTree.TryUpdateMainChain(current.Header, true, preloadedBlocks: new[] { current });
+                }
+
+                current = Build.A.Block.WithNumber(i + 1).WithParent(current).WithDifficulty(BlockHeaderBuilder.DefaultDifficulty).TestObject;
+            }
+
+            return this;
+        }
+
+        public static void AddBlock(IBlockTree blockTree, Block block)
+        {
+            blockTree.SuggestBlock(block);
+            blockTree.TryUpdateMainChain(block.Header, true, preloadedBlocks: new[] { block });
+        }
+
+        public BlockTreeBuilder WithBlocks(params Block[] blocks)
+        {
+            int counter = 0;
+            if (blocks.Length == 0)
+            {
+                return this;
+            }
+
+            if (blocks[0].Number != 0)
+            {
+                throw new ArgumentException("First block does not have block number 0.");
+            }
+
+            foreach (Block block in blocks)
+            {
+                if (block.Number != (ulong)counter++)
+                {
+                    throw new ArgumentException("Block numbers are not consecutively increasing.");
+                }
+
+                BlockTree.SuggestBlock(block);
+                BlockTree.TryUpdateMainChain(block.Header, true, preloadedBlocks: new[] { block });
+            }
+
+            return this;
+        }
+
+        public static void ExtendTree(IBlockTree blockTree, ulong newChainLength)
+        {
+            Block previous = blockTree.RetrieveHeadBlock()!;
+            ulong initialLength = previous.Number + 1;
+            for (ulong i = initialLength; i < newChainLength; i++)
+            {
+                previous = Build.A.Block.WithNumber(i).WithParent(previous).TestObject;
+                blockTree.SuggestBlock(previous);
+                blockTree.TryUpdateMainChain(previous.Header, true, preloadedBlocks: new[] { previous });
+            }
+        }
+
+        public BlockTreeBuilder WithTransactions(IReceiptStorage receiptStorage, Func<Block, Transaction, IEnumerable<LogEntry>>? logsForBlockBuilder = null)
+        {
+            _ecdsa = new SilaEcdsa(BlockTree.ChainId);
+            _receiptStorage = receiptStorage;
+            _logCreationFunction = logsForBlockBuilder;
+            return this;
+        }
+
+        public BlockTreeBuilder WithSpecProvider(ISpecProvider specProvider)
+        {
+            _specProvider = specProvider;
+            return this;
+        }
+
+        public BlockTreeBuilder WithDatabaseFrom(BlockTreeBuilder otherBuilder)
+        {
+            BlockStore = otherBuilder.BlockStore;
+            HeaderStore = otherBuilder.HeaderStore;
+            BlockInfoDb = otherBuilder.BlockInfoDb;
+            MetadataDb = otherBuilder.MetadataDb;
+            StateBoundary = otherBuilder.StateBoundary;
+
+            return this;
+        }
+
+        public BlockTreeBuilder WithBestPersistedState(ulong? bestPersistedState)
+        {
+            StateBoundary.BestPersistedState = bestPersistedState;
+            return this;
+        }
+
+        public BlockTreeBuilder WithBlockStore(IBlockStore blockStore)
+        {
+            BlockStore = blockStore;
+            return this;
+        }
+
+        public BlockTreeBuilder WithBadBlockStore(IBadBlockStore blockStore)
+        {
+            BadBlockStore = blockStore;
+            return this;
+        }
+
+        public BlockTreeBuilder WithHeaderStore(IHeaderStore headerStore)
+        {
+            HeaderStore = headerStore;
+            return this;
+        }
+
+        public BlockTreeBuilder WithBlocksDb(IDb blocksDb)
+        {
+            BlocksDb = blocksDb;
+            return this;
+        }
+
+        public BlockTreeBuilder WithHeadersDb(IDb headersDb)
+        {
+            HeadersDb = headersDb;
+            return this;
+        }
+
+        public BlockTreeBuilder WithBlocksNumberDb(IDb blocksNumberDb)
+        {
+            BlockNumbersDb = blocksNumberDb;
+            return this;
+        }
+
+        public BlockTreeBuilder WithBlockInfoDb(IDb blocksInfosDb)
+        {
+            BlockInfoDb = blocksInfosDb;
+            return this;
+        }
+
+        public BlockTreeBuilder WithMetadataDb(IDb metadataDb)
+        {
+            MetadataDb = metadataDb;
+            return this;
+        }
+
+        public BlockTreeBuilder WithSyncConfig(ISyncConfig syncConfig)
+        {
+            SyncConfig = syncConfig;
+            return this;
+        }
+
+        public BlockTreeBuilder WithChainLevelInfoRepository(IChainLevelInfoRepository chainLevelInfoRepository)
+        {
+            ChainLevelInfoRepository = chainLevelInfoRepository;
+            return this;
+        }
+    }
+}

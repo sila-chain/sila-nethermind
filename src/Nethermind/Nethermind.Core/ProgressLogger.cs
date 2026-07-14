@@ -1,0 +1,200 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Globalization;
+using System.Threading;
+using Nethermind.Logging;
+
+namespace Nethermind.Core
+{
+    public class ProgressLogger
+    {
+        public const int QueuePaddingLength = 8;
+        public const int SkippedPaddingLength = 7;
+        public const int SpeedPaddingLength = 7;
+        public const int BlockPaddingLength = 10;
+        public const int PrefixAlignment = -13;
+
+        private readonly ITimestamper _timestamper;
+        private readonly ILogger _logger;
+        private readonly Action<string>? _logAction;
+        private string _prefix;
+        private (ulong, ulong, long, long) _lastReportState = (0UL, 0UL, 0L, 0L);
+        private Func<ProgressLogger, string>? _formatter;
+
+        public ProgressLogger(string prefix, ILogManager logManager, ITimestamper? timestamper = null, LogLevel logLevel = LogLevel.Info)
+        {
+            _prefix = prefix;
+            _timestamper = timestamper ?? Timestamper.Default;
+            _logger = logManager.GetClassLogger<ProgressLogger>();
+            ILogger logger = _logger;
+            InterfaceLogger underlying = logger.UnderlyingLogger;
+            _logAction = logLevel switch
+            {
+                LogLevel.Info when logger.IsInfo => underlying.Info,
+                LogLevel.Debug when logger.IsDebug => underlying.Debug,
+                LogLevel.Warn when logger.IsWarn => underlying.Warn,
+                LogLevel.Error when logger.IsError => s => underlying.Error(s),
+                LogLevel.Trace when logger.IsTrace => underlying.Trace,
+                _ => null,
+            };
+        }
+
+        public void Update(ulong value)
+        {
+            UtcEndTime = null;
+
+            if (!UtcStartTime.HasValue)
+            {
+                UtcStartTime = _timestamper.UtcNow;
+                StartValue = value;
+            }
+
+            CurrentValue = value;
+        }
+
+        public void IncrementSkipped(int skipped = 1) => Interlocked.Add(ref _skipped, skipped);
+
+        public void SetMeasuringPoint(bool resetCompletion = true)
+        {
+            if (resetCompletion) UtcEndTime = null;
+
+            if (UtcStartTime is not null)
+            {
+                LastMeasurement = _timestamper.UtcNow;
+                LastValue = CurrentValue;
+            }
+
+            if (_skipped != -1) _skipped = 0;
+        }
+
+        public bool HasStarted => UtcStartTime.HasValue;
+
+        public bool HasEnded => UtcEndTime.HasValue;
+
+        public void MarkEnd()
+        {
+            if (CurrentQueued != -1) CurrentQueued = 0;
+            if (!UtcEndTime.HasValue)
+            {
+                UtcEndTime = _timestamper.UtcNow;
+            }
+        }
+
+        public void Reset(ulong startValue, ulong total)
+        {
+            LastMeasurement = UtcEndTime = _timestamper.UtcNow;
+            UtcStartTime = _timestamper.UtcNow;
+            StartValue = CurrentValue = LastValue = startValue;
+            if (CurrentQueued != -1) CurrentQueued = 0;
+            if (_skipped != -1) _skipped = 0;
+            TargetValue = total;
+        }
+
+        private long _skipped = -1;
+
+        private ulong StartValue { get; set; }
+
+        private DateTime? UtcStartTime { get; set; }
+
+        private DateTime? UtcEndTime { get; set; }
+
+        private DateTime? LastMeasurement { get; set; }
+
+        private ulong LastValue { get; set; }
+        public ulong TargetValue { get; set; }
+
+        public ulong CurrentValue { get; private set; }
+
+        // -1 sentinel = queue tracking disabled.
+        public long CurrentQueued { get; set; } = -1;
+
+        private TimeSpan Elapsed => (UtcEndTime ?? _timestamper.UtcNow) - (UtcStartTime ?? DateTime.MinValue);
+        private TimeSpan ElapsedSinceLastMeasurement => _timestamper.UtcNow - (LastMeasurement ?? DateTime.MinValue);
+
+        public decimal TotalPerSecond
+        {
+            get
+            {
+                decimal timePassed = (decimal)Elapsed.TotalSeconds;
+                if (timePassed == 0M)
+                {
+                    return 0M;
+                }
+
+                return ((decimal)CurrentValue - StartValue) / timePassed;
+            }
+        }
+
+        public decimal SkippedPerSecond
+        {
+            get
+            {
+                if (_skipped == -1) return -1;
+                if (UtcEndTime is not null)
+                {
+                    return 0;
+                }
+
+                decimal timePassed = (decimal)ElapsedSinceLastMeasurement.TotalSeconds;
+                if (timePassed == 0M)
+                {
+                    return 0M;
+                }
+
+                return _skipped / timePassed;
+            }
+        }
+
+        public decimal CurrentPerSecond
+        {
+            get
+            {
+                if (UtcEndTime is not null)
+                {
+                    return 0;
+                }
+
+                decimal timePassed = (decimal)ElapsedSinceLastMeasurement.TotalSeconds;
+                if (timePassed == 0M)
+                {
+                    return 0M;
+                }
+
+                return ((decimal)CurrentValue - LastValue) / timePassed;
+            }
+        }
+
+        public void SetFormat(Func<ProgressLogger, string> formatter) => _formatter = formatter;
+
+        public void LogProgress()
+        {
+            (ulong, ulong, long, long) reportState = (CurrentValue, TargetValue, CurrentQueued, _skipped);
+            if (reportState != _lastReportState)
+            {
+                _lastReportState = reportState;
+                _logAction?.Invoke(_formatter is not null ? _formatter(this) : DefaultFormatter());
+            }
+            SetMeasuringPoint(resetCompletion: false);
+        }
+
+        private string DefaultFormatter() => GenerateReport(_prefix, CurrentValue, TargetValue, CurrentQueued, CurrentPerSecond, SkippedPerSecond);
+
+        private static string GenerateReport(string prefix, ulong current, ulong total, long queue, decimal speed, decimal skippedPerSecond)
+        {
+            float percentage = Math.Clamp(current / (float)Math.Max(total, 1UL), 0, 1);
+            string queuedStr = (queue >= 0 ? $" queue {queue,QueuePaddingLength:N0} | " : " ");
+            string skippedStr = (skippedPerSecond >= 0 ? $"skipped {skippedPerSecond,SkippedPaddingLength:N0} Blk/s | " : "");
+            string speedStr = $"current {speed,SpeedPaddingLength:N0} Blk/s";
+            string receiptsReport =
+                $"{prefix,PrefixAlignment}" +
+                $"{current,BlockPaddingLength:N0} / {total,BlockPaddingLength:N0} ({percentage.ToString("P2", CultureInfo.InvariantCulture),8}) " +
+                Progress.GetMeter(percentage, 1) +
+                queuedStr +
+                skippedStr +
+                speedStr;
+            return receiptsReport;
+        }
+    }
+}

@@ -1,0 +1,255 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Runtime.CompilerServices;
+using Nethermind.Core;
+using Nethermind.Core.Specs;
+using Nethermind.Savm.CodeAnalysis;
+using Nethermind.Savm.GasPolicy;
+using Nethermind.Int256;
+using Nethermind.Savm.State;
+using static Nethermind.Savm.VirtualMachineStatics;
+
+namespace Nethermind.Savm;
+
+/// <summary>
+/// Contains implementations for SAVM instructions including contract creation (CREATE and CREATE2).
+/// </summary>
+public static partial class SavmInstructions
+{
+    private static readonly ReadOnlyMemory<byte> _emptyMemory = default;
+    /// <summary>
+    /// Interface for CREATE opcode types.
+    /// Implementations must specify the <see cref="ExecutionType"/> to distinguish between CREATE and CREATE2.
+    /// </summary>
+    public interface IOpCreate
+    {
+        /// <summary>
+        /// Gets the execution type corresponding to the create operation.
+        /// </summary>
+        abstract static ExecutionType ExecutionType { get; }
+    }
+
+    /// <summary>
+    /// Implements the basic contract creation opcode.
+    /// </summary>
+    public struct OpCreate : IOpCreate
+    {
+        /// <summary>
+        /// Gets the execution type for the CREATE opcode.
+        /// </summary>
+        public static ExecutionType ExecutionType => ExecutionType.CREATE;
+    }
+
+    /// <summary>
+    /// Implements the CREATE2 opcode, which allows for deterministic contract address generation.
+    /// </summary>
+    public struct OpCreate2 : IOpCreate
+    {
+        /// <summary>
+        /// Gets the execution type for the CREATE2 opcode.
+        /// </summary>
+        public static ExecutionType ExecutionType => ExecutionType.CREATE2;
+    }
+
+    /// <summary>
+    /// Implements the CREATE/CREATE2 opcode, handling new contract deployment.
+    /// This method performs validation, gas and memory cost calculations, state updates,
+    /// and delegates execution to a new call frame for the contract's initialization code.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy implementation.</typeparam>
+    /// <typeparam name="TOpCreate">The type of create operation (either <see cref="OpCreate"/> or <see cref="OpCreate2"/>).</typeparam>
+    /// <typeparam name="TTracingInst">Tracing instructions type used for instrumentation if active.</typeparam>
+    /// <param name="vm">The current virtual machine instance.</param>
+    /// <param name="stack">Reference to the SAVM stack.</param>
+    /// <param name="gas">Reference to the gas state.</param>
+    /// <param name="programCounter">Reference to the program counter.</param>
+    /// <returns>An <see cref="SavmExceptionType"/> indicating success or the type of exception encountered.</returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionCreate<TGasPolicy, TOpCreate, TTracingInst, TSip8037>(
+        VirtualMachine<TGasPolicy> vm,
+        ref SavmStack stack,
+        ref TGasPolicy gas,
+        ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpCreate : struct, IOpCreate
+        where TTracingInst : struct, IFlag
+        where TSip8037 : struct, IFlag
+    {
+        vm.MetricsCounters.IncrementCreates();
+
+        // Obtain the current SAVM specification and check if the call is static (static calls cannot create contracts).
+        IReleaseSpec spec = vm.Spec;
+        if (vm.VmState.IsStatic)
+        {
+            goto StaticCallViolation;
+        }
+
+        // Reset the return data buffer as contract creation does not use previous return data.
+        vm.ReturnData = null;
+        ExecutionEnvironment env = vm.VmState.Env;
+        IWorldState state = vm.WorldState;
+
+        // Pop parameters off the stack: value to transfer, memory position for the initialization code,
+        // and the length of the initialization code.
+        if (!stack.PopUInt256(out UInt256 value, out UInt256 memoryPositionOfInitCode, out UInt256 initCodeLength))
+            goto StackUnderflow;
+
+        Span<byte> salt = default;
+        // For CREATE2, an extra salt value is required. Use type check to differentiate.
+        if (typeof(TOpCreate) == typeof(OpCreate2))
+        {
+            if (!stack.PopWord256(out salt))
+                goto StackUnderflow;
+        }
+
+        // SIP-3860: Limit the maximum size of the initialization code.
+        bool isSip3860 = spec.IsSip3860Enabled;
+        if (isSip3860)
+        {
+            if (initCodeLength > spec.MaxInitCodeSize)
+            {
+                TGasPolicy.SetOutOfGas(ref gas);
+                goto OutOfGas;
+            }
+        }
+
+        ulong initCodeWords = SavmCalculations.Div32Ceiling(in initCodeLength, out bool outOfGas);
+        if (outOfGas)
+            goto OutOfGas;
+
+        if (!TGasPolicy.ConsumeCreateGas<TSip8037, TOpCreate>(ref gas, spec, initCodeWords))
+            goto OutOfGas;
+
+        // Update memory gas cost based on the required memory expansion for the init code.
+        if (!TGasPolicy.UpdateMemoryCost(ref gas, in memoryPositionOfInitCode, in initCodeLength, ref vm.VmState.Memory))
+            goto OutOfGas;
+
+        // Verify call depth does not exceed the maximum allowed. If exceeded, return early with empty data.
+        // This guard ensures we do not create nested contract calls beyond SAVM limits.
+        if (env.CallDepth >= MaxCallDepth)
+        {
+            vm.ReturnDataBuffer = Array.Empty<byte>();
+            return stack.PushZero<TTracingInst>();
+        }
+
+        // Load the initialization code from memory based on the specified position and length.
+        if (!vm.VmState.Memory.TryLoad(in memoryPositionOfInitCode, in initCodeLength, out ReadOnlyMemory<byte> initCode))
+            goto OutOfGas;
+
+        if (TSip8037.IsActive && !TGasPolicy.ConsumeCreateStateGas(ref gas))
+            goto OutOfGas;
+
+        // Check that the executing account has sufficient balance to transfer the specified value.
+        UInt256 balance = state.GetBalance(env.ExecutingAccount);
+        if (value > balance)
+        {
+            RefundCreateStateGas(ref gas);
+            vm.ReturnDataBuffer = Array.Empty<byte>();
+            return stack.PushZero<TTracingInst>();
+        }
+
+        // Retrieve the nonce of the executing account to ensure it hasn't reached the maximum.
+        ulong accountNonce = state.GetNonce(env.ExecutingAccount);
+        if (accountNonce >= ulong.MaxValue)
+        {
+            RefundCreateStateGas(ref gas);
+            vm.ReturnDataBuffer = Array.Empty<byte>();
+            return stack.PushZero<TTracingInst>();
+        }
+
+        // Get remaining gas for the create operation.
+        ulong gasAvailable = TGasPolicy.GetRemainingGas(in gas);
+
+        // End tracing if enabled, prior to switching to the new call frame.
+        if (TTracingInst.IsActive)
+            vm.EndInstructionTrace(gasAvailable);
+
+        // SIP-150: forward all remaining gas (capped at 63/64) to the creation frame.
+        if (!TGasPolicy.TryReserveChildGas(ref gas, spec, out ulong callGas))
+            goto OutOfGas;
+
+        // Compute the contract address:
+        // - For CREATE: based on the executing account and its current nonce.
+        // - For CREATE2: based on the executing account, the provided salt, and the init code.
+        Address contractAddress = typeof(TOpCreate) == typeof(OpCreate)
+            ? ContractAddress.From(env.ExecutingAccount, accountNonce)
+            : ContractAddress.From(env.ExecutingAccount, salt, initCode.Span);
+
+        // For SIP-2929 support, pre-warm the contract address in the access tracker to account for hot/cold storage costs.
+        if (spec.UseHotAndColdStorage)
+        {
+            vm.VmState.AccessTracker.WarmUp(contractAddress);
+        }
+
+        // Increment the nonce of the executing account to reflect the contract creation.
+        state.IncrementNonce(env.ExecutingAccount);
+
+        // Analyze and compile the initialization code.
+        CodeInfo? codeInfo = CodeInfoFactory.CreateCodeInfo(initCode);
+
+        // Take a snapshot of the current state. This allows the state to be reverted if contract creation fails.
+        Snapshot snapshot = state.TakeSnapshot();
+
+        // SIP-7610: If the account already exists and is non-zero, then the creation fails.
+        // Collision behaves as an immediate exceptional halt — burned callGas counts as block_regular.
+        if (state.IsNonZeroAccount(contractAddress, out bool accountExists))
+        {
+            RefundCreateStateGas(ref gas);
+            vm.ReturnDataBuffer = Array.Empty<byte>();
+            return stack.PushZero<TTracingInst>();
+        }
+
+        // If the contract address refers to a dead account, clear its storage before creation.
+        if (state.IsDeadAccount(contractAddress))
+        {
+            // Note: Seems to be needed on block 21827914 for some reason
+            state.ClearStorage(contractAddress);
+        }
+
+        // Deduct the transfer value from the executing account's balance.
+        state.SubtractFromBalance(env.ExecutingAccount, value, spec);
+
+        // Construct a new execution environment for the contract creation call.
+        // This environment sets up the call frame for executing the contract's initialization code.
+        ExecutionEnvironment callEnv = ExecutionEnvironment.Rent(
+            codeInfo: codeInfo,
+            executingAccount: contractAddress,
+            caller: env.ExecutingAccount,
+            codeSource: null,
+            callDepth: env.CallDepth + 1,
+            value: in value,
+            inputData: in _emptyMemory);
+
+        // Rent a new frame to run the initialization code in the new execution environment.
+        vm.ReturnData = VmState<TGasPolicy>.RentFrame(
+            gas: TGasPolicy.CreateChildFrameGas(ref gas, callGas),
+            outputDestination: 0,
+            outputLength: 0,
+            executionType: TOpCreate.ExecutionType,
+            isStatic: vm.VmState.IsStatic,
+            isCreateOnPreExistingAccount: accountExists,
+            env: callEnv,
+            stateForAccessLists: in vm.VmState.AccessTracker,
+            snapshot: in snapshot);
+
+        return SavmExceptionType.None;
+        // Jump forward to be unpredicted by the branch predictor.
+    OutOfGas:
+        return SavmExceptionType.OutOfGas;
+    StackUnderflow:
+        return SavmExceptionType.StackUnderflow;
+    StaticCallViolation:
+        return SavmExceptionType.StaticCallViolation;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        void RefundCreateStateGas(ref TGasPolicy gasState)
+        {
+            if (TSip8037.IsActive)
+            {
+                vm.CreditStateGasRefund(ref gasState, TGasPolicy.GetCreateStateCost());
+            }
+        }
+    }
+}

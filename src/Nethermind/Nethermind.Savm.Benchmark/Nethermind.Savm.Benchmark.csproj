@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsTestingPlatformApplication>false</IsTestingPlatformApplication>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Nethermind.Blockchain\Nethermind.Blockchain.csproj" />
+    <ProjectReference Include="..\Nethermind.Consensus\Nethermind.Consensus.csproj" />
+    <ProjectReference Include="..\Nethermind.Savm.Test\Nethermind.Savm.Test.csproj" />
+    <ProjectReference Include="..\Nethermind.Savm\Nethermind.Savm.csproj" />
+    <ProjectReference Include="..\Nethermind.Logging\Nethermind.Logging.csproj" />
+    <ProjectReference Include="..\Nethermind.State\Nethermind.State.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="bytecode.in" />
+  </ItemGroup>
+
+</Project>

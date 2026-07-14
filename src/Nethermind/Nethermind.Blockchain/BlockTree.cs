@@ -1,0 +1,1901 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Autofac.Features.AttributeFilters;
+using Nethermind.Blockchain.Blocks;
+using Nethermind.Blockchain.Find;
+using Nethermind.Blockchain.BlockAccessLists;
+using Nethermind.Blockchain.Headers;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Core;
+using Nethermind.Core.Caching;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Crypto;
+using Nethermind.Db;
+using Nethermind.Int256;
+using Nethermind.Logging;
+using Nethermind.Serialization.Rlp;
+using Nethermind.State;
+using Nethermind.State.Repositories;
+
+namespace Nethermind.Blockchain
+{
+    public partial class BlockTree : IBlockTree
+    {
+        // there is not much logic in the addressing here
+        internal static Hash256 DeletePointerAddressInDb = new(new BitArray(32 * 8, true).ToBytes());
+        internal static Hash256 HeadAddressInDb = Keccak.Zero;
+
+        private const int BestKnownSearchLimit = 256_000_000;
+
+        private readonly IBlockStore _blockStore;
+        private readonly IHeaderStore _headerStore;
+        private readonly IDb _blockInfoDb;
+        private readonly IDb _metadataDb;
+        private readonly IBadBlockStore _badBlockStore;
+        private readonly IBlockAccessListStore _balStore;
+
+        private readonly LruCache<ValueHash256, Block> _invalidBlocks =
+            new(128, 128, "invalid blocks");
+
+        protected readonly ILogger Logger;
+        protected readonly ISpecProvider SpecProvider;
+        private readonly ISyncConfig _syncConfig;
+        private readonly IChainLevelInfoRepository _chainLevelInfoRepository;
+        private readonly IStateBoundary _stateBoundary;
+
+        public BlockHeader? Genesis { get; protected set; }
+        public Block? Head { get; private set; }
+
+        public BlockHeader? BestSuggestedHeader { get; private set; }
+
+        public Block? BestSuggestedBody { get; private set; }
+        public BlockHeader? LowestInsertedHeader
+        {
+            get => _lowestInsertedHeader;
+            set
+            {
+                _lowestInsertedHeader = value;
+                _metadataDb.Set(MetadataDbKeys.LowestInsertedFastHeaderHash, Rlp.Encode(value?.Hash ?? value?.CalculateHash()).Bytes);
+            }
+        }
+
+        private BlockHeader? _lowestInsertedHeader;
+
+        public BlockHeader? BestSuggestedBeaconHeader { get; private set; }
+
+        public Block? BestSuggestedBeaconBody { get; private set; }
+
+        public BlockHeader? LowestInsertedBeaconHeader
+        {
+            get => _lowestInsertedBeaconHeader;
+            set
+            {
+                _lowestInsertedBeaconHeader = value;
+                _metadataDb.Set(MetadataDbKeys.LowestInsertedBeaconHeaderHash, Rlp.Encode(value?.Hash ?? value?.CalculateHash()).Bytes);
+            }
+        }
+
+        private BlockHeader? _lowestInsertedBeaconHeader;
+
+        public ulong BestKnownNumber { get; private set; }
+
+        public ulong BestKnownBeaconNumber { get; private set; }
+
+        public ulong NetworkId => SpecProvider.NetworkId;
+
+        public ulong ChainId => SpecProvider.ChainId;
+
+        private int _canAcceptNewBlocksCounter;
+        public bool CanAcceptNewBlocks => _canAcceptNewBlocksCounter == 0;
+
+        private ulong _oldestBlock;
+
+        private TaskCompletionSource? _taskCompletionSource;
+
+        private readonly ulong _genesisBlockNumber;
+
+        public BlockTree(
+            IBlockStore? blockStore,
+            IHeaderStore? headerDb,
+            [KeyFilter(DbNames.BlockInfos)] IDb? blockInfoDb,
+            [KeyFilter(DbNames.Metadata)] IDb? metadataDb,
+            IBadBlockStore? badBlockStore,
+            IBlockAccessListStore? balStore,
+            IChainLevelInfoRepository? chainLevelInfoRepository,
+            ISpecProvider? specProvider,
+            ISyncConfig? syncConfig,
+            IStateBoundary? stateBoundary,
+            ILogManager? logManager,
+            ulong genesisBlockNumber = 0)
+        {
+            Logger = logManager?.GetClassLogger<BlockTree>() ?? throw new ArgumentNullException(nameof(logManager));
+            _blockStore = blockStore ?? throw new ArgumentNullException(nameof(blockStore));
+            _headerStore = headerDb ?? throw new ArgumentNullException(nameof(headerDb));
+            _blockInfoDb = blockInfoDb ?? throw new ArgumentNullException(nameof(blockInfoDb));
+            _metadataDb = metadataDb ?? throw new ArgumentNullException(nameof(metadataDb));
+            _badBlockStore = badBlockStore ?? throw new ArgumentNullException(nameof(badBlockStore));
+            _balStore = balStore ?? throw new ArgumentNullException(nameof(balStore));
+            SpecProvider = specProvider ?? throw new ArgumentNullException(nameof(specProvider));
+            _syncConfig = syncConfig ?? throw new ArgumentNullException(nameof(syncConfig));
+            _chainLevelInfoRepository = chainLevelInfoRepository ??
+                                        throw new ArgumentNullException(nameof(chainLevelInfoRepository));
+            _stateBoundary = stateBoundary ?? throw new ArgumentNullException(nameof(stateBoundary));
+            _oldestBlock = syncConfig.AncientBodiesBarrierCalc;
+
+            _genesisBlockNumber = genesisBlockNumber;
+
+            LoadSyncPivot();
+
+            byte[]? deletePointer = _blockInfoDb.Get(DeletePointerAddressInDb);
+            if (deletePointer is not null)
+            {
+                DeleteBlocks(new Hash256(deletePointer));
+            }
+
+            // Need to be here because it still need to run even if there are no genesis to store the null entry.
+            LoadLowestInsertedHeader();
+
+            ChainLevelInfo? genesisLevel = LoadLevel(_genesisBlockNumber);
+            if (genesisLevel is not null)
+            {
+                BlockInfo genesisBlockInfo = genesisLevel.BlockInfos[0];
+                if (genesisLevel.BlockInfos.Length != 1)
+                {
+                    // just for corrupted test bases
+
+                    genesisLevel.BlockInfos = [genesisBlockInfo];
+                    _chainLevelInfoRepository.PersistLevel(0, genesisLevel);
+                    //throw new InvalidOperationException($"Genesis level in DB has {genesisLevel.BlockInfos.Length} blocks");
+                }
+
+                if (genesisBlockInfo.WasProcessed)
+                {
+                    BlockHeader genesisHeader = FindHeader(genesisBlockInfo.BlockHash, BlockTreeLookupOptions.None);
+                    Genesis = genesisHeader;
+                    LoadStartBlock();
+                    Head ??= FindBlock(genesisBlockInfo.BlockHash, BlockTreeLookupOptions.None);
+                }
+
+                RecalculateTreeLevels();
+                AttemptToFixCorruptionByMovingHeadBackwards();
+            }
+
+            if (Logger.IsInfo)
+            {
+                Logger.Info($"Block tree initialized, " +
+                             $"last processed is {Head?.Header.ToString(BlockHeader.Format.Short) ?? "0"}, " +
+                             $"best queued is {BestSuggestedHeader?.Number.ToString() ?? "0"}, " +
+                             $"best known is {BestKnownNumber}, " +
+                             $"lowest inserted header {LowestInsertedHeader?.Number}, " +
+                             $"lowest sync inserted block number {LowestInsertedBeaconHeader?.Number}");
+            }
+
+            ProductInfo.Network = $"{(ChainId == NetworkId ? BlockchainIds.GetBlockchainName(NetworkId) : ChainId)}";
+            ThisNodeInfo.AddInfo("Chain ID     :", ProductInfo.Network);
+            ThisNodeInfo.AddInfo("Chain head   :", $"{Head?.Header.ToString(BlockHeader.Format.Short) ?? "0"}");
+            if (ChainId != NetworkId)
+            {
+                ThisNodeInfo.AddInfo("Network ID   :", $"{NetworkId}");
+            }
+        }
+
+        public AddBlockResult Insert(BlockHeader header, BlockTreeInsertHeaderOptions headerOptions = BlockTreeInsertHeaderOptions.None)
+        {
+            if (!CanAcceptNewBlocks)
+            {
+                return AddBlockResult.CannotAccept;
+            }
+
+            if (header.Hash is null)
+            {
+                throw new InvalidOperationException("An attempt to insert a block header without a known hash.");
+            }
+
+            if (header.Bloom is null)
+            {
+                throw new InvalidOperationException("An attempt to insert a block header without a known bloom.");
+            }
+
+            if (header.Number == _genesisBlockNumber)
+            {
+                throw new InvalidOperationException("Genesis block should not be inserted.");
+            }
+
+            bool totalDifficultyNeeded = (headerOptions & BlockTreeInsertHeaderOptions.TotalDifficultyNotNeeded) == 0;
+
+            if (header.TotalDifficulty is null && totalDifficultyNeeded)
+            {
+                SetTotalDifficulty(header);
+            }
+
+            _headerStore.Insert(header);
+
+            bool isOnMainChain = (headerOptions & BlockTreeInsertHeaderOptions.NotOnMainChain) == 0;
+            BlockInfo blockInfo = new(header.Hash, header.TotalDifficulty ?? 0);
+
+            bool beaconInsert = (headerOptions & BlockTreeInsertHeaderOptions.BeaconHeaderMetadata) != 0;
+            if (!beaconInsert)
+            {
+                if (header.Number > BestKnownNumber)
+                {
+                    BestKnownNumber = header.Number;
+                }
+
+                if (header.Number > (BestSuggestedHeader?.Number ?? 0))
+                {
+                    BestSuggestedHeader = header;
+                }
+            }
+
+            if (beaconInsert)
+            {
+                if (header.Number > BestKnownBeaconNumber)
+                {
+                    BestKnownBeaconNumber = header.Number;
+                }
+
+                if (header.Number > (BestSuggestedBeaconHeader?.Number ?? 0))
+                {
+                    BestSuggestedBeaconHeader = header;
+                }
+
+                if (header.Number < (LowestInsertedBeaconHeader?.Number ?? ulong.MaxValue))
+                {
+                    if (Logger.IsTrace)
+                        Logger.Trace(
+                            $"LowestInsertedBeaconHeader changed, old: {LowestInsertedBeaconHeader?.Number}, new: {header?.Number}");
+                    LowestInsertedBeaconHeader = header;
+                }
+            }
+
+            bool addBeaconHeaderMetadata = (headerOptions & BlockTreeInsertHeaderOptions.BeaconHeaderMetadata) != 0;
+            bool addBeaconBodyMetadata = (headerOptions & BlockTreeInsertHeaderOptions.BeaconBodyMetadata) != 0;
+            bool moveToBeaconMainChain = (headerOptions & BlockTreeInsertHeaderOptions.MoveToBeaconMainChain) != 0;
+            if (addBeaconHeaderMetadata)
+            {
+                blockInfo.Metadata |= BlockMetadata.BeaconHeader;
+            }
+
+            if (addBeaconBodyMetadata)
+            {
+                blockInfo.Metadata |= BlockMetadata.BeaconBody;
+            }
+
+
+            if (moveToBeaconMainChain)
+            {
+                blockInfo.Metadata |= BlockMetadata.BeaconMainChain;
+            }
+
+            UpdateOrCreateLevel(header.Number, blockInfo, isOnMainChain);
+
+            return AddBlockResult.Added;
+        }
+
+        public void BulkInsertHeader(IReadOnlyList<BlockHeader> headers,
+            BlockTreeInsertHeaderOptions headerOptions = BlockTreeInsertHeaderOptions.None)
+        {
+            if (!CanAcceptNewBlocks)
+            {
+                throw new InvalidOperationException("Cannot accept new blocks at the moment.");
+            }
+            _headerStore.BulkInsert(headers);
+
+            bool isOnMainChain = (headerOptions & BlockTreeInsertHeaderOptions.NotOnMainChain) == 0;
+            bool beaconInsert = (headerOptions & BlockTreeInsertHeaderOptions.BeaconHeaderMetadata) != 0;
+            using ArrayPoolListRef<(ulong, BlockInfo)> blockInfos = new(headers.Count);
+
+            foreach (BlockHeader? header in headers)
+            {
+                BlockInfo blockInfo = new(header.Hash, header.TotalDifficulty ?? 0);
+                if (!beaconInsert)
+                {
+                    if (header.Number > BestKnownNumber)
+                    {
+                        BestKnownNumber = header.Number;
+                    }
+
+                    if (header.Number > (BestSuggestedHeader?.Number ?? 0))
+                    {
+                        BestSuggestedHeader = header;
+                    }
+                }
+
+                if (beaconInsert)
+                {
+                    if (header.Number > BestKnownBeaconNumber)
+                    {
+                        BestKnownBeaconNumber = header.Number;
+                    }
+
+                    if (header.Number > (BestSuggestedBeaconHeader?.Number ?? 0))
+                    {
+                        BestSuggestedBeaconHeader = header;
+                    }
+
+                    if (header.Number < (LowestInsertedBeaconHeader?.Number ?? ulong.MaxValue))
+                    {
+                        if (Logger.IsTrace)
+                            Logger.Trace(
+                                $"LowestInsertedBeaconHeader changed, old: {LowestInsertedBeaconHeader?.Number}, new: {header?.Number}");
+                        LowestInsertedBeaconHeader = header;
+                    }
+                }
+
+                bool addBeaconHeaderMetadata = (headerOptions & BlockTreeInsertHeaderOptions.BeaconHeaderMetadata) != 0;
+                bool addBeaconBodyMetadata = (headerOptions & BlockTreeInsertHeaderOptions.BeaconBodyMetadata) != 0;
+                bool moveToBeaconMainChain = (headerOptions & BlockTreeInsertHeaderOptions.MoveToBeaconMainChain) != 0;
+                if (addBeaconHeaderMetadata)
+                {
+                    blockInfo.Metadata |= BlockMetadata.BeaconHeader;
+                }
+
+                if (addBeaconBodyMetadata)
+                {
+                    blockInfo.Metadata |= BlockMetadata.BeaconBody;
+                }
+
+
+                if (moveToBeaconMainChain)
+                {
+                    blockInfo.Metadata |= BlockMetadata.BeaconMainChain;
+                }
+
+                blockInfos.Add((header.Number, blockInfo));
+            }
+
+            UpdateOrCreateLevel(blockInfos, isOnMainChain);
+        }
+
+        public AddBlockResult Insert(Block block, BlockTreeInsertBlockOptions insertBlockOptions = BlockTreeInsertBlockOptions.None,
+            BlockTreeInsertHeaderOptions insertHeaderOptions = BlockTreeInsertHeaderOptions.None, WriteFlags blockWriteFlags = WriteFlags.None)
+        {
+            bool skipCanAcceptNewBlocks = (insertBlockOptions & BlockTreeInsertBlockOptions.SkipCanAcceptNewBlocks) != 0;
+            if (!CanAcceptNewBlocks)
+            {
+                if (Logger.IsTrace) Logger.Trace($"Block tree in cannot accept new blocks mode. SkipCanAcceptNewBlocks: {skipCanAcceptNewBlocks}, Block {block}");
+            }
+
+            if (!CanAcceptNewBlocks && !skipCanAcceptNewBlocks)
+            {
+                return AddBlockResult.CannotAccept;
+            }
+
+            if (block.Number == _genesisBlockNumber)
+            {
+                throw new InvalidOperationException("Genesis block should not be inserted.");
+            }
+
+            _blockStore.Insert(block, writeFlags: blockWriteFlags);
+            _headerStore.InsertBlockNumber(block.Hash, block.Number);
+            _balStore.InsertFromBlock(block);
+
+            bool saveHeader = (insertBlockOptions & BlockTreeInsertBlockOptions.SaveHeader) != 0;
+            if (saveHeader)
+            {
+                Insert(block.Header, insertHeaderOptions);
+            }
+
+            return AddBlockResult.Added;
+        }
+
+        protected virtual AddBlockResult Suggest(Block? block, BlockHeader header, BlockTreeSuggestOptions options = BlockTreeSuggestOptions.ShouldProcess)
+        {
+            bool shouldProcess = options.ContainsFlag(BlockTreeSuggestOptions.ShouldProcess);
+            bool fillBeaconBlock = options.ContainsFlag(BlockTreeSuggestOptions.FillBeaconBlock);
+            bool setAsMain = options.ContainsFlag(BlockTreeSuggestOptions.ForceSetAsMain) ||
+                             !options.ContainsFlag(BlockTreeSuggestOptions.ForceDontSetAsMain) && !shouldProcess;
+
+            if (Logger.IsTrace) Logger.Trace($"Suggesting a new block. BestSuggestedBlock {BestSuggestedBody}, BestSuggestedBlock TD {BestSuggestedBody?.TotalDifficulty}, Block TD {block?.TotalDifficulty}, Head: {Head}, Head TD: {Head?.TotalDifficulty}, Block {block?.ToString(Block.Format.FullHashAndNumber)}. ShouldProcess: {shouldProcess}, TryProcessKnownBlock: {fillBeaconBlock}, SetAsMain {setAsMain}");
+
+#if DEBUG
+            /* this is just to make sure that we do not fall into this trap when creating tests */
+            if (header.StateRoot is null && !header.IsGenesis)
+            {
+                throw new InvalidDataException($"State root is null in {header.ToString(BlockHeader.Format.Short)}");
+            }
+#endif
+
+            if (header.Hash is null)
+            {
+                throw new InvalidOperationException("An attempt to suggest a header with a null hash.");
+            }
+
+            if (!CanAcceptNewBlocks)
+            {
+                return AddBlockResult.CannotAccept;
+            }
+
+            if (_invalidBlocks.Contains(header.Hash))
+            {
+                return AddBlockResult.InvalidBlock;
+            }
+
+            bool isKnown = IsKnownBlock(header.Number, header.Hash);
+            if (isKnown && (BestSuggestedHeader?.Number ?? 0) >= header.Number)
+            {
+                if (Logger.IsTrace) Logger.Trace($"Block {header.ToString(BlockHeader.Format.FullHashAndNumber)} already known.");
+                return AddBlockResult.AlreadyKnown;
+            }
+
+            bool parentExists = IsKnownBlock(header.Number - 1, header.ParentHash!) ||
+                                IsKnownBeaconBlock(header.Number - 1, header.ParentHash!);
+            if (!header.IsGenesis && !parentExists)
+            {
+                if (Logger.IsTrace) Logger.Trace($"Could not find parent ({header.ParentHash}) of block {header.Hash}");
+                return AddBlockResult.UnknownParent;
+            }
+
+            SetTotalDifficulty(header);
+
+            if (block is not null)
+            {
+                if (block.Hash is null)
+                {
+                    throw new InvalidOperationException("An attempt to suggest block with a null hash.");
+                }
+
+                // Body and BAL persistence defer off the engine API path; visibility stays synchronous via
+                // each store's pending overlay, and the live block's BAL is freed synchronously as before.
+                _blockStore.InsertDeferred(block);
+                _balStore.InsertFromBlockDeferred(block);
+            }
+
+            if (!isKnown)
+            {
+                _headerStore.Insert(header);
+            }
+
+            if (!isKnown || fillBeaconBlock)
+            {
+                BlockInfo blockInfo = new(header.Hash, header.TotalDifficulty ?? 0);
+                UpdateOrCreateLevel(header.Number, blockInfo, setAsMain);
+                NewSuggestedBlock?.Invoke(this, new BlockEventArgs(block!));
+            }
+
+            if (header.IsGenesis)
+            {
+                Genesis = header;
+                BestSuggestedHeader = header;
+            }
+
+            if (block is not null)
+            {
+                bool bestSuggestedImprovementSatisfied = BestSuggestedImprovementRequirementsSatisfied(header);
+                if (bestSuggestedImprovementSatisfied)
+                {
+                    if (Logger.IsTrace) Logger.Trace($"New best suggested block. PreviousBestSuggestedBlock {BestSuggestedBody}, BestSuggestedBlock TD {BestSuggestedBody?.TotalDifficulty}, Block TD {block?.TotalDifficulty}, Head: {Head}, Head: {Head?.TotalDifficulty}, Block {block?.ToString(Block.Format.FullHashAndNumber)}");
+                    BestSuggestedHeader = block.Header;
+
+                    if (block.IsPostMerge)
+                    {
+                        BestSuggestedBody = block;
+                    }
+                }
+
+                if (shouldProcess && (bestSuggestedImprovementSatisfied || header.IsGenesis || fillBeaconBlock))
+                {
+                    BestSuggestedBody = block;
+                    NewBestSuggestedBlock?.Invoke(this, new BlockEventArgs(block));
+                }
+            }
+
+            return AddBlockResult.Added;
+        }
+
+        public AddBlockResult SuggestHeader(BlockHeader header) => Suggest(null, header);
+
+        public async ValueTask<AddBlockResult> SuggestBlockAsync(Block block, BlockTreeSuggestOptions suggestOptions = BlockTreeSuggestOptions.ShouldProcess)
+        {
+            if (!WaitForReadinessToAcceptNewBlock.IsCompleted)
+            {
+                await WaitForReadinessToAcceptNewBlock;
+            }
+
+            return SuggestBlock(block, suggestOptions);
+        }
+
+        public AddBlockResult SuggestBlock(Block block, BlockTreeSuggestOptions options = BlockTreeSuggestOptions.ShouldProcess)
+        {
+            if (Genesis is null && !block.IsGenesis)
+            {
+                throw new InvalidOperationException("Block tree should be initialized with genesis before suggesting other blocks.");
+            }
+
+            return Suggest(block, block.Header, options);
+        }
+
+        public BlockHeader? FindHeader(ulong number, BlockTreeLookupOptions options)
+        {
+            Hash256 blockHash = GetBlockHashOnMainOrBestDifficultyHash(number);
+            return blockHash is null ? null : FindHeader(blockHash, options, blockNumber: number);
+        }
+
+        public Hash256? FindBlockHash(ulong blockNumber) => GetBlockHashOnMainOrBestDifficultyHash(blockNumber);
+
+        public bool HasBlock(ulong blockNumber, Hash256 blockHash) => _blockStore.HasBlock(blockNumber, blockHash);
+
+        public BlockHeader? FindHeader(Hash256? blockHash, BlockTreeLookupOptions options, ulong? blockNumber = null)
+        {
+            if (blockHash is null || blockHash == Keccak.Zero)
+            {
+                // TODO: would be great to check why this is still needed (maybe it is something archaic)
+                return null;
+            }
+
+            BlockHeader? header = _headerStore.Get(blockHash, shouldCache: false, blockNumber: blockNumber);
+            if (header is null)
+            {
+                bool allowInvalid = (options & BlockTreeLookupOptions.AllowInvalid) == BlockTreeLookupOptions.AllowInvalid;
+                if (allowInvalid && _invalidBlocks.TryGet(blockHash, out Block block))
+                {
+                    header = block.Header;
+                }
+
+                return header;
+            }
+
+            header.Hash ??= blockHash;
+            bool totalDifficultyNeeded = (options & BlockTreeLookupOptions.TotalDifficultyNotNeeded) == BlockTreeLookupOptions.None;
+            bool createLevelIfMissing = (options & BlockTreeLookupOptions.DoNotCreateLevelIfMissing) == BlockTreeLookupOptions.None;
+            bool requiresCanonical = (options & BlockTreeLookupOptions.RequireCanonical) == BlockTreeLookupOptions.RequireCanonical;
+
+            if ((totalDifficultyNeeded && header.TotalDifficulty is null) || requiresCanonical)
+            {
+                (BlockInfo blockInfo, ChainLevelInfo level) = LoadInfo(header.Number, header.Hash, true);
+                if (level is null || blockInfo is null)
+                {
+                    // TODO: this is here because storing block data is not transactional
+                    // TODO: would be great to remove it, he?
+                    // TODO: we should remove it - readonly method modifies DB
+                    bool isSearchingForBeaconBlock = (BestKnownBeaconNumber > BestKnownNumber && header.Number > BestKnownNumber);  // if we're searching for beacon block we don't want to create level. We're creating it in different place with beacon metadata
+                    if (!createLevelIfMissing || isSearchingForBeaconBlock)
+                    {
+                        if (Logger.IsInfo) Logger.Info($"Missing block info - ignoring creation of the level in {nameof(FindHeader)} scope when head is {Head?.ToString(Block.Format.Short)}. BlockHeader {header.ToString(BlockHeader.Format.FullHashAndNumber)}, CreateLevelIfMissing: {createLevelIfMissing}. BestKnownBeaconNumber: {BestKnownBeaconNumber}, BestKnownNumber: {BestKnownNumber}");
+                    }
+                    else
+                    {
+                        if (Logger.IsInfo) Logger.Info($"Missing block info - creating level in {nameof(FindHeader)} scope when head is {Head?.ToString(Block.Format.Short)}. BlockHeader {header.ToString(BlockHeader.Format.FullHashAndNumber)}, CreateLevelIfMissing: {createLevelIfMissing}. BestKnownBeaconNumber: {BestKnownBeaconNumber}, BestKnownNumber: {BestKnownNumber}");
+                        SetTotalDifficulty(header);
+                        blockInfo = new BlockInfo(header.Hash, header.TotalDifficulty ?? UInt256.Zero);
+                        level = UpdateOrCreateLevel(header.Number, blockInfo);
+                    }
+                }
+                else
+                {
+                    SetTotalDifficultyFromBlockInfo(header, blockInfo);
+                }
+
+                if (requiresCanonical)
+                {
+                    bool isMain = level?.MainChainBlock?.BlockHash?.Equals(blockHash) == true;
+                    header = isMain ? header : null;
+                }
+            }
+
+            if (header is not null && ShouldCache(header.Number))
+            {
+                _headerStore.Cache(header);
+            }
+
+            return header;
+        }
+
+        /// <returns>
+        /// If level has a block on the main chain then returns the block info,otherwise <value>null</value>
+        /// </returns>
+        public BlockInfo? FindCanonicalBlockInfo(ulong blockNumber)
+        {
+            ChainLevelInfo level = LoadLevel(blockNumber);
+            if (level is null)
+            {
+                return null;
+            }
+
+            if (level.HasBlockOnMainChain)
+            {
+                BlockInfo blockInfo = level.BlockInfos[0];
+                blockInfo.BlockNumber = blockNumber;
+                return blockInfo;
+            }
+
+            return null;
+        }
+
+        public Hash256? FindHash(ulong number) => GetBlockHashOnMainOrBestDifficultyHash(number);
+
+        public IOwnedReadOnlyList<BlockHeader> FindHeaders(Hash256? blockHash, int numberOfBlocks, int skip, bool reverse)
+        {
+            if (numberOfBlocks == 0)
+            {
+                return ArrayPoolList<BlockHeader>.Empty();
+            }
+
+            if (blockHash is null)
+            {
+                return new ArrayPoolList<BlockHeader>(numberOfBlocks, numberOfBlocks);
+            }
+
+            BlockHeader startHeader = FindHeader(blockHash, BlockTreeLookupOptions.TotalDifficultyNotNeeded);
+            if (startHeader is null)
+            {
+                return new ArrayPoolList<BlockHeader>(numberOfBlocks, numberOfBlocks);
+            }
+
+            if (numberOfBlocks == 1)
+            {
+                return new ArrayPoolList<BlockHeader>(1) { startHeader };
+            }
+
+            if (skip == 0)
+            {
+                static ArrayPoolList<BlockHeader> FindHeadersReversedFast(BlockTree tree, BlockHeader startHeader, int numberOfBlocks, bool reverse = false)
+                {
+                    ArgumentNullException.ThrowIfNull(startHeader);
+                    if (numberOfBlocks == 1)
+                    {
+                        return new ArrayPoolList<BlockHeader>(1) { startHeader };
+                    }
+
+                    ArrayPoolList<BlockHeader> result = new(numberOfBlocks, numberOfBlocks);
+
+                    BlockHeader current = startHeader;
+                    int responseIndex = reverse ? 0 : numberOfBlocks - 1;
+                    int step = reverse ? 1 : -1;
+                    do
+                    {
+                        result[responseIndex] = current;
+                        responseIndex += step;
+                        if (responseIndex < 0)
+                        {
+                            break;
+                        }
+
+                        current = tree.FindParentHeader(current, BlockTreeLookupOptions.TotalDifficultyNotNeeded);
+                    } while (current is not null && responseIndex < numberOfBlocks);
+
+                    return result;
+                }
+
+                /* if we do not skip and we have the last block then we can assume that all the blocks are there
+                   and we can use the fact that we can use parent hash and that searching by hash is much faster
+                   as it does not require the step of resolving number -> hash */
+                if (reverse)
+                {
+                    return FindHeadersReversedFast(this, startHeader, numberOfBlocks, true);
+                }
+                else
+                {
+                    BlockHeader endHeader = FindHeader(startHeader.Number + (ulong)(numberOfBlocks - 1), BlockTreeLookupOptions.TotalDifficultyNotNeeded);
+                    if (endHeader is not null)
+                    {
+                        return FindHeadersReversedFast(this, endHeader, numberOfBlocks);
+                    }
+                }
+            }
+
+            ArrayPoolList<BlockHeader> result = new(numberOfBlocks, numberOfBlocks);
+            BlockHeader current = startHeader;
+            int responseIndex = 0;
+            do
+            {
+                result[responseIndex] = current;
+                responseIndex++;
+                ulong offset = (ulong)responseIndex * ((ulong)skip + 1ul);
+                ulong nextNumber;
+                if (reverse)
+                {
+                    if (startHeader.Number < offset)
+                    {
+                        break;
+                    }
+                    nextNumber = startHeader.Number - offset;
+                }
+                else
+                {
+                    nextNumber = startHeader.Number + offset;
+                }
+
+                current = FindHeader(nextNumber, BlockTreeLookupOptions.TotalDifficultyNotNeeded);
+            } while (current is not null && responseIndex < numberOfBlocks);
+
+            return result;
+        }
+
+        private Hash256? GetBlockHashOnMainOrBestDifficultyHash(ulong blockNumber)
+        {
+            ChainLevelInfo level = LoadLevel(blockNumber);
+            if (level is null)
+            {
+                return null;
+            }
+
+            if (level.HasBlockOnMainChain)
+            {
+                return level.BlockInfos[0].BlockHash;
+            }
+
+            bool IsPostMerge(Block? block) => SpecProvider.TerminalTotalDifficulty is { } ttd
+                                              && (block?.TotalDifficulty ?? UInt256.Zero) >= ttd;
+
+            // Post-merge: TD never increases, so the best-TD fallback cannot distinguish canonical from orphaned.
+            if (IsPostMerge(Head))
+            {
+                return null;
+            }
+
+            // Pre-merge: the block with the highest total difficulty is canonical by PoW rule.
+            UInt256 bestDifficultySoFar = UInt256.Zero;
+            Hash256 bestHash = null;
+            for (int i = 0; i < level.BlockInfos.Length; i++)
+            {
+                BlockInfo current = level.BlockInfos[i];
+                if (current.TotalDifficulty >= bestDifficultySoFar)
+                {
+                    bestDifficultySoFar = current.TotalDifficulty;
+                    bestHash = current.BlockHash;
+                }
+            }
+
+            return bestHash;
+        }
+
+        public Block? FindBlock(ulong blockNumber, BlockTreeLookupOptions options)
+        {
+            Hash256 hash = GetBlockHashOnMainOrBestDifficultyHash(blockNumber);
+            return FindBlock(hash, options, blockNumber: blockNumber);
+        }
+
+        public void ReportBadBlock(Block badBlock)
+        {
+            if (badBlock.Hash is null)
+            {
+                if (Logger.IsWarn) Logger.Warn($"{nameof(ReportBadBlock)} call has been made for a block with a null hash.");
+                return;
+            }
+
+            _invalidBlocks.Set(badBlock.Hash, badBlock);
+            _badBlockStore.Insert(badBlock);
+        }
+
+        public void DeleteInvalidBlock(Block invalidBlock)
+        {
+            if (invalidBlock.Hash is null)
+            {
+                if (Logger.IsWarn) Logger.Warn($"{nameof(DeleteInvalidBlock)} call has been made for a block with a null hash.");
+                return;
+            }
+
+            if (Logger.IsDebug) Logger.Debug($"Deleting invalid block {invalidBlock.ToString(Block.Format.FullHashAndNumber)}");
+
+            ReportBadBlock(invalidBlock);
+
+            BestSuggestedHeader = Head?.Header;
+            BestSuggestedBody = Head;
+
+            BlockAcceptingNewBlocks();
+
+            try
+            {
+                DeleteBlocks(invalidBlock.Hash!);
+            }
+            finally
+            {
+                ReleaseAcceptingNewBlocks();
+            }
+        }
+
+        public void DeleteOldBlock(ulong blockNumber, Hash256 blockHash)
+            => _blockStore.Delete(blockNumber, blockHash);
+
+        private void DeleteBlocks(Hash256 deletePointer)
+        {
+            BlockHeader? deleteHeader = FindHeader(deletePointer, BlockTreeLookupOptions.TotalDifficultyNotNeeded);
+            if (deleteHeader is null)
+            {
+                if (Logger.IsWarn) Logger.Warn($"Cannot delete invalid block {deletePointer} - block has not been added to the database or has already been deleted.");
+                return;
+            }
+
+            if (deleteHeader.Hash is null)
+            {
+                if (Logger.IsWarn) Logger.Warn($"Cannot delete invalid block {deletePointer} - black has a null hash.");
+                return;
+            }
+
+            ulong currentNumber = deleteHeader.Number;
+            Hash256 currentHash = deleteHeader.Hash;
+            Hash256? nextHash = null;
+            ChainLevelInfo? nextLevel = null;
+
+            using BatchWrite batch = _chainLevelInfoRepository.StartBatch();
+            while (true)
+            {
+                ChainLevelInfo? currentLevel = nextLevel ?? LoadLevel(currentNumber);
+                nextLevel = LoadLevel(currentNumber + 1);
+
+                bool shouldRemoveLevel = false;
+                if (currentLevel is not null) // preparing update of the level (removal of the invalid branch block)
+                {
+                    if (currentLevel.BlockInfos.Length == 1)
+                    {
+                        shouldRemoveLevel = true;
+                    }
+                    else
+                    {
+                        currentLevel.BlockInfos = currentLevel.BlockInfos.Where(bi => bi.BlockHash != currentHash).ToArray();
+                    }
+                }
+
+                // just finding what the next descendant will be
+                if (nextLevel is not null)
+                {
+                    nextHash = FindChild(nextLevel, currentHash);
+                }
+
+                UpdateDeletePointer(nextHash);
+
+                if (shouldRemoveLevel)
+                {
+                    BestKnownNumber = Math.Min(BestKnownNumber, currentNumber.SaturatingSub(1ul));
+                    _chainLevelInfoRepository.Delete(currentNumber, batch);
+                }
+                else if (currentLevel is not null)
+                {
+                    _chainLevelInfoRepository.PersistLevel(currentNumber, currentLevel, batch);
+                }
+
+                if (Logger.IsInfo) Logger.Info($"Deleting invalid block {currentHash} at level {currentNumber}");
+                _blockStore.Delete(currentNumber, currentHash);
+                _headerStore.Delete(currentHash);
+
+                if (nextHash is null)
+                {
+                    break;
+                }
+
+                currentNumber++;
+                currentHash = nextHash;
+                nextHash = null;
+            }
+        }
+
+        private Hash256? FindChild(ChainLevelInfo level, Hash256 parentHash)
+        {
+            Hash256 childHash = null;
+            for (int i = 0; i < level.BlockInfos.Length; i++)
+            {
+                Hash256 potentialChildHash = level.BlockInfos[i].BlockHash;
+                BlockHeader? potentialChild = FindHeader(potentialChildHash, BlockTreeLookupOptions.TotalDifficultyNotNeeded);
+                if (potentialChild is null)
+                {
+                    if (Logger.IsWarn) Logger.Warn($"Block with hash {potentialChildHash} has been found on chain level but its header is missing from the DB.");
+                    return null;
+                }
+
+                if (potentialChild.ParentHash == parentHash)
+                {
+                    childHash = potentialChildHash;
+                    break;
+                }
+            }
+
+            return childHash;
+        }
+
+        public bool IsMainChain(BlockHeader blockHeader) =>
+            LoadLevel(blockHeader.Number)?.MainChainBlock?.BlockHash.Equals(blockHeader.Hash) == true;
+
+        public bool IsMainChain(Hash256 blockHash, bool throwOnMissingHash = true)
+        {
+            BlockHeader? header = FindHeader(blockHash, BlockTreeLookupOptions.TotalDifficultyNotNeeded);
+            return header is not null
+                ? IsMainChain(header)
+                : throwOnMissingHash
+                    ? throw new InvalidOperationException($"Not able to retrieve block number for an unknown block {blockHash}")
+                    : false;
+        }
+
+        public BlockHeader? FindBestSuggestedHeader() => BestSuggestedHeader;
+
+        public bool WasProcessed(ulong number, Hash256 blockHash)
+        {
+            ChainLevelInfo? levelInfo = LoadLevel(number) ?? throw new InvalidOperationException($"Not able to find block {blockHash} from an unknown level {number}");
+            int? index = levelInfo.FindIndex(blockHash) ?? throw new InvalidOperationException($"Not able to find block {blockHash} index on the chain level");
+            return levelInfo.BlockInfos[index.Value].WasProcessed;
+        }
+
+        public void MarkChainAsProcessed(IReadOnlyList<Block> blocks)
+        {
+            if (blocks.Count == 0)
+            {
+                return;
+            }
+
+            using BatchWrite batch = _chainLevelInfoRepository.StartBatch();
+
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                Block block = blocks[i];
+                if (ShouldCache(block.Number))
+                {
+                    _blockStore.Cache(block);
+                    _headerStore.Cache(block.Header);
+                }
+
+                ChainLevelInfo? level = LoadLevel(block.Number);
+                int? index = (level?.FindIndex(block.Hash)) ?? throw new InvalidOperationException($"Cannot mark unknown block {block.ToString(Block.Format.FullHashAndNumber)} as processed");
+                BlockInfo info = level.BlockInfos[index.Value];
+                info.WasProcessed = true;
+                _chainLevelInfoRepository.PersistLevel(block.Number, level, batch);
+            }
+        }
+
+        public bool TryUpdateMainChain(BlockHeader newHead, bool wereProcessed, bool forceUpdateHeadBlock = false, params ReadOnlySpan<Block> preloadedBlocks)
+        {
+            // The head itself must have a body to be moved onto the main chain (the walk below checks every
+            // ancestor the same way). Fail fast here rather than throwing later when GetBlock can't load it.
+            if (!_blockStore.HasBlock(newHead.Number, newHead.Hash!))
+            {
+                return false;
+            }
+
+            PreloadedBlockLookup cache = PreloadedBlockLookup.Build(preloadedBlocks);
+
+            // Walk back from the new head, collecting the branch of headers down to the current main chain.
+            // Only headers are loaded here, so this stays cheap regardless of reorg depth. A missing
+            // predecessor means we cannot complete the reorg - bail out without mutating anything.
+            using ArrayPoolList<BlockHeader> headers = new(16) { newHead };
+            BlockHeader current = newHead;
+            while (!current.IsGenesis)
+            {
+                // Prefer the preloaded cache (a full block the caller already holds) over a store lookup.
+                bool fromCache = cache.TryGet(current.ParentHash!, out Block? cachedParent);
+                BlockHeader? parent = fromCache
+                    ? cachedParent!.Header
+                    : this.FindParentHeader(current, BlockTreeLookupOptions.DoNotCreateLevelIfMissing);
+                if (parent is null)
+                {
+                    return false;
+                }
+
+                // Stop at the reorg's common ancestor - the first parent already on the main chain. Genesis is
+                // canonicalized at init (GenesisLoader, and TaikoGenesisBuilder for Taiko), so it is caught here
+                // by IsMainChain; we deliberately do not special-case it, so a not-yet-canonical root is moved.
+                if (IsMainChain(parent)) break;
+
+                // A header whose body is missing cannot be moved onto the main chain. Preloaded blocks
+                // already carry their body, so only store-fetched parents need the check. For a forced (FCU)
+                // reorg a missing body means the branch is incomplete; for forward processing it is a
+                // header-only beacon gap below the processed block, so we stop and move only the suffix above.
+                if (!fromCache && !_blockStore.HasBlock(parent.Number, parent.Hash!))
+                {
+                    if (forceUpdateHeadBlock) return false;
+                    break;
+                }
+
+                headers.Add(parent);
+                current = parent;
+            }
+
+            headers.Reverse(); // ascending order, from the branching point up to the new head
+            UpdateMainChainCore(headers, wereProcessed, forceUpdateHeadBlock, cache);
+            return true;
+        }
+
+        /// <summary>
+        /// Test-only: marks exactly the supplied blocks canonical without walking to the current main chain.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="TryUpdateMainChain"/> deliberately validates connectivity (it walks back to a main-chain
+        /// ancestor and refuses if a predecessor is missing). Some tests need to stage states that violate that —
+        /// e.g. a disconnected fast-sync head, beacon blocks marked canonical above a stale head, or deliberately
+        /// inconsistent level markers. This bypass moves exactly the given blocks; do not use it from production.
+        /// </remarks>
+        internal void MarkBlocksCanonicalForTest(IReadOnlyList<Block> blocks, bool wereProcessed, bool forceUpdateHeadBlock = false)
+        {
+            if (blocks.Count == 0)
+            {
+                return;
+            }
+
+            bool descending = blocks.Count > 1 && blocks[^1].Number < blocks[0].Number;
+            using ArrayPoolList<BlockHeader> headers = new(blocks.Count);
+            if (descending)
+                for (int i = blocks.Count - 1; i >= 0; i--) headers.Add(blocks[i].Header);
+            else
+                for (int i = 0; i < blocks.Count; i++) headers.Add(blocks[i].Header);
+
+            UpdateMainChainCore(headers, wereProcessed, forceUpdateHeadBlock, PreloadedBlockLookup.Build(blocks as Block[] ?? [.. blocks]));
+        }
+
+        /// <remarks>
+        /// <paramref name="headers"/> must be in ascending order and contiguous, ending at the new head.
+        /// The chain-level manipulation is header-only; full blocks are loaded one at a time afterwards
+        /// (from <paramref name="cache"/> or the store) purely to fire events and write BAL/cache, so peak
+        /// memory stays bounded. Events are raised only after the chain-level batch is flushed, so
+        /// subscribers always observe committed state.
+        /// </remarks>
+        private void UpdateMainChainCore(IReadOnlyList<BlockHeader> headers, bool wereProcessed, bool forceUpdateHeadBlock, in PreloadedBlockLookup cache)
+        {
+            if (headers.Count == 0)
+            {
+                return;
+            }
+
+#if DEBUG
+            for (int i = 1; i < headers.Count; i++)
+            {
+                if (headers[i].Number != headers[i - 1].Number + 1)
+                {
+                    throw new InvalidOperationException("Update main chain invoked with gaps");
+                }
+            }
+#endif
+
+            ulong lastNumber = headers[^1].Number;
+            ulong previousHeadNumber = Head?.Number ?? 0UL;
+
+            using ArrayPoolListRef<DeferredHeaderEvent> pending = new(headers.Count);
+            Block? headBlock = null;
+
+            using (BatchWrite batch = _chainLevelInfoRepository.StartBatch())
+            {
+                if (previousHeadNumber > lastNumber)
+                {
+                    for (ulong i = 0; i < previousHeadNumber - lastNumber; i++)
+                    {
+                        ulong levelNumber = previousHeadNumber - i;
+
+                        ChainLevelInfo? level = LoadLevel(levelNumber);
+                        if (level is not null)
+                        {
+                            level.HasBlockOnMainChain = false;
+                            _chainLevelInfoRepository.PersistLevel(levelNumber, level, batch);
+                        }
+                    }
+                }
+
+                // Clear stale canonical markers above the new head left by beacon sync.
+                // Only needed on FCU reorgs (forceUpdateHeadBlock == true). During forward sync
+                // (BlockDownloader) and forward processing (BlockchainProcessor), the markers above
+                // are either not yet set or belong to the same chain and must not be cleared.
+                if (forceUpdateHeadBlock)
+                    ClearStaleMarkersAbove(Math.Max(previousHeadNumber, lastNumber), batch);
+
+                for (int i = 0; i < headers.Count; i++)
+                {
+                    BlockHeader header = headers[i];
+
+                    // Cache the header up front (it is already in hand) so the sync-pivot lookup below and any
+                    // sync requests can be served without touching the DB - matching the pre-refactor behavior.
+                    if (ShouldCache(header.Number)) _headerStore.Cache(header);
+
+                    Hash256? previousMainHash = MoveHeaderToMain(header, batch, wereProcessed);
+
+                    // we only force update head block for the last header in the branch
+                    bool forceThisHead = forceUpdateHeadBlock && i == headers.Count - 1;
+                    bool isNewHead = wereProcessed && (forceThisHead || header.IsGenesis || HeadImprovementRequirementsSatisfied(header));
+                    if (isNewHead)
+                    {
+                        // Head improvement is evaluated progressively (HeadImprovementRequirementsSatisfied reads the
+                        // current Head), so the head must be moved here, inside the batch, before TryUpdateSyncPivot
+                        // and any event observes it. Loading one block at a time keeps peak memory bounded.
+                        headBlock = GetBlock(cache, header);
+                        if (headBlock.TotalDifficulty is null)
+                        {
+                            throw new InvalidOperationException("Head block with null total difficulty");
+                        }
+
+                        SetHeadBlock(headBlock);
+                    }
+
+                    pending.Add(new DeferredHeaderEvent(header, previousMainHash, isNewHead));
+                }
+            }
+
+            TryUpdateSyncPivot();
+
+            // Events fire only after the chain-level batch is flushed, so subscribers observe committed state.
+            // Blocks are loaded one at a time here (cache hit for preloaded/near-head blocks) and released each
+            // iteration, so a deep reorg never materializes its whole branch at once.
+            foreach (DeferredHeaderEvent deferred in pending.AsSpan())
+            {
+                BlockHeader header = deferred.Header;
+                Block block = headBlock is not null && headBlock.Hash == header.Hash ? headBlock : GetBlock(cache, header);
+
+                // Deferred so the authoritative generated BAL supersedes any suggested BAL entry from Suggest
+                // (the later overlay entry wins; the stale suggested write no-ops). Falls back to synchronous
+                // when deferral is off.
+                _balStore.InsertFromBlockDeferred(block);
+
+                if (ShouldCache(block.Number)) _blockStore.Cache(block);
+
+                if (deferred.IsNewHead)
+                {
+                    NewHeadBlock?.Invoke(this, new BlockEventArgs(block));
+                }
+
+                Block? previous = deferred.PreviousMainHash is not null && deferred.PreviousMainHash != block.Hash
+                    ? FindBlock(deferred.PreviousMainHash, BlockTreeLookupOptions.TotalDifficultyNotNeeded, blockNumber: block.Number)
+                    : null;
+                BlockAddedToMain?.Invoke(this, new BlockReplacementEventArgs(block, previous));
+            }
+
+            OnUpdateMainChain?.Invoke(this, new OnUpdateMainChainArgs(headers, wereProcessed));
+        }
+
+        /// <remarks>
+        /// Lookup over caller-preloaded blocks. The steady-state hot callers (BlockchainProcessor, BlockDownloader)
+        /// preload a single block, so a linear span scan is allocation-free and faster than building a dictionary.
+        /// Above the threshold we fall back to a Dictionary so deep reorgs stay O(1) per lookup.
+        /// </remarks>
+        private readonly ref struct PreloadedBlockLookup
+        {
+            private const int DictionaryThreshold = 8;
+
+            private readonly ReadOnlySpan<Block> _span;
+            private readonly Dictionary<Hash256, Block>? _dict;
+
+            private PreloadedBlockLookup(ReadOnlySpan<Block> span, Dictionary<Hash256, Block>? dict)
+            {
+                _span = span;
+                _dict = dict;
+            }
+
+            public static PreloadedBlockLookup Build(ReadOnlySpan<Block> preloadedBlocks)
+            {
+                if (preloadedBlocks.Length == 0) return default;
+                if (preloadedBlocks.Length <= DictionaryThreshold) return new PreloadedBlockLookup(preloadedBlocks, null);
+
+                Dictionary<Hash256, Block> dict = new(preloadedBlocks.Length);
+                foreach (Block block in preloadedBlocks)
+                {
+                    if (block.Hash is not null) dict[block.Hash] = block;
+                }
+                return new PreloadedBlockLookup(default, dict);
+            }
+
+            public bool TryGet(Hash256 hash, out Block? block)
+            {
+                if (_dict is not null) return _dict.TryGetValue(hash, out block);
+
+                foreach (Block b in _span)
+                {
+                    if (b.Hash == hash)
+                    {
+                        block = b;
+                        return true;
+                    }
+                }
+
+                block = null;
+                return false;
+            }
+        }
+
+        private Block GetBlock(in PreloadedBlockLookup cache, BlockHeader header) =>
+            cache.TryGet(header.Hash!, out Block? block)
+                ? block!
+                : FindBlock(header.Hash!, BlockTreeLookupOptions.DoNotCreateLevelIfMissing, blockNumber: header.Number)
+                  ?? throw new InvalidOperationException($"Cannot load block {header.ToString(BlockHeader.Format.FullHashAndNumber)} required to update main chain");
+
+        private readonly record struct DeferredHeaderEvent(BlockHeader Header, Hash256? PreviousMainHash, bool IsNewHead);
+
+        private void TryUpdateSyncPivot()
+        {
+            BlockHeader? newPivotHeader = FinalizedHash is not null
+                ? FindHeader(FinalizedHash, BlockTreeLookupOptions.RequireCanonical)
+                : FindHeader((Head?.Number ?? 0UL).SaturatingSub(Reorganization.MaxDepth), BlockTreeLookupOptions.RequireCanonical);
+
+            if (newPivotHeader is null)
+            {
+                if (Logger.IsTrace) Logger.Trace("Did not update sync pivot because unable to find finalized header");
+                return;
+            }
+
+            ulong? bestPersisted = _stateBoundary.BestPersistedState;
+            if (bestPersisted is null)
+            {
+                if (Logger.IsTrace) Logger.Trace("Did not update sync pivot because no best persisted state");
+                return;
+            }
+
+            if (bestPersisted < newPivotHeader.Number)
+            {
+                if (Logger.IsTrace) Logger.Trace("Best persisted is lower than sync pivot. Using best persisted state as pivot.");
+                newPivotHeader = FindHeader(bestPersisted.Value, BlockTreeLookupOptions.RequireCanonical);
+            }
+            if (newPivotHeader is null) return;
+
+            if (SyncPivot.BlockNumber >= newPivotHeader.Number) return;
+
+            (ulong BlockNumber, Hash256 BlockHash) newSyncPivot = (newPivotHeader.Number, newPivotHeader.Hash);
+            SyncPivot = newSyncPivot;
+        }
+
+        public void UpdateBeaconMainChain(IReadOnlyList<BlockInfo>? blockInfos, ulong clearBeaconMainChainStartPoint)
+        {
+            if (blockInfos is null || blockInfos.Count == 0)
+                return;
+
+            using BatchWrite batch = _chainLevelInfoRepository.StartBatch();
+
+            for (ulong j = clearBeaconMainChainStartPoint; j > blockInfos[^1].BlockNumber; --j)
+            {
+                ChainLevelInfo? level = LoadLevel(j);
+                if (level is not null)
+                {
+                    for (int i = 0; i < level.BlockInfos.Length; ++i)
+                    {
+                        level.BlockInfos[i].Metadata &= ~BlockMetadata.BeaconMainChain;
+                    }
+
+                    _chainLevelInfoRepository.PersistLevel(j, level, batch);
+                }
+            }
+
+            foreach (BlockInfo blockInfo in blockInfos)
+            {
+                ulong levelNumber = blockInfo.BlockNumber;
+                ChainLevelInfo? level = LoadLevel(levelNumber);
+                if (level is not null)
+                {
+                    for (int i = 0; i < level.BlockInfos.Length; ++i)
+                    {
+                        if (level.BlockInfos[i].BlockHash == blockInfo.BlockHash)
+                        {
+                            level.BlockInfos[i].Metadata |= BlockMetadata.BeaconMainChain;
+                        }
+                        else
+                        {
+                            level.BlockInfos[i].Metadata &= ~BlockMetadata.BeaconMainChain;
+                        }
+                    }
+
+                    _chainLevelInfoRepository.PersistLevel(levelNumber, level, batch);
+                }
+            }
+        }
+
+        private (ulong BlockNumber, Hash256 BlockHash) _syncPivot;
+        public (ulong BlockNumber, Hash256 BlockHash) SyncPivot
+        {
+            get => _syncPivot;
+            set
+            {
+                if (Logger.IsTrace) Logger.Trace($"Sync pivot updated from {SyncPivot} to {value}");
+
+                Span<byte> pivotData = stackalloc byte[38]; //1 byte (prefix) + 4 bytes (long) + 1 byte (prefix) + 32 bytes (Keccak)
+                RlpWriter writer = new(pivotData);
+                writer.Encode(value.BlockNumber);
+                writer.Encode(value.BlockHash);
+                _metadataDb.PutSpan(((long)MetadataDbKeys.UpdatedPivotData).ToBigEndianSpanWithoutLeadingZeros(out _), pivotData);
+                _syncPivot = value;
+            }
+        }
+
+
+        public virtual bool IsBetterThanHead(BlockHeader? header) =>
+            header is not null // null is never better
+            && ((header.IsGenesis && Genesis is null) // is genesis
+                || header.TotalDifficulty >= SpecProvider.TerminalTotalDifficulty // is post-merge block, we follow engine API
+                || header.TotalDifficulty > (Head?.TotalDifficulty ?? 0) // pre-merge rules
+                || (header.TotalDifficulty == Head?.TotalDifficulty // when in doubt on difficulty
+                    && ((Head?.Number ?? 0L).CompareTo(header.Number) > 0 // pick longer chain
+                        || (Head?.Hash ?? Keccak.Zero).CompareTo(header.Hash) > 0))); // or have a deterministic order on hash
+
+
+        /// <summary>
+        /// Marks the block identified by <paramref name="header"/> as the main-chain block at its level.
+        /// </summary>
+        /// <remarks>
+        /// Header-only: it touches the chain level (swap to main, processed flag, bloom) but does not load
+        /// the full block or update <see cref="Head"/>. The caller sets the head and raises events.
+        /// </remarks>
+        /// <returns>The hash of the block that was on main at this level before the move, or null if none.</returns>
+        /// <exception cref="InvalidOperationException">Invalid block</exception>
+        private Hash256? MoveHeaderToMain(BlockHeader header, BatchWrite batch, bool wasProcessed)
+        {
+            if (Logger.IsTrace) Logger.Trace($"Moving {header.ToString(BlockHeader.Format.Short)} to main");
+            if (header.Hash is null)
+            {
+                throw new InvalidOperationException("An attempt to move to main a block with hash not set.");
+            }
+
+            if (header.Bloom is null)
+            {
+                throw new InvalidOperationException("An attempt to move to main a block with bloom not set.");
+            }
+
+            ChainLevelInfo? level = LoadLevel(header.Number);
+            int? index = (level?.FindIndex(header.Hash)) ?? throw new InvalidOperationException($"Cannot move unknown block {header.ToString(BlockHeader.Format.FullHashAndNumber)} to main");
+            Hash256? hashOfThePreviousMainBlock = level.MainChainBlock?.BlockHash;
+
+            BlockInfo info = level.BlockInfos[index.Value];
+            info.WasProcessed = wasProcessed;
+            if (index.Value != 0)
+            {
+                level.SwapToMain(index.Value);
+            }
+
+            level.HasBlockOnMainChain = true;
+            _chainLevelInfoRepository.PersistLevel(header.Number, level, batch);
+
+            if (header.Number == _genesisBlockNumber)
+            {
+                Genesis = header;
+            }
+
+            if (Logger.IsTrace) Logger.Trace($"Block {header.ToString(BlockHeader.Format.Short)}, TD: {header.TotalDifficulty} added to main chain");
+
+            return hashOfThePreviousMainBlock;
+        }
+
+        protected virtual bool HeadImprovementRequirementsSatisfied(BlockHeader header)
+        {
+            // before merge TD requirements are satisfied only if TD > block head
+            bool preMergeImprovementRequirementSatisfied = header.TotalDifficulty > (Head?.TotalDifficulty ?? 0)
+                                                           && (header.TotalDifficulty <
+                                                               SpecProvider.TerminalTotalDifficulty
+                                                               || SpecProvider.TerminalTotalDifficulty is null);
+
+            // after the merge, we will accept only the blocks with Difficulty = 0. However, during the transition process
+            // we can have terminal PoW blocks with Difficulty > 0. That is why we accept everything greater or equal
+            // than current head and header.TD >= TTD.
+            bool postMergeImprovementRequirementSatisfied = SpecProvider.TerminalTotalDifficulty is not null &&
+                                                            header.TotalDifficulty >=
+                                                            SpecProvider.TerminalTotalDifficulty;
+            return preMergeImprovementRequirementSatisfied || postMergeImprovementRequirementSatisfied;
+        }
+
+        protected virtual bool BestSuggestedImprovementRequirementsSatisfied(BlockHeader header)
+        {
+            if (BestSuggestedHeader is null) return true;
+
+            bool reachedTtd = header.IsPostTTD(SpecProvider);
+            bool isPostMerge = header.IsPoS();
+            bool tdImproved = header.TotalDifficulty > (BestSuggestedBody?.TotalDifficulty ?? 0);
+            bool preMergeImprovementRequirementSatisfied = tdImproved && !reachedTtd;
+            bool terminalBlockRequirementSatisfied = tdImproved && reachedTtd && header.IsTerminalBlock(SpecProvider) && !Head.IsPoS();
+            bool postMergeImprovementRequirementSatisfied = reachedTtd && (BestSuggestedBody?.Number ?? 0) <= header.Number && isPostMerge;
+
+            return preMergeImprovementRequirementSatisfied || terminalBlockRequirementSatisfied || postMergeImprovementRequirementSatisfied;
+        }
+
+        public bool IsKnownBlock(ulong number, Hash256 blockHash)
+        {
+            if (number > BestKnownNumber)
+            {
+                return false;
+            }
+
+            // IsKnownBlock will be mainly called when new blocks are incoming
+            // and these are very likely to be all at the head of the chain
+            if (blockHash == Head?.Hash)
+            {
+                return true;
+            }
+
+            (BlockInfo blockInfo, ChainLevelInfo level) = LoadInfo(number, blockHash, false);
+            if (level is null || blockInfo is null) return false;
+            return !blockInfo.IsBeaconInfo;
+        }
+
+        public bool IsKnownBeaconBlock(ulong number, Hash256 blockHash)
+        {
+            if (number > BestKnownBeaconNumber)
+            {
+                return false;
+            }
+
+            (BlockInfo blockInfo, ChainLevelInfo level) = LoadInfo(number, blockHash, true);
+            if (level is null || blockInfo is null) return false;
+            return blockInfo.IsBeaconInfo;
+        }
+
+        private void UpdateDeletePointer(Hash256? hash)
+        {
+            if (hash is null)
+            {
+                _blockInfoDb.Delete(DeletePointerAddressInDb);
+            }
+            else
+            {
+                if (Logger.IsDebug) Logger.Debug($"Deleting an invalid block or its descendant {hash}");
+                _blockInfoDb.Set(DeletePointerAddressInDb, hash.Bytes);
+            }
+        }
+
+        public void UpdateHeadBlock(Hash256 blockHash)
+        {
+            BlockHeader? header = FindHeader(blockHash, BlockTreeLookupOptions.None);
+            if (header is not null)
+            {
+                if (Logger.IsError) Logger.Error($"Block tree override detected - updating head block to {blockHash}.");
+                _blockInfoDb.Set(HeadAddressInDb, blockHash.Bytes);
+            }
+            else
+            {
+                if (Logger.IsError) Logger.Error($"Block tree override detected - cannot find block: {blockHash}.");
+            }
+        }
+
+        private void UpdateHeadBlock(Block block)
+        {
+            BlockEventArgs args = SetHeadBlock(block);
+            NewHeadBlock?.Invoke(this, args);
+        }
+
+        // Mutates Head and writes the head hash without raising NewHeadBlock.
+        // TryUpdateMainChain raises the event itself after the ChainLevelInfoRepository write batch
+        // has been disposed (and therefore flushed) so subscribers always observe committed state.
+        private BlockEventArgs SetHeadBlock(Block block)
+        {
+            if (block.Hash is null)
+            {
+                throw new InvalidOperationException("Block suggested as the new head block has no hash set.");
+            }
+
+            if (block.IsGenesis)
+            {
+                Genesis = block.Header;
+            }
+
+            Head = block;
+            _blockInfoDb.Set(HeadAddressInDb, block.Hash.Bytes);
+            return new BlockEventArgs(block);
+        }
+
+        private ChainLevelInfo UpdateOrCreateLevel(ulong number, BlockInfo blockInfo, bool setAsMain = false)
+        {
+            using BatchWrite? batch = _chainLevelInfoRepository.StartBatch();
+
+            if (!blockInfo.IsBeaconInfo && number > BestKnownNumber)
+            {
+                BestKnownNumber = number;
+            }
+
+            ChainLevelInfo level = LoadLevel(number, false);
+
+            if (level is not null)
+            {
+                level.InsertBlockInfo(blockInfo.BlockHash, blockInfo, setAsMain);
+            }
+            else
+            {
+                level = new ChainLevelInfo(false, new[] { blockInfo });
+            }
+
+            if (setAsMain)
+            {
+                level.HasBlockOnMainChain = true;
+            }
+
+            _chainLevelInfoRepository.PersistLevel(number, level, batch);
+
+            return level;
+        }
+
+        private void UpdateOrCreateLevel(in ArrayPoolListRef<(ulong number, BlockInfo blockInfo)> blockInfos, bool setAsMain = false)
+        {
+            using BatchWrite? batch = _chainLevelInfoRepository.StartBatch();
+
+            using ArrayPoolListRef<ulong> blockNumbers = blockInfos.Select(b => b.number);
+
+            // Yes, this is measurably faster
+            using IOwnedReadOnlyList<ChainLevelInfo?> levels = _chainLevelInfoRepository.MultiLoadLevel(blockNumbers);
+            ReadOnlySpan<ChainLevelInfo?> levelsSpan = levels.AsSpan();
+
+            for (int i = 0; i < blockInfos.Count; i++)
+            {
+                (ulong number, BlockInfo blockInfo) = blockInfos[i];
+
+                if (!blockInfo.IsBeaconInfo && number > BestKnownNumber)
+                {
+                    BestKnownNumber = number;
+                }
+
+                ChainLevelInfo? level = levelsSpan[i];
+
+                if (level is not null)
+                {
+                    level.InsertBlockInfo(blockInfo.BlockHash, blockInfo, setAsMain);
+                }
+                else
+                {
+                    level = new ChainLevelInfo(false, new[] { blockInfo });
+                }
+
+                if (setAsMain)
+                {
+                    level.HasBlockOnMainChain = true;
+                }
+
+                _chainLevelInfoRepository.PersistLevel(number, level, batch);
+            }
+        }
+
+        public (BlockInfo? Info, ChainLevelInfo? Level) GetInfo(ulong number, Hash256 blockHash) => LoadInfo(number, blockHash, true);
+
+        private (BlockInfo? Info, ChainLevelInfo? Level) LoadInfo(ulong number, Hash256 blockHash, bool forceLoad)
+        {
+            ChainLevelInfo chainLevelInfo = LoadLevel(number, forceLoad);
+            return chainLevelInfo is null ? (null, null) : (chainLevelInfo.FindBlockInfo(blockHash), chainLevelInfo);
+        }
+
+        private ChainLevelInfo? LoadLevel(ulong number, bool forceLoad = true) =>
+            number > Math.Max(BestKnownNumber, BestKnownBeaconNumber) && !forceLoad
+                ? null
+                : _chainLevelInfoRepository.LoadLevel(number);
+
+        /// <summary>
+        /// To make cache useful even when we handle sync requests
+        /// </summary>
+        /// <param name="number"></param>
+        /// <returns></returns>
+        private bool ShouldCache(ulong number) =>
+            number == _genesisBlockNumber || Head is null || Head.Number < BlockStore.CacheSize || number >= Head.Number - BlockStore.CacheSize;
+
+        public ChainLevelInfo? FindLevel(ulong number) => _chainLevelInfoRepository.LoadLevel(number);
+
+        public Hash256? HeadHash => Head?.Hash;
+        public Hash256? GenesisHash => Genesis?.Hash;
+        public Hash256? PendingHash => Head?.Hash;
+        public Hash256? FinalizedHash { get; private set; }
+        public Hash256? SafeHash { get; private set; }
+        public ulong LastFinalizedBlockLevel { get; private set; }
+
+        public event EventHandler<FinalizeEventArgs>? BlocksFinalized;
+
+        public Block? FindBlock(Hash256? blockHash, BlockTreeLookupOptions options, ulong? blockNumber = null)
+        {
+            if (blockHash is null || blockHash == Keccak.Zero)
+            {
+                return null;
+            }
+
+            Block? block = null;
+            blockNumber ??= _headerStore.GetBlockNumber(blockHash);
+            if (blockNumber is not null)
+            {
+                block = _blockStore.Get(
+                    blockNumber.Value,
+                    blockHash,
+                    (options & BlockTreeLookupOptions.ExcludeTxHashes) != 0 ? RlpBehaviors.ExcludeHashes : RlpBehaviors.None,
+                    shouldCache: false);
+            }
+
+            if (block is null)
+            {
+                bool allowInvalid = (options & BlockTreeLookupOptions.AllowInvalid) == BlockTreeLookupOptions.AllowInvalid;
+                if (allowInvalid)
+                {
+                    _invalidBlocks.TryGet(blockHash, out block);
+                }
+
+                return block;
+            }
+
+            bool totalDifficultyNeeded = (options & BlockTreeLookupOptions.TotalDifficultyNotNeeded) ==
+                                         BlockTreeLookupOptions.None;
+            bool createLevelIfMissing = (options & BlockTreeLookupOptions.DoNotCreateLevelIfMissing) ==
+                                        BlockTreeLookupOptions.None;
+            bool requiresCanonical = (options & BlockTreeLookupOptions.RequireCanonical) ==
+                                     BlockTreeLookupOptions.RequireCanonical;
+
+            if ((totalDifficultyNeeded && block.TotalDifficulty is null) || requiresCanonical)
+            {
+                (BlockInfo blockInfo, ChainLevelInfo level) = LoadInfo(block.Number, block.Hash, true);
+                if (level is null || blockInfo is null)
+                {
+                    // TODO: this is here because storing block data is not transactional
+                    // TODO: would be great to remove it, he?
+                    // TODO: we should remove it - readonly method modifies DB
+                    bool isSearchingForBeaconBlock = BestKnownBeaconNumber > BestKnownNumber && block.Number > BestKnownNumber;  // if we're searching for beacon block we don't want to create level. We're creating it in different place with beacon metadata
+                    if (!createLevelIfMissing || isSearchingForBeaconBlock)
+                    {
+                        if (Logger.IsInfo) Logger.Info($"Missing block info - ignoring creation of the level in {nameof(FindBlock)} scope when head is {Head?.ToString(Block.Format.Short)}. BlockHeader {block.ToString(Block.Format.FullHashAndNumber)}, CreateLevelIfMissing: {createLevelIfMissing}. BestKnownBeaconNumber: {BestKnownBeaconNumber}, BestKnownNumber: {BestKnownNumber}");
+                    }
+                    else
+                    {
+                        if (Logger.IsInfo) Logger.Info($"Missing block info - creating level in {nameof(FindBlock)} scope when head is {Head?.ToString(Block.Format.Short)}. BlockHeader {block.ToString(Block.Format.FullHashAndNumber)}, CreateLevelIfMissing: {createLevelIfMissing}. BestKnownBeaconNumber: {BestKnownBeaconNumber}, BestKnownNumber: {BestKnownNumber}");
+                        SetTotalDifficulty(block.Header);
+                        blockInfo = new BlockInfo(block.Hash, block.TotalDifficulty ?? UInt256.Zero);
+                        level = UpdateOrCreateLevel(block.Number, blockInfo);
+                    }
+                }
+                else
+                {
+                    SetTotalDifficultyFromBlockInfo(block.Header, blockInfo);
+                }
+
+                if (requiresCanonical)
+                {
+                    bool isMain = level?.MainChainBlock?.BlockHash.Equals(blockHash) == true;
+                    block = isMain ? block : null;
+                }
+            }
+
+            if (block is not null && ShouldCache(block.Number))
+            {
+                _blockStore.Cache(block);
+                _headerStore.Cache(block.Header);
+            }
+
+            return block;
+        }
+
+        private bool IsTotalDifficultyAlwaysZero() =>
+            // In some Sila tests and possible testnets difficulty of all blocks might be zero
+            // We also checking TTD is zero to ensure that block after genesis have zero difficulty
+            Genesis?.Difficulty == 0 && SpecProvider.TerminalTotalDifficulty == 0;
+
+        private void SetTotalDifficultyFromBlockInfo(BlockHeader header, BlockInfo blockInfo)
+        {
+            if (header.IsGenesis)
+            {
+                header.TotalDifficulty = header.Difficulty;
+                return;
+            }
+
+            if (blockInfo.TotalDifficulty != UInt256.Zero)
+            {
+                header.TotalDifficulty = blockInfo.TotalDifficulty;
+                return;
+            }
+
+            if (IsTotalDifficultyAlwaysZero())
+            {
+                header.TotalDifficulty = 0;
+            }
+        }
+
+        private void SetTotalDifficulty(BlockHeader header)
+        {
+            if (header.IsGenesis)
+            {
+                header.TotalDifficulty = header.Difficulty;
+                if (Logger.IsTrace) Logger.Trace($"Genesis total difficulty is {header.TotalDifficulty}");
+                return;
+            }
+
+            if (IsTotalDifficultyAlwaysZero())
+            {
+                header.TotalDifficulty = 0;
+                if (Logger.IsTrace) Logger.Trace($"Block {header} has zero total difficulty");
+                return;
+            }
+            BlockHeader GetParentHeader(BlockHeader current) =>
+                // TotalDifficultyNotNeeded is by design here,
+                // if it was absent this would result in recursion, as if parent doesn't already have total difficulty
+                // then it would call back to SetTotalDifficulty for it
+                // This was original code but it could result in stack overflow
+                this.FindParentHeader(current, BlockTreeLookupOptions.TotalDifficultyNotNeeded)
+                ?? throw new InvalidOperationException($"An orphaned block on the chain {current}");
+
+            void SetTotalDifficultyDeep(BlockHeader current)
+            {
+                Stack<BlockHeader> stack = new();
+                while (!current.IsGenesis && !current.IsNonZeroTotalDifficulty())
+                {
+                    (BlockInfo blockInfo, ChainLevelInfo level) = LoadInfo(current.Number, current.Hash, true);
+                    if (level is null || blockInfo is null || blockInfo.TotalDifficulty == 0)
+                    {
+                        stack.Push(current);
+                        if (Logger.IsTrace)
+                            Logger.Trace(
+                                $"Calculating total difficulty for {current.ToString(BlockHeader.Format.Short)}");
+                        current = GetParentHeader(current);
+                    }
+                    else
+                    {
+                        current.TotalDifficulty = blockInfo.TotalDifficulty;
+                    }
+                }
+
+                if (current.IsGenesis)
+                {
+                    current.TotalDifficulty = current.Difficulty;
+                    BlockInfo blockInfo = new(current.Hash, current.Difficulty);
+                    blockInfo.WasProcessed = true;
+                    UpdateOrCreateLevel(current.Number, blockInfo);
+                }
+
+                while (stack.TryPop(out BlockHeader child))
+                {
+                    child.TotalDifficulty = current.TotalDifficulty + child.Difficulty;
+                    BlockInfo blockInfo = new(child.Hash, child.TotalDifficulty.Value);
+                    UpdateOrCreateLevel(child.Number, blockInfo);
+                    if (Logger.IsTrace)
+                        Logger.Trace($"Calculated total difficulty for {child} is {child.TotalDifficulty}");
+                    current = child;
+                }
+            }
+
+            if (header.IsNonZeroTotalDifficulty())
+            {
+                return;
+            }
+
+            if (Logger.IsTrace)
+                Logger.Trace($"Calculating total difficulty for {header.ToString(BlockHeader.Format.Short)}");
+
+
+            BlockHeader parentHeader = GetParentHeader(header);
+
+            if (!parentHeader.IsNonZeroTotalDifficulty())
+            {
+                SetTotalDifficultyDeep(parentHeader);
+            }
+
+            header.TotalDifficulty = parentHeader.TotalDifficulty + header.Difficulty;
+
+            if (Logger.IsTrace) Logger.Trace($"Calculated total difficulty for {header} is {header.TotalDifficulty}");
+        }
+
+        public event EventHandler<BlockReplacementEventArgs>? BlockAddedToMain;
+
+        public event EventHandler<OnUpdateMainChainArgs>? OnUpdateMainChain;
+
+        public event EventHandler<BlockEventArgs>? NewBestSuggestedBlock;
+
+        public event EventHandler<BlockEventArgs>? NewSuggestedBlock;
+
+        public event EventHandler<BlockEventArgs>? NewHeadBlock;
+        public event EventHandler<IBlockTree.ForkChoiceUpdateEventArgs>? OnForkChoiceUpdated;
+
+        /// <summary>
+        /// Can delete a slice of the chain (usually invoked when the chain is corrupted in the DB).
+        /// This will only allow to delete a slice starting somewhere before the head of the chain
+        /// and ending somewhere after the head (in case there are some hanging levels later).
+        /// </summary>
+        /// <param name="startNumber">Start level of the slice to delete</param>
+        /// <param name="endNumber">End level of the slice to delete</param>
+        /// <param name="force">Should it force of deletion of valid blocks</param>
+        /// <exception cref="ArgumentException">Thrown when <paramref name="startNumber"/> ot <paramref name="endNumber"/> do not satisfy the slice position rules</exception>
+        public int DeleteChainSlice(in ulong startNumber, ulong? endNumber = null, bool force = false)
+        {
+            int deleted = 0;
+            endNumber ??= BestKnownNumber;
+
+            if (endNumber < startNumber)
+            {
+                throw new ArgumentException("Start number must be equal or greater end number.", nameof(startNumber));
+            }
+
+            if (endNumber - startNumber > 50000)
+            {
+                throw new ArgumentException(
+                    $"Cannot delete that many blocks at once (start: {startNumber}, end {endNumber}).",
+                    nameof(startNumber));
+            }
+
+            if (startNumber < 1)
+            {
+                throw new ArgumentException("Start number must be strictly greater than 0", nameof(startNumber));
+            }
+
+            Block? newHeadBlock = null;
+
+            // we are running these checks before all the deletes
+            if (Head?.Number >= startNumber)
+            {
+                // greater than zero so will not fail
+                ChainLevelInfo? chainLevelInfo = _chainLevelInfoRepository.LoadLevel(startNumber - 1) ?? throw new InvalidDataException(
+                        $"Chain level {startNumber - 1} does not exist when {startNumber} level exists.");
+
+                // there may be no canonical block marked on this level - then we just hack to genesis
+                Hash256? newHeadHash = chainLevelInfo.HasBlockOnMainChain
+                    ? chainLevelInfo.BlockInfos[0].BlockHash
+                    : Genesis?.Hash;
+                newHeadBlock = newHeadHash is null ? null : FindBlock(newHeadHash, BlockTreeLookupOptions.None, blockNumber: startNumber - 1);
+            }
+
+            using (_chainLevelInfoRepository.StartBatch())
+            {
+                for (ulong i = endNumber.Value; i >= startNumber; i--)
+                {
+                    ChainLevelInfo? chainLevelInfo = _chainLevelInfoRepository.LoadLevel(i);
+                    if (chainLevelInfo is null)
+                    {
+                        continue;
+                    }
+
+                    _chainLevelInfoRepository.Delete(i);
+                    deleted++;
+
+                    foreach (BlockInfo blockInfo in chainLevelInfo.BlockInfos)
+                    {
+                        Hash256 blockHash = blockInfo.BlockHash;
+                        _blockInfoDb.Delete(blockHash);
+                        _blockStore.Delete(i, blockHash);
+                        _headerStore.Delete(blockHash);
+                        _balStore.Delete(i, blockHash);
+                    }
+                }
+            }
+
+            if (newHeadBlock is not null)
+            {
+                UpdateHeadBlock(newHeadBlock);
+            }
+
+            return deleted;
+        }
+
+        internal void BlockAcceptingNewBlocks()
+        {
+            if (CanAcceptNewBlocks)
+            {
+                Interlocked.CompareExchange(ref _taskCompletionSource, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously), null);
+            }
+
+            Interlocked.Increment(ref _canAcceptNewBlocksCounter);
+        }
+
+        internal void ReleaseAcceptingNewBlocks()
+        {
+            Interlocked.Decrement(ref _canAcceptNewBlocksCounter);
+            if (CanAcceptNewBlocks)
+            {
+                TaskCompletionSource tcs = Interlocked.Exchange(ref _taskCompletionSource, null);
+                tcs?.SetResult();
+            }
+        }
+
+        private Task WaitForReadinessToAcceptNewBlock => _taskCompletionSource?.Task ?? Task.CompletedTask;
+
+        public bool IsProcessingBlock { get; set; }
+
+        public void ForkChoiceUpdated(Hash256? finalizedBlockHash, Hash256? safeBlockHash)
+        {
+            bool finalizedAdvanced = finalizedBlockHash is not null
+                && finalizedBlockHash != Keccak.Zero
+                && finalizedBlockHash != FinalizedHash;
+            BlockHeader? finalizedHeader = finalizedAdvanced
+                ? FindHeader(finalizedBlockHash!, BlockTreeLookupOptions.TotalDifficultyNotNeeded)
+                : null;
+
+            FinalizedHash = finalizedBlockHash;
+            SafeHash = safeBlockHash;
+            if (finalizedHeader is not null) LastFinalizedBlockLevel = finalizedHeader.Number;
+
+            using (_metadataDb.StartWriteBatch())
+            {
+                _metadataDb.Set(MetadataDbKeys.FinalizedBlockHash, Rlp.Encode(FinalizedHash!).Bytes);
+                _metadataDb.Set(MetadataDbKeys.SafeBlockHash, Rlp.Encode(SafeHash!).Bytes);
+            }
+
+            if (finalizedHeader is not null)
+            {
+                BlocksFinalized?.Invoke(this, new FinalizeEventArgs(finalizedHeader));
+            }
+
+            TryUpdateSyncPivot();
+
+            OnForkChoiceUpdated?.Invoke(
+                this,
+                new(
+                    Head,
+                    safeBlockHash is null ? 0UL : _headerStore.GetBlockNumber(safeBlockHash) ?? 0UL,
+                    FinalizedHash is null ? 0UL : _headerStore.GetBlockNumber(FinalizedHash) ?? 0UL)
+                );
+        }
+
+        public ulong GetLowestBlock() => _oldestBlock;
+
+        public void NewOldestBlock(ulong oldestBlock) => _oldestBlock = oldestBlock;
+    }
+}

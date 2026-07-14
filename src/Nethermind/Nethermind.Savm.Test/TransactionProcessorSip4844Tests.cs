@@ -1,0 +1,192 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Core;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Specs;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Crypto;
+using Nethermind.Int256;
+using Nethermind.Savm.Tracing;
+using Nethermind.Savm.TransactionProcessing;
+using Nethermind.Logging;
+using Nethermind.Specs.Forks;
+using Nethermind.Savm.State;
+using NUnit.Framework;
+using System.Collections.Generic;
+using Nethermind.Blockchain;
+using Nethermind.Core.Test;
+
+namespace Nethermind.Savm.Test;
+
+[TestFixture]
+internal class TransactionProcessorSip4844Tests
+{
+    private ISpecProvider _specProvider = null!;
+    private ISilaEcdsa _silaEcdsa = null!;
+    private ITransactionProcessor _transactionProcessor = null!;
+    private IWorldState _stateProvider = null!;
+    private IDisposable _worldStateCloser;
+
+    [SetUp]
+    public void Setup()
+    {
+        _specProvider = new TestSpecProvider(SilaCancun.Instance);
+        _stateProvider = TestWorldStateFactory.CreateForTest();
+        _worldStateCloser = _stateProvider.BeginScope(IWorldState.PreGenesis);
+        SilaCodeInfoRepository codeInfoRepository = new(_stateProvider);
+        SilaVirtualMachine virtualMachine = new(new TestBlockhashProvider(_specProvider), _specProvider, LimboLogs.Instance);
+        _transactionProcessor = new SilaTransactionProcessor(BlobBaseFeeCalculator.Instance, _specProvider, _stateProvider, virtualMachine, codeInfoRepository, LimboLogs.Instance);
+        _silaEcdsa = new SilaEcdsa(_specProvider.ChainId);
+    }
+
+    [TearDown]
+    public void TearDown() => _worldStateCloser?.Dispose();
+
+    [TestCaseSource(nameof(BalanceIsAffectedByBlobGasTestCaseSource))]
+    [TestCaseSource(nameof(BalanceIsNotAffectedWhenNotEnoughFunds))]
+    public UInt256 Balance_is_affected_by_blob_gas_on_execution(UInt256 balance, int blobCount,
+        ulong maxFeePerBlobGas, ulong excessBlobGas, ulong value)
+    {
+        _stateProvider.CreateAccount(TestItem.AddressA, balance);
+        _stateProvider.Commit(_specProvider.GenesisSpec);
+        _stateProvider.CommitTree(0);
+
+        ulong gasLimit = GasCostOf.Transaction;
+        Transaction blobTx = Build.A.Transaction
+            .WithValue(value)
+            .WithGasPrice(1)
+            .WithMaxFeePerGas(1)
+            .WithMaxFeePerBlobGas(maxFeePerBlobGas)
+            .WithGasLimit(gasLimit)
+            .WithShardBlobTxTypeAndFields(blobCount)
+            .SignedAndResolved(_silaEcdsa, TestItem.PrivateKeyA)
+            .TestObject;
+
+        Block block = Build.A.Block
+            .WithNumber(1)
+            .WithTransactions(blobTx)
+            .WithGasLimit(gasLimit)
+            .WithExcessBlobGas(excessBlobGas)
+            .WithBaseFeePerGas(1)
+            .TestObject;
+
+        BlockExecutionContext blkCtx = new(block.Header, _specProvider.GetSpec(block.Header));
+        _transactionProcessor.CallAndRestore(blobTx, blkCtx, NullTxTracer.Instance);
+        UInt256 deltaBalance = balance - _stateProvider.GetBalance(TestItem.PrivateKeyA.Address);
+        Assert.That(deltaBalance, Is.EqualTo(UInt256.Zero));
+
+        _transactionProcessor.Execute(blobTx, blkCtx, NullTxTracer.Instance);
+        deltaBalance = balance - _stateProvider.GetBalance(TestItem.PrivateKeyA.Address);
+
+        return deltaBalance;
+    }
+
+    [Test]
+    public void Rejects_blob_tx_when_max_fee_per_blob_gas_is_below_current_blob_fee()
+    {
+        UInt256 balance = 1.Sila;
+        _stateProvider.CreateAccount(TestItem.AddressA, balance);
+        _stateProvider.Commit(_specProvider.GenesisSpec);
+        _stateProvider.CommitTree(0);
+
+        ulong gasLimit = GasCostOf.Transaction;
+        Transaction blobTx = Build.A.Transaction
+            .WithGasPrice(1)
+            .WithMaxFeePerGas(1)
+            .WithMaxFeePerBlobGas(1)
+            .WithGasLimit(gasLimit)
+            .WithShardBlobTxTypeAndFields(1)
+            .SignedAndResolved(_silaEcdsa, TestItem.PrivateKeyA)
+            .TestObject;
+
+        Block block = Build.A.Block
+            .WithNumber(1)
+            .WithTransactions(blobTx)
+            .WithGasLimit(gasLimit)
+            .WithExcessBlobGas((ulong)SilaCancun.Instance.BlobBaseFeeUpdateFraction)
+            .WithBaseFeePerGas(1)
+            .TestObject;
+
+        BlockExecutionContext blkCtx = new(block.Header, _specProvider.GetSpec(block.Header));
+        TransactionResult result = _transactionProcessor.Execute(blobTx, blkCtx, NullTxTracer.Instance);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(result.TransactionExecuted, Is.False);
+            Assert.That(result.ErrorDescription, Does.Contain("max fee per blob gas less than block blob gas fee"));
+            Assert.That(_stateProvider.GetBalance(TestItem.PrivateKeyA.Address), Is.EqualTo(balance));
+            Assert.That(_stateProvider.GetNonce(TestItem.PrivateKeyA.Address), Is.EqualTo(0UL));
+        }
+    }
+
+    public static IEnumerable<TestCaseData> BalanceIsAffectedByBlobGasTestCaseSource()
+    {
+        yield return new TestCaseData((UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob), 1, 1ul, 0ul, 0ul)
+        {
+            TestName = "Blob gas consumed for 1 blob, minimal balance",
+            ExpectedResult = (UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob),
+        };
+        yield return new TestCaseData(1.Sila, 1, 1ul, 0ul, 0ul)
+        {
+            TestName = "Blob gas consumed for 1 blob",
+            ExpectedResult = (UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob),
+        };
+        yield return new TestCaseData(1.Sila, 2, 1ul, 0ul, 0ul)
+        {
+            TestName = "Blob gas consumed for 2 blobs",
+            ExpectedResult = (UInt256)(GasCostOf.Transaction + 2 * Sip4844Constants.GasPerBlob),
+        };
+        yield return new TestCaseData(1.Sila, (int)SilaCancun.Instance.MaxBlobCount, 1ul, 0ul, 0ul)
+        {
+            TestName = "Blob gas consumed for max blobs",
+            ExpectedResult = (UInt256)(GasCostOf.Transaction + SilaCancun.Instance.GasCosts.MaxBlobGasPerBlock),
+        };
+        yield return new TestCaseData(1.Sila, 1, 10ul, 0ul, 0ul)
+        {
+            TestName = $"Blob gas consumed for 1 blob, with {nameof(Transaction.MaxFeePerBlobGas)} more than needed",
+            ExpectedResult = (UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob),
+        };
+        yield return new TestCaseData(1.Sila, 1, 10ul, (ulong)SilaCancun.Instance.BlobBaseFeeUpdateFraction, 0ul)
+        {
+            TestName = $"Blob gas consumed for 1 blob, with blob gas price hiking",
+            ExpectedResult = (UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob * 2),
+        };
+        yield return new TestCaseData(1.Sila, 1, 10ul, (ulong)SilaCancun.Instance.BlobBaseFeeUpdateFraction, 2ul)
+        {
+            TestName = $"Blob gas consumed for 1 blob, with blob gas price hiking and some {nameof(Transaction.Value)}",
+            ExpectedResult = (UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob * 2 + 2),
+        };
+    }
+
+    public static IEnumerable<TestCaseData> BalanceIsNotAffectedWhenNotEnoughFunds()
+    {
+        yield return new TestCaseData((UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob - 1), 1, 1ul, 0ul, 0ul)
+        {
+            TestName = $"Rejected if balance is not enough, all funds are returned",
+            ExpectedResult = UInt256.Zero,
+        };
+        yield return new TestCaseData((UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob + 41), 1, 1ul, 0ul, 42ul)
+        {
+            TestName = $"Rejected if balance is not enough to cover {nameof(Transaction.Value)} also, all funds are returned",
+            ExpectedResult = UInt256.Zero,
+        };
+        yield return new TestCaseData((UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob), 1, 10ul, (ulong)SilaCancun.Instance.BlobBaseFeeUpdateFraction, 0ul)
+        {
+            TestName = $"Rejected if balance is not enough due to blob gas price hiking, all funds are returned",
+            ExpectedResult = UInt256.Zero,
+        };
+        yield return new TestCaseData((UInt256)(GasCostOf.Transaction + Sip4844Constants.GasPerBlob), 1, 2ul, 0ul, 0ul)
+        {
+            TestName = $"Rejected if balance does not cover {nameof(Transaction.MaxFeePerBlobGas)}, all funds are returned",
+            ExpectedResult = UInt256.Zero,
+        };
+        yield return new TestCaseData((UInt256)(GasCostOf.Transaction + 2 * Sip4844Constants.GasPerBlob + 41), 1, 2ul, 0ul, 42ul)
+        {
+            TestName = $"Rejected if balance does not cover {nameof(Transaction.MaxFeePerBlobGas)} + {nameof(Transaction.Value)}, all funds are returned",
+            ExpectedResult = UInt256.Zero,
+        };
+    }
+}

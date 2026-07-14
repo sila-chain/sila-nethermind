@@ -1,0 +1,6 @@
+[submodule "src/tests"]
+	path = src/tests
+	url = https://github.com/sila-chain/tests.git
+[submodule "src/bench_precompiles"]
+	path = src/bench_precompiles
+	url = https://github.com/shamatar/bench_precompiles.git

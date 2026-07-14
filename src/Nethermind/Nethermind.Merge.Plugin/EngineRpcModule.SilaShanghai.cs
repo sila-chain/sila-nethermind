@@ -1,0 +1,35 @@
+// SPDX-FileCopyrightText: 2023 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Nethermind.Core;
+using Nethermind.Consensus.Producers;
+using Nethermind.Core.Crypto;
+using Nethermind.JsonRpc;
+using Nethermind.Merge.Plugin.Data;
+using Nethermind.Merge.Plugin.Handlers;
+
+namespace Nethermind.Merge.Plugin;
+
+public partial class EngineRpcModule : IEngineRpcModule
+{
+    private readonly IHandler<IReadOnlyList<Hash256>, IReadOnlyList<ExecutionPayloadBodyV1Result?>> _executionGetPayloadBodiesByHashV1Handler = executionGetPayloadBodiesByHashV1Handler;
+    private readonly IGetPayloadBodiesByRangeV1Handler _executionGetPayloadBodiesByRangeV1Handler = executionGetPayloadBodiesByRangeV1Handler;
+    private readonly IAsyncHandler<byte[], GetPayloadV2Result?> _getPayloadHandlerV2 = getPayloadHandlerV2;
+
+    public Task<ResultWrapper<ForkchoiceUpdatedV1Result>> engine_forkchoiceUpdatedV2(ForkchoiceStateV1 forkchoiceState, PayloadAttributes? payloadAttributes = null)
+        => ForkchoiceUpdated(forkchoiceState, payloadAttributes, EngineApiVersions.Fcu.V2);
+
+    public Task<ResultWrapper<GetPayloadV2Result?>> engine_getPayloadV2(byte[] payloadId)
+        => _getPayloadHandlerV2.HandleAsync(payloadId);
+
+    public ResultWrapper<IReadOnlyList<ExecutionPayloadBodyV1Result?>> engine_getPayloadBodiesByHashV1(IReadOnlyList<Hash256> blockHashes)
+        => _executionGetPayloadBodiesByHashV1Handler.Handle(blockHashes);
+
+    public Task<ResultWrapper<IReadOnlyList<ExecutionPayloadBodyV1Result?>>> engine_getPayloadBodiesByRangeV1(ulong start, ulong count)
+        => _executionGetPayloadBodiesByRangeV1Handler.Handle(start, count);
+
+    public Task<ResultWrapper<PayloadStatusV1>> engine_newPayloadV2(ExecutionPayload executionPayload)
+        => NewPayload(executionPayload, EngineApiVersions.NewPayload.V2);
+}

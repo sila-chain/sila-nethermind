@@ -1,0 +1,919 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using Nethermind.Blockchain;
+using Nethermind.Blockchain.Synchronization;
+using Nethermind.Consensus;
+using Nethermind.Consensus.Scheduler;
+using Nethermind.Core;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Test;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Core.Timers;
+using Nethermind.Logging;
+using Nethermind.Network.P2P;
+using Nethermind.Network.P2P.EventArg;
+using Nethermind.Network.P2P.Messages;
+using Nethermind.Network.P2P.Subprotocols;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62;
+using Nethermind.Network.P2P.Subprotocols.Sil.V62.Messages;
+using Nethermind.Network.Rlpx;
+using Nethermind.Network.Test.Builders;
+using Nethermind.Stats;
+using Nethermind.Stats.Model;
+using Nethermind.Synchronization;
+using Nethermind.TxPool;
+using NSubstitute;
+using NUnit.Framework;
+using DotNetty.Buffers;
+using DotNetty.Transport.Channels;
+using Nethermind.Network.P2P.ProtocolHandlers;
+using Nethermind.Serialization.Rlp;
+
+namespace Nethermind.Network.Test.P2P.Subprotocols.Sil.V62
+{
+    [TestFixture, Parallelizable(ParallelScope.Self)]
+    public class Sil62ProtocolHandlerTests
+    {
+        private ISession _session = null!;
+        private IMessageSerializationService _svc = null!;
+        private ISyncServer _syncManager = null!;
+        private ITxPool _transactionPool = null!;
+        private Block _genesisBlock = null!;
+        private Sil62ProtocolHandler _handler = null!;
+        private IGossipPolicy _gossipPolicy = null!;
+        private ITxGossipPolicy _txGossipPolicy = null!;
+        private CompositeDisposable _disposables = null!;
+
+        [SetUp]
+        public void Setup()
+        {
+            _svc = Build.A.SerializationService().WithEth().TestObject;
+
+            NetworkDiagTracer.IsEnabled = true;
+
+            _disposables = [];
+            _session = Substitute.For<ISession>();
+            Node node = new(TestItem.PublicKeyA, new IPEndPoint(IPAddress.Broadcast, 30303));
+            _session.Node.Returns(node);
+            _session.When(s => s.DeliverMessage(Arg.Any<P2PMessage>())).Do(c => c.Arg<P2PMessage>().AddTo(_disposables));
+            _syncManager = Substitute.For<ISyncServer>();
+            _transactionPool = Substitute.For<ITxPool>();
+            _genesisBlock = Build.A.Block.Genesis.TestObject;
+            _syncManager.Head.Returns(_genesisBlock.Header);
+            _syncManager.Genesis.Returns(_genesisBlock.Header);
+            ITimerFactory timerFactory = Substitute.For<ITimerFactory>();
+            _gossipPolicy = Substitute.For<IGossipPolicy>();
+            _gossipPolicy.CanGossipBlocks.Returns(true);
+            _gossipPolicy.ShouldGossipBlock(Arg.Any<BlockHeader>()).Returns(true);
+            _gossipPolicy.ShouldDisconnectGossipingNodes.Returns(false);
+            _txGossipPolicy = Substitute.For<ITxGossipPolicy>();
+            _txGossipPolicy.ShouldListenToGossipedTransactions.Returns(true);
+            _txGossipPolicy.ShouldGossipTransaction(Arg.Any<Transaction>()).Returns(true);
+            _handler = new Sil62ProtocolHandler(
+                _session,
+                _svc,
+                new NodeStatsManager(timerFactory, LimboLogs.Instance),
+                _syncManager,
+                RunImmediatelyScheduler.Instance,
+                _transactionPool,
+                _gossipPolicy,
+                LimboLogs.Instance,
+                _txGossipPolicy);
+            _handler.Init();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            _handler?.Dispose();
+            _session?.Dispose();
+            _syncManager?.Dispose();
+            _disposables.Dispose();
+        }
+
+        [Test]
+        public void Metadata_correct()
+        {
+            Assert.That(_handler.ProtocolCode, Is.EqualTo("sil"));
+            Assert.That(_handler.Name, Is.EqualTo("sil62"));
+            Assert.That(_handler.ProtocolVersion, Is.EqualTo(62));
+            Assert.That(_handler.MessageIdSpaceSize, Is.EqualTo(8));
+            Assert.That(_handler.IncludeInTxPool, Is.True);
+            Assert.That(_handler.ClientId, Is.EqualTo(_session.Node?.ClientId));
+            Assert.That(_handler.HeadHash, Is.Null);
+            Assert.That(_handler.HeadNumber, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Cannot_init_if_sync_server_head_is_not_set()
+        {
+            _syncManager.Head.Returns((BlockHeader)null);
+            Assert.Throws<InvalidOperationException>(() => _handler.Init());
+        }
+
+        [Test]
+        public void Should_stop_notifying_about_new_blocks_and_new_block_hashes_if_in_PoS()
+        {
+            _gossipPolicy.CanGossipBlocks.Returns(false);
+
+            _handler = new Sil62ProtocolHandler(
+                _session,
+                _svc,
+                new NodeStatsManager(Substitute.For<ITimerFactory>(), LimboLogs.Instance),
+                _syncManager,
+                RunImmediatelyScheduler.Instance,
+                _transactionPool,
+                _gossipPolicy,
+                LimboLogs.Instance);
+
+            _syncManager.Received().StopNotifyingPeersAboutNewBlocks();
+        }
+
+        [Test]
+        public void Can_broadcast_a_block([Values(SendBlockMode.HashOnly, SendBlockMode.FullBlock, (SendBlockMode)99)] SendBlockMode mode)
+        {
+            Block block = Build.A.Block.WithTotalDifficulty(1L).TestObject;
+            Type expectedMessageType = mode == SendBlockMode.FullBlock ? typeof(NewBlockMessage) : typeof(NewBlockHashesMessage);
+            _handler.NotifyOfNewBlock(block, mode);
+            _session.Received().DeliverMessage(Arg.Is<P2PMessage>(m => m.GetType().IsAssignableFrom(expectedMessageType)));
+        }
+
+        [Test]
+        public void Broadcasts_only_once([Values(SendBlockMode.HashOnly, SendBlockMode.FullBlock)] SendBlockMode mode)
+        {
+            Block block = Build.A.Block.WithTotalDifficulty(1L).TestObject;
+            _handler.NotifyOfNewBlock(block, mode);
+            _handler.NotifyOfNewBlock(block, SendBlockMode.HashOnly);
+            _handler.NotifyOfNewBlock(block, SendBlockMode.FullBlock);
+            _session.Received(1).DeliverMessage(Arg.Is<P2PMessage>(static m =>
+                m.GetType().IsAssignableFrom(typeof(NewBlockMessage))
+                || m.GetType().IsAssignableFrom(typeof(NewBlockHashesMessage))));
+        }
+
+        [Test]
+        public void Should_not_broadcast_a_block_if_in_PoS()
+        {
+            Block block = Build.A.Block.WithTotalDifficulty(1L).TestObject;
+            _gossipPolicy.CanGossipBlocks.Returns(false);
+            _handler.NotifyOfNewBlock(block, SendBlockMode.FullBlock);
+            _session.Received(0).DeliverMessage(Arg.Any<NewBlockMessage>());
+            _session.ClearReceivedCalls();
+            _handler.NotifyOfNewBlock(block, SendBlockMode.HashOnly);
+            _session.Received(0).DeliverMessage(Arg.Any<NewBlockHashesMessage>());
+            _session.ClearReceivedCalls();
+            _handler.NotifyOfNewBlock(block, (SendBlockMode)99);
+            _session.Received(0).DeliverMessage(Arg.Any<NewBlockHashesMessage>());
+        }
+
+        [Test]
+        public void Cannot_broadcast_a_block_without_total_difficulty_but_can_hint()
+        {
+            Block block = Build.A.Block.TestObject;
+            Assert.Throws<InvalidOperationException>(
+                () => _handler.NotifyOfNewBlock(block, SendBlockMode.FullBlock));
+            _handler.NotifyOfNewBlock(block, SendBlockMode.HashOnly);
+            _handler.NotifyOfNewBlock(block, (SendBlockMode)99);
+        }
+
+        [Test]
+        public void Get_headers_from_genesis()
+        {
+            using GetBlockHeadersMessage msg = new();
+            msg.StartBlockHash = TestItem.KeccakA;
+            msg.MaxHeaders = 3;
+            msg.Skip = 1;
+            msg.Reverse = 1;
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.GetBlockHeaders);
+
+            _syncManager.Received().FindHeaders(TestItem.KeccakA, 3, 1, true);
+        }
+
+        [Test]
+        public void Receiving_request_before_status_fails()
+        {
+            GetBlockHeadersMessage msg = new();
+            msg.StartBlockHash = TestItem.KeccakA;
+            msg.MaxHeaders = 3;
+            msg.Skip = 1;
+            msg.Reverse = 1;
+
+            using DisposableByteBuffer packet = _svc.ZeroSerialize(msg).AsDisposable();
+            packet.ReadByte();
+
+            Assert.Throws<SubprotocolException>(
+                () => _handler.HandleMessage(new ZeroPacket(packet) { PacketType = Sil62MessageCode.GetBlockHeaders }));
+        }
+
+        [Test]
+        public void Get_headers_when_blocks_are_missing_at_the_end()
+        {
+            BlockHeader[] headers = new BlockHeader[5];
+            headers[0] = Build.A.BlockHeader.TestObject;
+            headers[1] = Build.A.BlockHeader.TestObject;
+            headers[2] = Build.A.BlockHeader.TestObject;
+
+            _syncManager.FindHash(100).Returns(TestItem.KeccakA);
+            _syncManager.FindHeaders(TestItem.KeccakA, 5, 1, true).Returns(headers.ToPooledList());
+            _syncManager.Head.Returns(_genesisBlock.Header);
+            _syncManager.Genesis.Returns(_genesisBlock.Header);
+
+            using GetBlockHeadersMessage msg = new();
+            msg.StartBlockNumber = 100;
+            msg.MaxHeaders = 5;
+            msg.Skip = 1;
+            msg.Reverse = 1;
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.GetBlockHeaders);
+
+            _session.Received().DeliverMessage(Arg.Is<BlockHeadersMessage>(static bhm => bhm.BlockHeaders.Count == 3));
+            _syncManager.Received().FindHash(100);
+        }
+
+        [Test]
+        public void Throws_after_receiving_status_message_for_the_second_time()
+        {
+            HandleIncomingStatusMessage();
+            Assert.Throws<SubprotocolException>(HandleIncomingStatusMessage);
+        }
+
+        [Test]
+        public void Get_headers_when_blocks_are_missing_in_the_middle()
+        {
+            BlockHeader[] headers = new BlockHeader[5];
+            headers[0] = Build.A.BlockHeader.TestObject;
+            headers[1] = Build.A.BlockHeader.TestObject;
+            headers[2] = null;
+            headers[3] = Build.A.BlockHeader.TestObject;
+            headers[4] = Build.A.BlockHeader.TestObject;
+
+            _syncManager.FindHash(100).Returns(TestItem.KeccakA);
+            _syncManager.FindHeaders(TestItem.KeccakA, 5, 1, true)
+                .Returns(headers.ToPooledList());
+
+            _syncManager.Head.Returns(_genesisBlock.Header);
+            _syncManager.Genesis.Returns(_genesisBlock.Header);
+
+            using GetBlockHeadersMessage msg = new();
+            msg.StartBlockNumber = 100;
+            msg.MaxHeaders = 5;
+            msg.Skip = 1;
+            msg.Reverse = 1;
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.GetBlockHeaders);
+
+            _session.Received().DeliverMessage(Arg.Is<BlockHeadersMessage>(static bhm => bhm.BlockHeaders.Count == 5));
+            _syncManager.Received().FindHash(100);
+        }
+
+        [Test]
+        public void Disconnects_when_headers_request_exceeds_limit()
+        {
+            using GetBlockHeadersMessage msg = new();
+            msg.StartBlockHash = TestItem.KeccakA;
+            msg.MaxHeaders = 1025;
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.GetBlockHeaders);
+
+            _session.Received(1).InitiateDisconnect(DisconnectReason.SilSyncException, Arg.Any<string>());
+            _session.DidNotReceive().DeliverMessage(Arg.Any<BlockHeadersMessage>());
+        }
+
+        [Test]
+        public void Can_handle_new_block_message()
+        {
+            using NewBlockMessage newBlockMessage = new();
+            newBlockMessage.Block = Build.A.Block.WithParent(_genesisBlock).TestObject;
+            newBlockMessage.TotalDifficulty = _genesisBlock.Difficulty + newBlockMessage.Block.Difficulty;
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(newBlockMessage, Sil62MessageCode.NewBlock);
+
+            _syncManager.Received().AddNewBlock(
+                Arg.Is<Block>(b => b.Hash == newBlockMessage.Block.Hash),
+                _handler);
+        }
+
+        [Test]
+        public void Should_disconnect_peer_sending_new_block_message_in_PoS()
+        {
+            using NewBlockMessage newBlockMessage = new();
+            newBlockMessage.Block = Build.A.Block.WithParent(_genesisBlock).TestObject;
+            newBlockMessage.TotalDifficulty = _genesisBlock.Difficulty + newBlockMessage.Block.Difficulty;
+
+            _gossipPolicy.ShouldDisconnectGossipingNodes.Returns(true);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(newBlockMessage, Sil62MessageCode.NewBlock);
+
+            _session.Received().InitiateDisconnect(DisconnectReason.GossipingInPoS, "NewBlock message received after FIRST_FINALIZED_BLOCK PoS block. Disconnecting Peer.");
+        }
+
+        [Test]
+        public void Disconnects_peer_if_adding_new_block_fails()
+        {
+            using NewBlockMessage newBlockMessage = new();
+            newBlockMessage.Block = Build.A.Block.WithParent(_genesisBlock).TestObject;
+            newBlockMessage.TotalDifficulty = _genesisBlock.Difficulty + newBlockMessage.Block.Difficulty;
+
+            HandleIncomingStatusMessage();
+
+            using DisposableByteBuffer getBlockHeadersPacket = _svc.ZeroSerialize(newBlockMessage).AsDisposable();
+            getBlockHeadersPacket.ReadByte();
+
+            _syncManager.WhenForAnyArgs(w => w.AddNewBlock(null!, _handler)).Do(_ => throw new Exception());
+            _handler.HandleMessage(new ZeroPacket(getBlockHeadersPacket) { PacketType = Sil62MessageCode.NewBlock });
+
+            _session.Received().InitiateDisconnect(DisconnectReason.BackgroundTaskFailure, Arg.Any<string>());
+        }
+
+        [Test]
+        public void Can_handle_new_block_hashes()
+        {
+            using NewBlockHashesMessage msg = new((Keccak.Zero, 1UL), (Keccak.Zero, 2UL));
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.NewBlockHashes);
+        }
+
+        [Test]
+        public void Should_disconnect_peer_sending_new_block_hashes_in_PoS()
+        {
+            using NewBlockHashesMessage msg = new((Keccak.Zero, 1UL), (Keccak.Zero, 2UL));
+
+            _gossipPolicy.ShouldDisconnectGossipingNodes.Returns(true);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.NewBlockHashes);
+
+            _session.Received().InitiateDisconnect(DisconnectReason.GossipingInPoS, "NewBlock message received after FIRST_FINALIZED_BLOCK PoS block. Disconnecting Peer.");
+        }
+
+        [Test]
+        public void Can_handle_get_block_bodies()
+        {
+            using GetBlockBodiesMessage msg = new(new[] { Keccak.Zero, TestItem.KeccakA });
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.GetBlockBodies);
+        }
+
+        [Test]
+        public void Should_omit_unknown_hashes_from_get_block_bodies()
+        {
+            Block block = Build.A.Block.TestObject;
+            _syncManager.Find(Keccak.Zero).Returns((Block?)null);
+            _syncManager.Find(TestItem.KeccakA).Returns(block);
+
+            BlockBody?[] bodies = RequestBlockBodies(Keccak.Zero, TestItem.KeccakA);
+
+            Assert.That(bodies, Has.Length.EqualTo(1));
+            Assert.That(bodies[0], Is.SameAs(block.Body));
+        }
+
+        [Test]
+        public void Should_omit_unknown_hash_in_middle_from_get_block_bodies()
+        {
+            Block firstBlock = Build.A.Block.WithNonce(1).TestObject;
+            Block thirdBlock = Build.A.Block.WithNonce(3).TestObject;
+            _syncManager.Find(TestItem.KeccakA).Returns(firstBlock);
+            _syncManager.Find(TestItem.KeccakB).Returns((Block?)null);
+            _syncManager.Find(TestItem.KeccakC).Returns(thirdBlock);
+
+            BlockBody?[] bodies = RequestBlockBodies(TestItem.KeccakA, TestItem.KeccakB, TestItem.KeccakC);
+
+            Assert.That(bodies, Has.Length.EqualTo(2));
+            Assert.That(bodies[0], Is.SameAs(firstBlock.Body));
+            Assert.That(bodies[1], Is.SameAs(thirdBlock.Body));
+        }
+
+        [TestCase(5)]
+        [TestCase(50)]
+        public void Should_truncate_array_when_too_many_body(int availableBody)
+        {
+            List<Block> blocks = [];
+            Transaction[] transactions = Build.A.Transaction.TestObjectNTimes(1000);
+            for (int i = 0; i < availableBody; i++)
+            {
+                if (i == 0)
+                {
+                    blocks.Add(Build.A.Block.WithTransactions(transactions).TestObject);
+                }
+                else
+                {
+                    blocks.Add(Build.A.Block.WithTransactions(transactions).WithParent(blocks[^1]).TestObject);
+                }
+
+                _syncManager.Find(blocks[^1].Hash).Returns(blocks[^1]);
+            }
+
+            using GetBlockBodiesMessage msg = new(blocks.Select(block => block.Hash).ToArray());
+
+            BlockBodiesMessage response = null;
+            _session.When(session => session.DeliverMessage(Arg.Any<BlockBodiesMessage>())).Do((call) => response = (BlockBodiesMessage)call[0]);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.GetBlockBodies);
+
+            Assert.That(response, Is.Not.Null);
+            BlockBody[]? bodies = response.Bodies.Bodies;
+            Assert.That(bodies, Has.Length.EqualTo(SoftLimitTestHelper.CountBlocksWithinSoftLimit(blocks)));
+            foreach (BlockBody responseBody in bodies)
+            {
+                Assert.That(responseBody, Is.Not.Null);
+            }
+            response.Dispose();
+        }
+
+        [Test]
+        public void Can_handle_transactions([Values(true, false)] bool canGossipTransactions)
+        {
+            _txGossipPolicy.ShouldListenToGossipedTransactions.Returns(canGossipTransactions);
+            using TransactionsMessage msg = new(Build.A.Transaction.SignedAndResolved().TestObjectNTimes(3).ToPooledList());
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.Transactions);
+            _transactionPool.Received(canGossipTransactions ? 3 : 0).SubmitTx(Arg.Any<Transaction>(), TxHandlingOptions.None);
+        }
+
+        [Test]
+        public void Should_schedule_transactions_without_value_tuple_request()
+        {
+            RecordingBackgroundTaskScheduler taskScheduler = new();
+            _handler.Dispose();
+            _handler = new Sil62ProtocolHandler(
+                _session,
+                _svc,
+                new NodeStatsManager(Substitute.For<ITimerFactory>(), LimboLogs.Instance),
+                _syncManager,
+                taskScheduler,
+                _transactionPool,
+                _gossipPolicy,
+                LimboLogs.Instance,
+                _txGossipPolicy);
+            _handler.Init();
+
+            using TransactionsMessage msg = new(Build.A.Transaction.SignedAndResolved().TestObjectNTimes(3).ToPooledList());
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.Transactions);
+
+            Assert.That(taskScheduler.RequestTypes, Has.Count.EqualTo(1));
+            Assert.That(ContainsValueTuple(taskScheduler.RequestTypes[0]), Is.False);
+        }
+
+        /// <summary>
+        /// Calls <see cref="ZeroNettyP2PHandler.ExceptionCaught"/> with <see cref="RlpException"/> directly
+        /// (without testing the whole pipeline) and verifies disconnect was triggered.
+        /// </summary>
+        [Test]
+        public void Disconnects_peer_on_transaction_deserialization_exception()
+        {
+            _txGossipPolicy.ShouldListenToGossipedTransactions.Returns(true);
+            IByteBuffer malformedTransactionsPacket = Unpooled.WrappedBuffer([0xc1, 0xc0]);
+
+            HandleIncomingStatusMessage();
+            RlpException exception = Assert.Throws<RlpException>(() => HandleZeroMessage(malformedTransactionsPacket, Sil62MessageCode.Transactions));
+
+            ZeroNettyP2PHandler zeroNettyP2PHandler = new(_session, LimboLogs.Instance);
+            zeroNettyP2PHandler.ExceptionCaught(Substitute.For<IChannelHandlerContext>(), exception!);
+
+            _session.Received().InitiateDisconnect(
+                DisconnectReason.Exception,
+                Arg.Is<string>(details => details.Contains("RlpException") && details.Contains("Transaction decoding returned null")));
+        }
+
+        private class AlwaysTimeoutBackgroundTaskScheduler : IBackgroundTaskScheduler
+        {
+            internal int ScheduledTasks = 0;
+            public bool TryScheduleTask<TReq>(TReq request, Func<TReq, CancellationToken, Task> fulfillFunc,
+                TimeSpan? timeout = null, string? source = null)
+            {
+                CancellationTokenSource cts = new();
+                cts.Cancel();
+                fulfillFunc(request, cts.Token);
+                ScheduledTasks++;
+                return true;
+            }
+        }
+
+        private sealed class RecordingBackgroundTaskScheduler : IBackgroundTaskScheduler
+        {
+            public List<Type> RequestTypes { get; } = [];
+
+            public bool TryScheduleTask<TReq>(TReq request, Func<TReq, CancellationToken, Task> fulfillFunc,
+                TimeSpan? timeout = null, string? source = null)
+            {
+                RequestTypes.Add(typeof(TReq));
+                fulfillFunc(request, CancellationToken.None).GetAwaiter().GetResult();
+                return true;
+            }
+        }
+
+        private static bool ContainsValueTuple(Type type)
+        {
+            if (type.FullName?.StartsWith("System.ValueTuple", StringComparison.Ordinal) is true)
+            {
+                return true;
+            }
+
+            Type[] genericArguments = type.IsGenericType ? type.GetGenericArguments() : Type.EmptyTypes;
+            for (int i = 0; i < genericArguments.Length; i++)
+            {
+                if (ContainsValueTuple(genericArguments[i]))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        [Test]
+        public void Will_Not_Reschedule_SubmitTx_When_Queue_Is_Full()
+        {
+            _txGossipPolicy.ShouldListenToGossipedTransactions.Returns(true);
+            using TransactionsMessage msg = new(Build.A.Transaction.SignedAndResolved().TestObjectNTimes(3).ToPooledList());
+
+            AlwaysTimeoutBackgroundTaskScheduler taskScheduler = new();
+            _handler = new Sil62ProtocolHandler(
+                _session,
+                _svc,
+                new NodeStatsManager(Substitute.For<ITimerFactory>(), LimboLogs.Instance),
+                _syncManager,
+                taskScheduler,
+                _transactionPool,
+                _gossipPolicy,
+                LimboLogs.Instance,
+                _txGossipPolicy);
+            _handler.Init();
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.Transactions);
+
+            Assert.That(taskScheduler.ScheduledTasks, Is.EqualTo(1));
+        }
+
+        [Test]
+        public void Cancelled_mid_processing_releases_transactions_unless_rescheduled([Values] bool rescheduleSucceeds)
+        {
+            Transaction[] txs = new Transaction[2];
+            for (int i = 0; i < txs.Length; i++)
+            {
+                txs[i] = Build.A.Transaction.SignedAndResolved().TestObject;
+                txs[i].SetPreHashNoLock([(byte)(i + 1)]);
+            }
+
+            ArrayPoolList<Transaction> list = new(txs.Length, txs);
+
+            using CancellationTokenSource cts = new();
+            bool triedToReschedule = false;
+
+            // process first transaction and reschedule
+            _transactionPool.SubmitTx(Arg.Any<Transaction>(), TxHandlingOptions.None).Returns(ctx =>
+            {
+                Transaction tx = ctx.Arg<Transaction>();
+                _ = tx.Hash;
+                cts.Cancel();
+                return AcceptTxResult.Accepted;
+            });
+
+            CallbackBackgroundTaskScheduler scheduler = new(() =>
+            {
+                triedToReschedule = true;
+                if (rescheduleSucceeds)
+                {
+                    // The new task now owns the remaining txs: process tx[1] and release the list.
+                    list[1].ClearPreHash();
+                    list.Dispose();
+                }
+                return rescheduleSucceeds;
+            });
+
+
+            using TestEth62ProtocolHandler handler = new(
+                _session,
+                _svc,
+                new NodeStatsManager(Substitute.For<ITimerFactory>(), LimboLogs.Instance),
+                _syncManager,
+                scheduler,
+                _transactionPool,
+                _gossipPolicy,
+                LimboLogs.Instance,
+                _txGossipPolicy);
+
+            handler.HandleSlowPublic(list, cts.Token);
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(triedToReschedule, Is.True);
+                Assert.That(txs[0].Hash, Is.Not.Null);
+                Assert.That(txs[1].Hash, Is.Null);
+                Assert.Throws<ObjectDisposedException>(() => _ = list[0]);
+            }
+        }
+
+        private sealed class TestEth62ProtocolHandler(
+            ISession session,
+            IMessageSerializationService serializer,
+            INodeStatsManager statsManager,
+            ISyncServer syncServer,
+            IBackgroundTaskScheduler backgroundTaskScheduler,
+            ITxPool txPool,
+            IGossipPolicy gossipPolicy,
+            ILogManager logManager,
+            ITxGossipPolicy? transactionsGossipPolicy = null)
+            : Sil62ProtocolHandler(session, serializer, statsManager, syncServer, backgroundTaskScheduler, txPool, gossipPolicy, logManager, transactionsGossipPolicy)
+        {
+            public void HandleSlowPublic(IOwnedReadOnlyList<Transaction> transactions, CancellationToken cancellationToken) =>
+                HandleSlow(new TransactionsRequest(transactions, 0), cancellationToken).GetAwaiter().GetResult();
+        }
+
+        private sealed class CallbackBackgroundTaskScheduler(Func<bool> onSchedule) : IBackgroundTaskScheduler
+        {
+            public bool TryScheduleTask<TReq>(TReq request, Func<TReq, CancellationToken, Task> fulfillFunc,
+                TimeSpan? timeout = null, string? source = null) => onSchedule();
+        }
+
+        [Test]
+        public void Can_handle_transactions_without_filtering()
+        {
+            using TransactionsMessage msg = new(Build.A.Transaction.SignedAndResolved().TestObjectNTimes(3).ToPooledList());
+
+            _handler.DisableTxFiltering();
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.Transactions);
+        }
+
+        [Test]
+        public async Task Can_LimitGetBlockBodiesRequestSize()
+        {
+            using BlockBodiesMessage msg4 = new(Build.A.Block.TestObjectNTimes(4));
+            Transaction signedTransaction = Build.A.Transaction.SignedAndResolved().TestObject;
+            Block largerBlock = Build.A.Block.WithTransactions(Enumerable.Repeat(signedTransaction, 1000).ToArray()).TestObject;
+
+            using BlockBodiesMessage largeMsg = new(Enumerable.Repeat(largerBlock, 100).ToArray());
+            List<Hash256> requests = Enumerable.Repeat(Keccak.Zero, 1000).ToList();
+
+            GetBlockBodiesMessage? getMsg = null;
+
+            _session
+                .When(session => session.DeliverMessage(Arg.Any<GetBlockBodiesMessage>()))
+                .Do((info => getMsg = (GetBlockBodiesMessage)info[0]));
+
+            HandleIncomingStatusMessage();
+            Task getTask = ((ISyncPeer)_handler).GetBlockBodies(requests, CancellationToken.None).AddResultTo(_disposables);
+            HandleZeroMessage(msg4, Sil62MessageCode.BlockBodies);
+            await getTask;
+
+            Assert.That(getMsg.BlockHashes.Count, Is.EqualTo(4));
+
+            getTask = ((ISyncPeer)_handler).GetBlockBodies(requests, CancellationToken.None).AddResultTo(_disposables);
+            HandleZeroMessage(largeMsg, Sil62MessageCode.BlockBodies);
+            await getTask;
+
+            Assert.That(getMsg.BlockHashes.Count, Is.EqualTo(6));
+
+            getTask = ((ISyncPeer)_handler).GetBlockBodies(requests, CancellationToken.None).AddResultTo(_disposables);
+            HandleZeroMessage(msg4, Sil62MessageCode.BlockBodies);
+            await getTask;
+
+            Assert.That(getMsg.BlockHashes.Count, Is.EqualTo(4));
+        }
+
+        [Test]
+        public async Task Can_handle_block_bodies()
+        {
+            using BlockBodiesMessage msg = new(Build.A.Block.TestObjectNTimes(3));
+
+            HandleIncomingStatusMessage();
+            Task task = ((ISyncPeer)_handler).GetBlockBodies(new List<Hash256>(new[] { Keccak.Zero }), CancellationToken.None).AddResultTo(_disposables);
+            HandleZeroMessage(msg, Sil62MessageCode.BlockBodies);
+            await task;
+        }
+
+        [Test]
+        public async Task Get_block_bodies_returns_immediately_when_empty_hash_list()
+        {
+            using OwnedBlockBodies bodies = await ((ISyncPeer)_handler).GetBlockBodies(new List<Hash256>(), CancellationToken.None);
+
+            Assert.That(bodies.Bodies, Has.Length.EqualTo(0));
+        }
+
+        [Test]
+        public void Throws_when_receiving_a_bodies_message_that_has_not_been_requested()
+        {
+            using BlockBodiesMessage msg = new(Build.A.Block.TestObjectNTimes(3));
+
+            HandleIncomingStatusMessage();
+            Assert.Throws<SubprotocolException>(() => HandleZeroMessage(msg, Sil62MessageCode.BlockBodies));
+        }
+
+        [Test]
+        public async Task Can_handle_headers()
+        {
+            using BlockHeadersMessage msg = new(Build.A.BlockHeader.TestObjectNTimes(3).ToPooledList());
+
+            Task task = ((ISyncPeer)_handler).GetBlockHeaders(1, 1, 1, CancellationToken.None).AddResultTo(_disposables);
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.BlockHeaders);
+            await task;
+        }
+
+        [Test]
+        public void Throws_when_receiving_a_headers_message_that_has_not_been_requested()
+        {
+            using BlockHeadersMessage msg = new(Build.A.BlockHeader.TestObjectNTimes(3).ToPooledList());
+
+            HandleIncomingStatusMessage();
+            Assert.Throws<SubprotocolException>(() => HandleZeroMessage(msg, Sil62MessageCode.BlockHeaders));
+        }
+
+        [Test]
+        public void Queued_headers_request_is_cancelled_on_dispose()
+        {
+            HandleIncomingStatusMessage();
+
+            Task request1 = ((ISyncPeer)_handler).GetBlockHeaders(1, 1, 0, CancellationToken.None);
+            // request1 is in-flight; request2 gets queued and is never sent to the peer
+            Task request2 = ((ISyncPeer)_handler).GetBlockHeaders(2, 1, 0, CancellationToken.None);
+
+            _handler.Dispose();
+
+            Assert.ThrowsAsync<TaskCanceledException>(async () => await request1);
+            Assert.ThrowsAsync<TaskCanceledException>(async () => await request2);
+        }
+
+        [Test]
+        public void Add_remove_listener()
+        {
+            static void HandlerOnSubprotocolRequested(object sender, ProtocolEventArgs e) { }
+
+            _handler.SubprotocolRequested += HandlerOnSubprotocolRequested;
+            _handler.SubprotocolRequested -= HandlerOnSubprotocolRequested;
+        }
+
+        [TestCase(1, true)]
+        [TestCase(1055, true)]
+        [TestCase(1056, false)]
+        public void should_send_txs_with_size_up_to_MaxPacketSize_in_one_TransactionsMessage(int txCount, bool shouldBeSentInJustOneMessage)
+        {
+            Transaction[] txs = new Transaction[txCount];
+
+            for (int i = 0; i < txCount; i++)
+            {
+                txs[i] = Build.A.Transaction.SignedAndResolved(Build.A.PrivateKey.TestObject).TestObject;
+            }
+
+            _handler.SendNewTransactions(txs);
+
+            if (shouldBeSentInJustOneMessage)
+            {
+                _session.Received(1).DeliverMessage(Arg.Is<TransactionsMessage>(m => m.Transactions.Count == txCount));
+            }
+            else
+            {
+                _session.Received(2).DeliverMessage(Arg.Any<TransactionsMessage>());
+            }
+        }
+
+        [TestCase(257)]
+        [TestCase(300)]
+        [TestCase(1055)]
+        [TestCase(1056)]
+        [TestCase(1500)]
+        [TestCase(10000)]
+        public void should_send_txs_with_size_exceeding_MaxPacketSize_in_more_than_one_TransactionsMessage(int txCount)
+        {
+            int sizeOfOneTestTransaction = Build.A.Transaction.SignedAndResolved().TestObject.GetLength();
+            int maxNumberOfTxsInOneMsg = TransactionsMessage.MaxPacketSize / sizeOfOneTestTransaction; // it's 1055
+            int nonFullMsgTxsCount = txCount % maxNumberOfTxsInOneMsg;
+            int messagesCount = txCount / maxNumberOfTxsInOneMsg + (nonFullMsgTxsCount > 0 ? 1 : 0);
+
+            Transaction[] txs = new Transaction[txCount];
+
+            for (int i = 0; i < txCount; i++)
+            {
+                txs[i] = Build.A.Transaction.SignedAndResolved(Build.A.PrivateKey.TestObject).TestObject;
+            }
+
+            _handler.SendNewTransactions(txs);
+
+            _session.Received(messagesCount).DeliverMessage(Arg.Is<TransactionsMessage>(m => m.Transactions.Count == maxNumberOfTxsInOneMsg || m.Transactions.Count == nonFullMsgTxsCount));
+        }
+
+        [TestCase(0)]
+        [TestCase(128)]
+        [TestCase(4096)]
+        [TestCase(100000)]
+        [TestCase(102400)]
+        [TestCase(222222)]
+        public void should_send_single_transaction_even_if_exceed_MaxPacketSize(int dataSize)
+        {
+            const int txCount = 512;
+
+            Transaction[] txs = new Transaction[txCount];
+            for (int i = 0; i < txCount; i++)
+            {
+                txs[i] = Build.A.Transaction.WithData(new byte[dataSize]).SignedAndResolved(Build.A.PrivateKey.TestObject).TestObject;
+            }
+
+            int sizeOfOneTx = txs[0].GetLength();
+            int numberOfTxsInOneMsg = Math.Max(TransactionsMessage.MaxPacketSize / sizeOfOneTx, 1);
+            int nonFullMsgTxsCount = txCount % numberOfTxsInOneMsg;
+            int messagesCount = txCount / numberOfTxsInOneMsg + (nonFullMsgTxsCount > 0 ? 1 : 0);
+
+            CountdownEvent delivered = new(messagesCount);
+            int matchingDeliveries = 0;
+            _session.When(s => s.DeliverMessage(Arg.Any<TransactionsMessage>()))
+                .Do(call =>
+                {
+                    TransactionsMessage msg = (TransactionsMessage)call[0];
+                    if (msg.Transactions.Count == numberOfTxsInOneMsg || msg.Transactions.Count == nonFullMsgTxsCount)
+                    {
+                        Interlocked.Increment(ref matchingDeliveries);
+                        if (!delivered.IsSet) delivered.Signal();
+                    }
+                });
+
+            _handler.SendNewTransactions(txs);
+
+            Assert.That(delivered.Wait(TimeSpan.FromSeconds(30)), Is.True, "Not all expected messages were delivered within 30s");
+            Assert.That(matchingDeliveries, Is.EqualTo(messagesCount));
+        }
+
+        private void HandleZeroMessage<T>(T msg, int messageCode) where T : MessageBase
+        {
+            using DisposableByteBuffer getBlockHeadersPacket = _svc.ZeroSerialize(msg).AsDisposable();
+            getBlockHeadersPacket.ReadByte();
+            _handler.HandleMessage(new ZeroPacket(getBlockHeadersPacket) { PacketType = (byte)messageCode });
+        }
+
+        private void HandleZeroMessage(IByteBuffer msg, int messageCode) =>
+            _handler.HandleMessage(new ZeroPacket(msg) { PacketType = (byte)messageCode });
+
+        private BlockBody?[] RequestBlockBodies(params Hash256[] hashes)
+        {
+            using GetBlockBodiesMessage msg = new(hashes);
+            BlockBodiesMessage? response = null;
+            _session.When(session => session.DeliverMessage(Arg.Any<BlockBodiesMessage>()))
+                .Do(call => response = (BlockBodiesMessage)call[0]);
+
+            HandleIncomingStatusMessage();
+            HandleZeroMessage(msg, Sil62MessageCode.GetBlockBodies);
+
+            Assert.That(response, Is.Not.Null);
+            Assert.That(response!.Bodies, Is.Not.Null);
+            Assert.That(response.Bodies!.Bodies, Is.Not.Null);
+            return response.Bodies.Bodies!;
+        }
+
+        [Test]
+        public void Throws_if_new_block_message_received_before_status()
+        {
+            using NewBlockMessage newBlockMessage = new();
+            newBlockMessage.Block = Build.A.Block.WithParent(_genesisBlock).TestObject;
+            newBlockMessage.TotalDifficulty = _genesisBlock.Difficulty + newBlockMessage.Block.Difficulty;
+
+            using DisposableByteBuffer getBlockHeadersPacket = _svc.ZeroSerialize(newBlockMessage).AsDisposable();
+            getBlockHeadersPacket.ReadByte();
+            Assert.Throws<SubprotocolException>(
+                () => _handler.HandleMessage(
+                    new ZeroPacket(getBlockHeadersPacket) { PacketType = Sil62MessageCode.NewBlock }));
+        }
+
+        private void HandleIncomingStatusMessage()
+        {
+            using StatusMessage statusMsg = new() { GenesisHash = _genesisBlock.Hash, BestHash = _genesisBlock.Hash };
+
+            using DisposableByteBuffer statusPacket = _svc.ZeroSerialize(statusMsg).AsDisposable();
+            statusPacket.ReadByte();
+            _handler.HandleMessage(new ZeroPacket(statusPacket) { PacketType = 0 });
+        }
+
+        [Test]
+        public void Should_disconnect_on_unknown_message_type()
+        {
+            HandleIncomingStatusMessage();
+
+            using StatusMessage filler = new() { GenesisHash = _genesisBlock.Hash, BestHash = _genesisBlock.Hash };
+            using DisposableByteBuffer packet = _svc.ZeroSerialize(filler).AsDisposable();
+            packet.ReadByte();
+            _handler.HandleMessage(new ZeroPacket(packet) { PacketType = 99 });
+
+            _session.Received().InitiateDisconnect(DisconnectReason.BreachOfProtocol, Arg.Any<string>());
+        }
+    }
+}

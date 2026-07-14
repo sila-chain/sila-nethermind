@@ -1,0 +1,49 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Threading.Tasks;
+
+namespace Nethermind.Synchronization.ParallelSync
+{
+    public class StaticSelector(SyncMode syncMode) : ISyncModeSelector
+    {
+        public static StaticSelector Full { get; } = new(SyncMode.Full);
+
+        public static StaticSelector FastSync { get; } = new(SyncMode.FastSync);
+
+        public static StaticSelector FastBlocks { get; } = new(SyncMode.FastBlocks);
+
+        public static StaticSelector FastSyncWithFastBlocks { get; } = new(SyncMode.FastSync | SyncMode.FastBlocks);
+
+        public static StaticSelector StateNodesWithFastBlocks { get; } = new(SyncMode.StateNodes | SyncMode.FastBlocks);
+
+        public static StaticSelector FullWithFastBlocks { get; } = new(SyncMode.Full | SyncMode.FastBlocks);
+
+        public SyncMode Current { get; } = syncMode;
+
+        public event EventHandler<SyncModeChangedEventArgs> Preparing
+        {
+            add { }
+            remove { }
+        }
+
+        public event EventHandler<SyncModeChangedEventArgs> Changed
+        {
+            add { }
+            remove { }
+        }
+
+        public Task StopAsync() => Task.CompletedTask;
+        public Task StartAsync() => Task.CompletedTask;
+        public void Update() { }
+
+        public event EventHandler<SyncModeChangedEventArgs> Changing
+        {
+            add { }
+            remove { }
+        }
+
+        public void Dispose() { }
+    }
+}

@@ -1,0 +1,1058 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using DotNetty.Transport.Channels;
+using Nethermind.Config;
+using Nethermind.Core.Collections;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Test.Builders;
+using Nethermind.Core.Timers;
+using Nethermind.Crypto;
+using Nethermind.Logging;
+using Nethermind.Network.Config;
+using Nethermind.Network.P2P;
+using Nethermind.Network.P2P.Analyzers;
+using Nethermind.Network.P2P.EventArg;
+using Nethermind.Network.Rlpx;
+using Nethermind.Stats;
+using Nethermind.Stats.Model;
+using NSubstitute;
+using NUnit.Framework;
+
+namespace Nethermind.Network.Test
+{
+    [Parallelizable(ParallelScope.All)]
+    [TestFixture]
+    public class PeerManagerTests
+    {
+        [Test]
+        public async Task Can_start_and_stop()
+        {
+            await using Context ctx = new();
+            ctx.PeerManager.Start();
+            await ctx.PeerManager.StopAsync();
+        }
+
+        [Test]
+        public async Task Will_ignore_sessions_created_after_stop()
+        {
+            await using Context ctx = new();
+            ctx.PeerManager.Start();
+
+            await ctx.PeerManager.StopAsync();
+            ctx.RlpxPeer.CreateRandomIncoming();
+
+            Assert.That(ctx.PeerManager.ActivePeers.Count, Is.EqualTo(0));
+        }
+
+        [TestCase(0, 0, TestName = "Stop completes cleanly while idle")]
+        [TestCase(1, 5, TestName = "Stop completes when slots are saturated")]
+        [CancelAfter(10_000)]
+        public async Task Stop_does_not_hang(int maxActivePeers, int persistedPeers)
+        {
+            await using Context ctx = maxActivePeers > 0 ? new(maxActivePeers: maxActivePeers) : new();
+            ctx.SetupPersistedPeers(persistedPeers);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            // Let the loop settle into its wait state
+            await Task.Delay(_delayLong);
+
+            Task stopTask = ctx.PeerManager.StopAsync();
+            bool completed = await Task.WhenAny(stopTask, Task.Delay(5000)) == stopTask;
+            Assert.That(completed, Is.True, "StopAsync should complete within 5 seconds");
+            await stopTask;
+        }
+
+        [Test]
+        public async Task Disconnect_triggers_refill_without_blocking()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(50);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(25, TimeSpan.FromSeconds(30));
+            Assert.That(ctx.PeerPool.ActivePeers.Count, Is.AtLeast(25));
+
+            int connectsBefore = ctx.RlpxPeer.ConnectAsyncCallsCount;
+            ctx.DisconnectAllSessions();
+
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(connectsBefore + 1, TimeSpan.FromSeconds(30));
+            Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.GreaterThan(connectsBefore));
+        }
+
+        [Test]
+        public async Task No_slot_available_before_deadline_does_not_deadlock_refill()
+        {
+            await using Context ctx = new(maxActivePeers: 1);
+            ctx.NetworkConfig.ConnectTimeoutMs = 0;
+            ctx.SetupPersistedPeers(5);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(1, TimeSpan.FromSeconds(30));
+            Assert.That(ctx.PeerPool.ActivePeers.Count, Is.GreaterThan(0));
+
+            await Task.Delay(Nethermind.Network.Timeouts.Handshake + TimeSpan.FromMilliseconds(_delay));
+
+            int connectsBefore = ctx.RlpxPeer.ConnectAsyncCallsCount;
+            ctx.DisconnectAllSessions();
+
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(connectsBefore + 1, TimeSpan.FromSeconds(30));
+            Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.GreaterThan(connectsBefore));
+        }
+
+        private const string enode1String =
+            "enode://22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222@51.141.78.53:30303";
+
+        private const string enode2String =
+            "enode://1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111b@52.141.78.53:30303";
+
+        private const string enode3String =
+            "enode://3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333b@some.url";
+
+        private const string enode4String =
+            "enode://3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333b@some.url:434";
+
+        private const string enode5String =
+            "enode://3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333b@52.141.78.53";
+
+        private const string enode6String =
+            "enode://3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333b@52.141.78.53:12345";
+
+        private const string enode7String =
+            "enode://3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333b@52.141.78.53:12345?discport=6789";
+
+        private const string enode8String =
+            "enode://3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333b@52.141.78.53:12345?somethingWrong=6789";
+
+        private const string enode9String =
+            "enode://3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333b@52.141.78.53:12345?discport=6789?discport=67899";
+
+        private const string enode10String =
+            "enode://3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333b@52.141.78.53:12345:discport=6789";
+
+        [Test]
+        public async Task Will_connect_to_a_candidate_node()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(1);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(1, TimeSpan.FromSeconds(30));
+            Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.EqualTo(1));
+        }
+
+        [Test]
+        public async Task Will_only_connect_up_to_max_peers()
+        {
+            await using Context ctx = new(1);
+            ctx.SetupPersistedPeers(50);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            const int expectedConnectCount = 25;
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(expectedConnectCount, TimeSpan.FromSeconds(30));
+            await Task.Delay(_delayLong);
+
+            Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.InRange(expectedConnectCount, expectedConnectCount + 1));
+        }
+
+        [Test]
+        public async Task Will_discard_a_duplicate_incoming_session()
+        {
+            await using Context ctx = new();
+            ctx.PeerManager.Start();
+            Session session1 = new(30303, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance,
+                LimboLogs.Instance);
+            Session session2 = new(30303, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance,
+                LimboLogs.Instance);
+            session1.RemoteHost = "1.2.3.4";
+            session1.RemotePort = 12345;
+            session1.RemoteNodeId = TestItem.PublicKeyA;
+            session2.RemoteHost = "1.2.3.4";
+            session2.RemotePort = 12345;
+            session2.RemoteNodeId = TestItem.PublicKeyA;
+
+            ctx.RlpxPeer.CreateIncoming(session1, session2);
+            Assert.That(ctx.PeerManager.ActivePeers.Count, Is.EqualTo(1));
+        }
+
+        [Test]
+        public async Task Will_replace_channel_closed_incoming_session_before_delayed_disconnect()
+        {
+            await using Context ctx = new();
+            ctx.PeerManager.Start();
+
+            Session firstSession = CreateIncomingSessionTemplate(TestItem.PublicKeyA);
+            Session secondSession = CreateIncomingSessionTemplate(TestItem.PublicKeyA);
+
+            ctx.RlpxPeer.CreateIncoming(firstSession);
+            Session staleSession = ctx.Sessions.Single();
+            staleSession.MarkChannelClosed();
+
+            ctx.RlpxPeer.CreateIncoming(secondSession);
+            Session freshSession = ctx.Sessions.Last();
+
+            InitSession(freshSession);
+
+            Assert.That(freshSession.State, Is.EqualTo(SessionState.Initialized));
+            Assert.That(ctx.PeerManager.ActivePeers.Single().InSession, Is.SameAs(freshSession));
+
+            staleSession.MarkDisconnected(DisconnectReason.ConnectionClosed, DisconnectType.Remote, "channel disconnected");
+
+            Assert.That(freshSession.State, Is.EqualTo(SessionState.Initialized));
+            Assert.That(ctx.PeerManager.ActivePeers.Single().InSession, Is.SameAs(freshSession));
+        }
+
+        private static Session CreateIncomingSessionTemplate(PublicKey remoteNodeId)
+        {
+            Session session = new(30303, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance, LimboLogs.Instance);
+            session.RemoteHost = "1.2.3.4";
+            session.RemotePort = 12345;
+            session.RemoteNodeId = remoteNodeId;
+            return session;
+        }
+
+        private static void InitSession(Session session)
+        {
+            IChannelHandlerContext context = Substitute.For<IChannelHandlerContext>();
+
+            session.Init(5, context, Substitute.For<IPacketSender>());
+        }
+
+        [Test]
+        public void Will_return_exception_in_port() =>
+            Assert.Throws<ArgumentException>(static () => new Enode(enode3String));
+
+        [Test]
+        public void Will_return_exception_in_dns() =>
+            Assert.Throws<ArgumentException>(static () => new Enode(enode4String));
+
+        [Test]
+        public void Will_return_exception_when_there_is_no_port() =>
+            Assert.Throws<ArgumentException>(static () => new Enode(enode5String));
+
+        [Test]
+        public void Will_parse_ports_correctly_when_there_are_two_different_ports()
+        {
+            Enode enode = new(enode6String);
+            Assert.That(enode.Port, Is.EqualTo(12345));
+            Assert.That(enode.DiscoveryPort, Is.EqualTo(12345));
+        }
+
+        [Test]
+        public void Will_parse_port_correctly_when_there_is_only_one()
+        {
+            Enode enode = new(enode7String);
+            Assert.That(enode.Port, Is.EqualTo(12345));
+            Assert.That(enode.DiscoveryPort, Is.EqualTo(6789));
+        }
+
+        [Test]
+        public void Will_return_exception_on_wrong_ports_part() =>
+            Assert.Throws<ArgumentException>(static () => new Enode(enode8String));
+
+        [Test]
+        public void Will_return_exception_on_duplicated_discovery_port_part() =>
+            Assert.Throws<ArgumentException>(static () => new Enode(enode9String));
+
+        [Test]
+        public void Will_return_exception_on_wrong_form_of_discovery_port_part() =>
+            Assert.Throws<ArgumentException>(static () => new Enode(enode10String));
+        [Test]
+        public async Task Will_accept_static_connection()
+        {
+            await using Context ctx = new();
+            ctx.NetworkConfig.MaxActivePeers = 1;
+            ctx.StaticNodesManager.IsStatic(Arg.Is<NetworkNode>(n => n.Enode!.Info == enode2String)).Returns(true);
+
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            Enode enode1 = new(enode1String);
+            Node node1 = new(enode1.PublicKey, new IPEndPoint(enode1.HostIp, enode1.Port));
+            Session session1 = new(30303, node1, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance,
+                LimboLogs.Instance);
+
+            Enode enode2 = new(enode2String);
+            Node node2 = new(enode2.PublicKey, new IPEndPoint(enode2.HostIp, enode2.Port));
+            Session session2 = new(30303, node2, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance,
+                LimboLogs.Instance);
+
+            ctx.RlpxPeer.CreateIncoming(session1, session2);
+            Assert.That(ctx.PeerManager.ActivePeers.Count, Is.EqualTo(2));
+        }
+
+        [Test]
+        public async Task MaxActivePeers_is_not_inflated_by_static_or_trusted()
+        {
+            await using Context ctx = new(maxActivePeers: 20);
+            Assert.That(ctx.PeerManager.MaxActivePeers, Is.EqualTo(20));
+
+            ctx.PeerPool.GetOrAdd(new Node(TestItem.PublicKeyA, "1.2.3.4", 1) { IsStatic = true });
+            ctx.PeerPool.GetOrAdd(new Node(TestItem.PublicKeyB, "1.2.3.5", 1) { IsTrusted = true });
+
+            Assert.That(ctx.PeerManager.MaxActivePeers, Is.EqualTo(20), "static and trusted peers do not inflate the limit");
+        }
+
+        // Migrated from ProtocolValidatorTests: the capacity policy moved into the peer manager,
+        // applied when a session completes the P2P Hello exchange.
+        [TestCase(11, 10, true)]
+        [TestCase(10, 10, false)]
+        [TestCase(9, 10, false)]
+        public async Task On_max_active_peer_limit(int activePeerCount, int maxActivePeer, bool shouldDisconnect)
+        {
+            await using Context ctx = new(maxActivePeers: maxActivePeer);
+            PrivateKeyGenerator keyGenerator = new();
+            for (int i = 0; i < activePeerCount; i++)
+            {
+                PublicKey key = keyGenerator.Generate().PublicKey;
+                ctx.PeerPool.ActivePeers[key] = new Peer(new Node(key, "1.2.3.4", 30303));
+            }
+
+            ISession session = Substitute.For<ISession>();
+            session.Node.Returns(new Node(TestItem.PublicKeyA, "1.2.3.4", 30303)); // plain (non-static, non-trusted)
+            ctx.PeerManager.OnP2PProtocolInitialized(session);
+
+            if (shouldDisconnect)
+            {
+                session.Received(1).InitiateDisconnect(DisconnectReason.TooManyPeers, Arg.Any<string>());
+            }
+            else
+            {
+                session.DidNotReceive().InitiateDisconnect(DisconnectReason.TooManyPeers, Arg.Any<string>());
+            }
+        }
+
+        [TestCase(true, ConnectionDirection.In)]
+        [TestCase(false, ConnectionDirection.In)]
+        // [TestCase(true, ConnectionDirection.Out)] // cannot create an active peer waiting for the test
+        [TestCase(false, ConnectionDirection.Out)]
+        [NonParallelizable]
+        public async Task Will_agree_on_which_session_to_disconnect_when_connecting_at_once(bool shouldLose,
+            ConnectionDirection firstDirection)
+        {
+            await using Context ctx = new();
+
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            Session session1 = new(30303, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance,
+                LimboLogs.Instance);
+            PacketSender packetSender = new(Substitute.For<IMessageSerializationService>(), LimboLogs.Instance, TimeSpan.Zero);
+            IChannelHandlerContext context = Substitute.For<IChannelHandlerContext>();
+
+            session1.RemoteHost = "1.2.3.4";
+            session1.RemotePort = 12345;
+            session1.RemoteNodeId =
+                (firstDirection == ConnectionDirection.In)
+                    ? (shouldLose ? TestItem.PublicKeyA : TestItem.PublicKeyC)
+                    : (shouldLose ? TestItem.PublicKeyC : TestItem.PublicKeyA);
+
+            void EnsureSession(ISession? session)
+            {
+                if (session is null) return;
+                if (session.State < SessionState.HandshakeComplete) session.Handshake(session.Node.Id);
+                if (session.State < SessionState.Initialized) session.Init(5, context, packetSender);
+            }
+
+            bool expectedOutSessionClosing = firstDirection == ConnectionDirection.In ? shouldLose : !shouldLose;
+            bool expectedInSessionClosing = !expectedOutSessionClosing;
+
+            if (firstDirection == ConnectionDirection.In)
+            {
+                ctx.RlpxPeer.CreateIncoming(session1);
+                if (!await ctx.RlpxPeer.ConnectAsync(session1.Node))
+                {
+                    throw new NetworkingException($"Failed to connect to {session1.Node:s}", NetworkExceptionType.TargetUnreachable);
+                }
+            }
+            else
+            {
+                ctx.RlpxPeer.SessionCreated += HandshakeOnCreate;
+                if (!await ctx.RlpxPeer.ConnectAsync(session1.Node))
+                {
+                    throw new NetworkingException($"Failed to connect to {session1.Node:s}", NetworkExceptionType.TargetUnreachable);
+                }
+                ctx.RlpxPeer.SessionCreated -= HandshakeOnCreate;
+                ctx.RlpxPeer.CreateIncoming(session1);
+            }
+
+            Assert.That(() =>
+            {
+                Peer? activePeer = ctx.PeerManager.ActivePeers.SingleOrDefault();
+                if (activePeer is null) return false;
+
+                EnsureSession(activePeer.OutSession);
+                EnsureSession(activePeer.InSession);
+
+                return activePeer.OutSession is not null
+                    && activePeer.InSession is not null
+                    && activePeer.OutSession.IsClosing == expectedOutSessionClosing
+                    && activePeer.InSession.IsClosing == expectedInSessionClosing;
+            }, Is.True.After(_delayLonger, 20));
+
+            Assert.That(() => ctx.PeerManager.ActivePeers.Count, Is.EqualTo(1).After(_delay, 10));
+        }
+
+        private void HandshakeOnCreate(object sender, SessionEventArgs e) => e.Session.Handshake(e.Session.RemoteNodeId);
+
+        [Test]
+        public async Task Will_fill_up_on_disconnects()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(50);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(25, TimeSpan.FromSeconds(30));
+            Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.AtLeast(25));
+            ctx.DisconnectAllSessions();
+
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(50, TimeSpan.FromSeconds(30));
+            Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.AtLeast(50));
+        }
+
+        [Test]
+        public async Task Ok_if_fails_to_connect()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(50);
+            ctx.RlpxPeer.MakeItFail();
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            // Wait for at least one failed connect attempt so we know the manager has cycled.
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(1, TimeSpan.FromSeconds(30));
+
+            // ActivePeers transiently holds a peer between AddActivePeer (before ConnectAsync) and
+            // DeactivatePeerIfDisconnected (after ConnectAsync returns false). Sessions, however,
+            // is only populated when ConnectAsync actually creates a session — which the failing
+            // mock never does. That's the invariant this test is asserting.
+            lock (ctx.Sessions) Assert.That(ctx.Sessions, Is.Empty);
+        }
+
+        [Test]
+        [NonParallelizable]
+        public async Task Will_fill_up_over_and_over_again_on_disconnects()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(50);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            TimeSpan prevConnectingDelay = StatsParameters.Instance.EventParams[NodeStatsEventType.Connecting].ReconnectDelay;
+            StatsParameters.Instance.EventParams[NodeStatsEventType.Connecting] = (TimeSpan.Zero, 0);
+            int[] prevDisconnectDelays = StatsParameters.Instance.DisconnectDelays;
+            StatsParameters.Instance.DisconnectDelays = new[] { 0 };
+
+            try
+            {
+                for (int i = 0; i < 10; i++)
+                {
+                    await ctx.WaitForActivePeersAsync(25, TimeSpan.FromSeconds(60));
+                    ctx.DisconnectAllSessions();
+                }
+            }
+            finally
+            {
+                StatsParameters.Instance.EventParams[NodeStatsEventType.Connecting] = (prevConnectingDelay, 0);
+                StatsParameters.Instance.DisconnectDelays = prevDisconnectDelays;
+            }
+        }
+
+        [Test]
+        public async Task Will_fill_up_over_and_over_again_on_newly_discovered()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(0);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            for (int i = 0; i < 10; i++)
+            {
+                ctx.DiscoverNew(25);
+                Assert.That(() => ctx.PeerManager.ActivePeers.Count, Is.EqualTo(25).After(_delay, 10));
+            }
+        }
+
+        [Test]
+        public async Task Will_not_stop_trying_on_rlpx_connection_failure()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(0);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            ctx.RlpxPeer.MakeItFail();
+
+            for (int i = 0; i < 10; i++)
+            {
+                ctx.DiscoverNew(25);
+                // The manager keeps retrying failed peers in the background, so the counter never
+                // settles — assert it reaches each cycle's threshold instead of an exact value.
+                await ctx.RlpxPeer.WaitForConnectCallsAsync(25 * (i + 1), TimeSpan.FromSeconds(30));
+                Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.AtLeast(25 * (i + 1)));
+            }
+        }
+
+        [Test]
+        public async Task Will_not_stop_trying_on_any_failure()
+        {
+            await using Context ctx = new(maxActivePeers: 110);
+
+            ctx.Stats = Substitute.For<INodeStatsManager>();
+            ctx.Stats
+                .When(it => it.ReportEvent(Arg.Any<Node>(), NodeStatsEventType.ConnectionFailed))
+                .Throw(new Exception("test exception"));
+
+            Enumerable.Range(0, 110).ForEach((idx) =>
+            {
+                PublicKey key = new PrivateKeyGenerator().Generate().PublicKey;
+                ctx.PeerPool.GetOrAdd(new Node(key, "1.2.3.4", idx));
+            });
+
+            ctx.CreatePeerManager();
+            ctx.SetupPersistedPeers(0);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            ctx.RlpxPeer.MakeItFail();
+
+            Assert.That(() => ctx.RlpxPeer.ConnectAsyncCallsCount, Is.GreaterThan(100).After(10000, 10));
+            await ctx.PeerManager.StopAsync();
+        }
+
+        [Test]
+        public async Task IfPeerAdded_with_invalid_chain_then_do_not_connect()
+        {
+            await using Context ctx = new();
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            NetworkNode networkNode = new(ctx.GenerateEnode());
+            ctx.Stats.ReportFailedValidation(new Node(networkNode), CompatibilityValidationType.NetworkId);
+
+            ctx.PeerPool.GetOrAdd(networkNode);
+
+            Assert.That(() => ctx.PeerPool.ActivePeers.Count, Is.EqualTo(0).After(_delay, 10));
+        }
+
+        private readonly int _delay = 500;
+
+        private readonly int _delayLong = 1000;
+        private readonly int _delayLonger = 3000;
+
+        [Test]
+        [Ignore("Behaviour changed that allows peers to go over max if awaiting response")]
+        public async Task Will_fill_up_with_incoming_over_and_over_again_on_disconnects()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(0);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            for (int i = 0; i < 10; i++)
+            {
+                ctx.CreateNewIncomingSessions(25);
+                Assert.That(() => ctx.PeerManager.ActivePeers.Count, Is.EqualTo(25).After(_delay, 10));
+            }
+        }
+
+        [Test]
+        [Explicit("CI issues - bad test design")]
+        public async Task Will_fill_up_over_and_over_again_on_disconnects_and_when_ids_keep_changing()
+        {
+            await using Context ctx = new();
+            ctx.SetupPersistedPeers(50);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            int currentCount = 0;
+            int maxCount = 0;
+            for (int i = 0; i < 10; i++)
+            {
+                currentCount += 25;
+                maxCount += 50;
+                Assert.That(() => ctx.RlpxPeer.ConnectAsyncCallsCount, Is.InRange(currentCount, maxCount).After(_delayLonger * 2, 10));
+                Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.InRange(currentCount, maxCount));
+                ctx.HandshakeAllSessions();
+                await Task.Delay(_delay);
+                ctx.DisconnectAllSessions();
+            }
+
+            await ctx.PeerManager.StopAsync();
+            ctx.DisconnectAllSessions();
+
+            Assert.That(
+                () => ctx.PeerManager.CandidatePeers.All(p => p.OutSession is null),
+                Is.True.After(2000, 10));
+        }
+
+        [Test]
+        [Explicit("CI issues - bad test design")]
+        public async Task Will_fill_up_over_and_over_again_on_disconnects_and_when_ids_keep_changing_with_max_candidates_40()
+        {
+            await using Context ctx = new();
+            ctx.NetworkConfig.MaxCandidatePeerCount = 40;
+            ctx.NetworkConfig.CandidatePeerCountCleanupThreshold = 30;
+            ctx.NetworkConfig.PersistedPeerCountCleanupThreshold = 40;
+            ctx.SetupPersistedPeers(50);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            int currentCount = 0;
+            int count = 35;
+            for (int i = 0; i < 10; i++)
+            {
+                currentCount += count;
+                await Task.Delay(_delayLong);
+                Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.InRange(currentCount, currentCount + count));
+                ctx.HandshakeAllSessions();
+                await Task.Delay(_delay);
+                ctx.DisconnectAllSessions();
+            }
+        }
+
+        [Test]
+        [Explicit("CI issues - bad test design")]
+        public async Task Will_fill_up_over_and_over_again_on_disconnects_and_when_ids_keep_changing_with_max_candidates_40_with_random_incoming_connections()
+        {
+            await using Context ctx = new();
+            ctx.NetworkConfig.MaxCandidatePeerCount = 40;
+            ctx.NetworkConfig.CandidatePeerCountCleanupThreshold = 30;
+            ctx.NetworkConfig.PersistedPeerCountCleanupThreshold = 40;
+            ctx.SetupPersistedPeers(50);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            int count = 35;
+            int currentCount = 0;
+            for (int i = 0; i < 10; i++)
+            {
+                currentCount += count;
+                await Task.Delay(_delayLong);
+                Assert.That(ctx.RlpxPeer.ConnectAsyncCallsCount, Is.InRange(currentCount, currentCount + count));
+                ctx.HandshakeAllSessions();
+                await Task.Delay(_delay);
+                ctx.CreateIncomingSessions();
+                await Task.Delay(_delay);
+                ctx.DisconnectAllSessions();
+            }
+        }
+
+        [Test]
+        public async Task Will_not_cleanup_active_peers()
+        {
+            await using Context ctx = new();
+            ctx.NetworkConfig.MaxCandidatePeerCount = 2;
+            ctx.NetworkConfig.CandidatePeerCountCleanupThreshold = 1;
+            ctx.NetworkConfig.PersistedPeerCountCleanupThreshold = 1;
+            ctx.SetupPersistedPeers(4);
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            Assert.That(
+                () => ctx.PeerManager.ActivePeers.Count,
+                Is.EqualTo(4).After(5000, 100));
+        }
+
+        [Test]
+        public async Task Will_load_static_nodes_and_connect_to_them()
+        {
+            await using Context ctx = new();
+            const int nodesCount = 5;
+            List<NetworkNode> staticNodes = ctx.CreateNodes(nodesCount);
+            ctx.StaticNodesManager.DiscoverNodes(Arg.Any<CancellationToken>()).Returns(staticNodes.Select(static n => new Node(n, true)).ToAsyncEnumerable());
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+
+            foreach (NetworkNode node in staticNodes)
+            {
+                ctx.TestNodeSource.AddNode(new Node(TestItem.PublicKeyA, node.Host, node.Port));
+            }
+
+            Assert.That(() => ctx.PeerManager.ActivePeers.Count(static p => p.Node.IsStatic), Is.EqualTo(nodesCount).After(_delay, 10));
+        }
+
+        [Test]
+        public async Task Will_disconnect_on_remove_static_node()
+        {
+            await using Context ctx = new();
+            const int nodesCount = 5;
+            int disconnections = 0;
+            List<NetworkNode> staticNodes = ctx.CreateNodes(nodesCount);
+            ctx.StaticNodesManager.DiscoverNodes(Arg.Any<CancellationToken>()).Returns(staticNodes.Select(n => new Node(n, true)).ToAsyncEnumerable());
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(nodesCount, TimeSpan.FromSeconds(30));
+
+            void DisconnectHandler(object o, DisconnectEventArgs e) => disconnections++;
+            ctx.Sessions.ForEach(s => s.Disconnected += DisconnectHandler);
+
+            ctx.StaticNodesManager.NodeRemoved += Raise.EventWith<NodeEventArgs>(new ExplicitNodeRemovalEventArgs(
+                new Node(staticNodes.First())));
+
+            Assert.That(ctx.PeerManager.ActivePeers.Count(p => p.Node.IsStatic), Is.EqualTo(nodesCount - 1));
+            Assert.That(disconnections, Is.EqualTo(1));
+        }
+
+        [Test]
+        public async Task Will_connect_and_disconnect_on_peer_management()
+        {
+            await using Context ctx = new();
+            int disconnections = 0;
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            NetworkNode node = new(ctx.GenerateEnode());
+            ctx.PeerPool.GetOrAdd(node);
+            await ctx.RlpxPeer.WaitForConnectCallsAsync(1, TimeSpan.FromSeconds(30));
+
+            void DisconnectHandler(object o, DisconnectEventArgs e) => disconnections++;
+            Assert.That(ctx.PeerManager.ActivePeers.Select(p => p.Node.Id), Is.EqualTo(new[] { node.NodeId }));
+
+            ctx.Sessions.ForEach(s => s.Disconnected += DisconnectHandler);
+
+            Assert.That(ctx.PeerPool.TryRemove(node.NodeId, out _), Is.True);
+            Assert.That(ctx.PeerManager.ActivePeers, Is.Empty);
+            Assert.That(disconnections, Is.EqualTo(1));
+        }
+
+        [Test]
+        public async Task Will_only_add_same_peer_once()
+        {
+            await using Context ctx = new();
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            NetworkNode node = new(ctx.GenerateEnode());
+            ctx.PeerPool.GetOrAdd(node);
+            ctx.PeerPool.GetOrAdd(node);
+            ctx.PeerPool.GetOrAdd(node);
+            await Task.Delay(_delayLong);
+            Assert.That(ctx.PeerManager.ActivePeers, Has.Count.EqualTo(1));
+        }
+
+        [Test]
+        public async Task RemovePeer_should_fail_if_peer_not_added()
+        {
+            await using Context ctx = new();
+            ctx.PeerPool.Start();
+            ctx.PeerManager.Start();
+            NetworkNode node = new(ctx.GenerateEnode());
+            Assert.That(() => ctx.PeerPool.TryRemove(node.NodeId, out _), Is.False.After(_delay, 10));
+        }
+
+        private class Context : IAsyncDisposable
+        {
+            public RlpxMock RlpxPeer { get; }
+            public IDiscoveryApp DiscoveryApp { get; }
+            public INodeStatsManager Stats { get; set; }
+            public INetworkStorage Storage { get; }
+            public NodesLoader NodesLoader { get; }
+            public PeerManager PeerManager { get; set; }
+            public IPeerPool PeerPool { get; }
+            public INetworkConfig NetworkConfig { get; }
+            public IStaticNodesManager StaticNodesManager { get; }
+            public TestNodeSource TestNodeSource { get; }
+            public List<Session> Sessions { get; } = [];
+
+            public Context(int parallelism = 0, int maxActivePeers = 25)
+            {
+                RlpxPeer = new RlpxMock(Sessions);
+                DiscoveryApp = Substitute.For<IDiscoveryApp>();
+                DiscoveryApp.DiscoverNodes(Arg.Any<CancellationToken>()).Returns(AsyncEnumerable.Empty<Node>());
+                ITimerFactory timerFactory = Substitute.For<ITimerFactory>();
+                Stats = new NodeStatsManager(timerFactory, LimboLogs.Instance);
+                Storage = new InMemoryStorage();
+                NodesLoader = new NodesLoader(new NetworkConfig(), Stats, Storage, new Enode(TestItem.PublicKeyA, IPAddress.Loopback, 30303), LimboLogs.Instance, new NodesLoaderOptions());
+                NetworkConfig = new NetworkConfig();
+                NetworkConfig.MaxActivePeers = maxActivePeers;
+                NetworkConfig.PeersPersistenceInterval = 50;
+                NetworkConfig.NumConcurrentOutgoingConnects = parallelism;
+                NetworkConfig.MaxOutgoingConnectPerSec = 1000000; // no limit in unit test
+                StaticNodesManager = Substitute.For<IStaticNodesManager>();
+                StaticNodesManager.DiscoverNodes(Arg.Any<CancellationToken>()).Returns(AsyncEnumerable.Empty<Node>());
+                TestNodeSource = new TestNodeSource();
+                CompositeNodeSource nodeSources = new(NodesLoader, DiscoveryApp, StaticNodesManager, TestNodeSource);
+                ITrustedNodesManager trustedNodesManager = Substitute.For<ITrustedNodesManager>();
+                PeerPool = new PeerPool(nodeSources, Stats, Storage, NetworkConfig, LimboLogs.Instance, trustedNodesManager);
+                CreatePeerManager();
+            }
+
+            public void CreatePeerManager() => PeerManager = new PeerManager(RlpxPeer, PeerPool, Stats, NetworkConfig, new Enode(TestItem.PublicKeyA, IPAddress.Loopback, 30303), LimboLogs.Instance);
+
+            public void SetupPersistedPeers(int count) => Storage.UpdateNodes(CreateNodes(count));
+
+            public void CreateIncomingSessions()
+            {
+                Session[] clone;
+
+                lock (Sessions)
+                {
+                    clone = Sessions.ToArray();
+                }
+
+                RlpxPeer.CreateIncoming(clone);
+            }
+
+            public void HandshakeAllSessions()
+            {
+                Session[] clone;
+                lock (Sessions)
+                {
+                    clone = Sessions.ToArray();
+                }
+
+                foreach (Session session in clone)
+                {
+                    session.Handshake(new PrivateKeyGenerator().Generate().PublicKey);
+                }
+            }
+
+            public void CreateNewIncomingSessions(int count)
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    RlpxPeer.CreateRandomIncoming();
+                }
+            }
+
+            public List<NetworkNode> CreateNodes(int count)
+            {
+                List<NetworkNode> nodes = [];
+                for (int i = 0; i < count; i++)
+                {
+                    PrivateKeyGenerator generator = new();
+                    string enode = GenerateEnode(generator);
+                    NetworkNode node = new(enode);
+                    nodes.Add(node);
+                }
+
+                return nodes;
+            }
+
+            public void DiscoverNew(int count)
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    TestNodeSource.AddNode(new Node(new PrivateKeyGenerator().Generate().PublicKey, "1.2.3.4", 1234));
+                }
+            }
+
+            public void DisconnectAllSessions()
+            {
+                Session[] clone;
+                lock (Sessions)
+                {
+                    clone = Sessions.ToArray();
+                    Sessions.Clear();
+                }
+
+                foreach (Session session in clone)
+                {
+                    session.MarkDisconnected(DisconnectReason.Other, DisconnectType.Remote, "test");
+                }
+            }
+
+            public async Task WaitForActivePeersAsync(int target, TimeSpan timeout)
+            {
+                // ActivePeers is updated synchronously by RlpxHostOnSessionCreated (subscribed by
+                // PeerManager), which the mock invokes before raising ConnectCalled. So every time
+                // ConnectCalled fires we have just gained — or could lose to a pending OnDisconnected —
+                // an active peer. Re-evaluate on each ConnectCalled signal until we observe the target.
+                if (PeerPool.ActivePeers.Count >= target) return;
+
+                TaskCompletionSource tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                Action handler = () =>
+                {
+                    if (PeerPool.ActivePeers.Count >= target) tcs.TrySetResult();
+                };
+                RlpxPeer.ConnectCalled += handler;
+                try
+                {
+                    if (PeerPool.ActivePeers.Count >= target) return;
+                    await tcs.Task.WaitAsync(timeout);
+                }
+                catch (TimeoutException)
+                {
+                    Assert.Fail($"Timed out after {timeout} waiting for {target} active peers (current: {PeerPool.ActivePeers.Count})");
+                }
+                finally
+                {
+                    RlpxPeer.ConnectCalled -= handler;
+                }
+            }
+
+            public string GenerateEnode(PrivateKeyGenerator generator = null)
+            {
+                generator ??= new PrivateKeyGenerator();
+                string enode = $"enode://{generator.Generate().PublicKey.ToString(false)}@52.141.78.53:30303";
+                return enode;
+            }
+
+            public async ValueTask DisposeAsync() => await PeerManager.StopAsync();
+        }
+
+        private class RlpxMock(List<Session> sessions) : IRlpxHost
+        {
+            private readonly List<Session> _sessions = sessions;
+            public ISessionMonitor SessionMonitor { get; }
+
+            public event Action? ConnectCalled;
+
+            public Task Init() => Task.CompletedTask;
+
+            public Task<bool> ConnectAsync(Node node)
+            {
+                lock (this)
+                {
+                    ConnectAsyncCallsCount++;
+                }
+
+                if (_isFailing)
+                {
+                    ConnectCalled?.Invoke();
+                    return Task.FromResult(false);
+                }
+
+                Session session = new(30313, node, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance,
+                    LimboLogs.Instance);
+                Track(session);
+                lock (_sessions)
+                {
+                    _sessions.Add(session);
+                }
+
+                SessionCreated?.Invoke(this, new SessionEventArgs(session));
+                ConnectCalled?.Invoke();
+                return Task.FromResult(true);
+            }
+
+            public async Task WaitForConnectCallsAsync(int totalCount, TimeSpan timeout)
+            {
+                if (ConnectAsyncCallsCount >= totalCount) return;
+
+                TaskCompletionSource tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                Action handler = () =>
+                {
+                    if (ConnectAsyncCallsCount >= totalCount) tcs.TrySetResult();
+                };
+                ConnectCalled += handler;
+                try
+                {
+                    if (ConnectAsyncCallsCount >= totalCount) return;
+                    await tcs.Task.WaitAsync(timeout);
+                }
+                catch (TimeoutException)
+                {
+                    Assert.Fail($"Timed out after {timeout} waiting for {totalCount} ConnectAsync calls (current: {ConnectAsyncCallsCount})");
+                }
+                finally
+                {
+                    ConnectCalled -= handler;
+                }
+            }
+
+            public void CreateRandomIncoming()
+            {
+                Session session = new(30313, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance, LimboLogs.Instance);
+                Track(session);
+                lock (_sessions)
+                {
+                    _sessions.Add(session);
+                }
+
+                session.RemoteHost = "1.2.3.4";
+                session.RemotePort = 12345;
+                SessionCreated?.Invoke(this, new SessionEventArgs(session));
+                session.Handshake(new PrivateKeyGenerator().Generate().PublicKey);
+            }
+
+            public int ConnectAsyncCallsCount { get; set; }
+
+            public Task Shutdown() => Task.CompletedTask;
+
+            public int LocalPort => 0;
+            public event EventHandler<SessionEventArgs> SessionCreated;
+            public event SessionDisconnectedEventHandler SessionDisconnected;
+
+            public void CreateIncoming(params Session[] sessions)
+            {
+                List<Session> incomingSessions = [];
+                foreach (Session session in sessions)
+                {
+                    Session sessionIn = new(30313, Substitute.For<IChannel>(), NullDisconnectsAnalyzer.Instance, LimboLogs.Instance);
+                    sessionIn.RemoteHost = session.RemoteHost;
+                    sessionIn.RemotePort = session.RemotePort;
+                    Track(sessionIn);
+                    SessionCreated?.Invoke(this, new SessionEventArgs(sessionIn));
+                    sessionIn.Handshake(session.RemoteNodeId);
+                    incomingSessions.Add(sessionIn);
+                }
+
+                lock (_sessions)
+                {
+                    _sessions.AddRange(incomingSessions);
+                }
+            }
+
+            private bool _isFailing;
+
+            public void MakeItFail() => _isFailing = true;
+
+            public bool ShouldContact(IPAddress ip, bool exactOnly = false) => true;
+
+            private void Track(Session session) => session.Disconnected += OnSessionDisconnected;
+
+            private void OnSessionDisconnected(object? sender, DisconnectEventArgs args)
+            {
+                ISession session = (ISession)sender!;
+                session.Disconnected -= OnSessionDisconnected;
+                SessionDisconnected?.Invoke(this, session, args);
+            }
+        }
+
+        private class InMemoryStorage : INetworkStorage
+        {
+            private readonly ConcurrentDictionary<PublicKey, NetworkNode> _nodes =
+                new();
+
+            public NetworkNode[] GetPersistedNodes() => _nodes.Select(static kvp => kvp.Value).ToArray();
+
+            public void UpdateNode(NetworkNode node)
+            {
+                _nodes[node.NodeId] = node;
+                _pendingChanges = true;
+            }
+
+            public void UpdateNodes(IEnumerable<NetworkNode> nodes)
+            {
+                foreach (NetworkNode node in nodes)
+                {
+                    UpdateNode(node);
+                }
+            }
+
+            public void RemoveNode(PublicKey nodeId) => _pendingChanges = true;
+
+            public void StartBatch()
+            {
+            }
+
+            public void Commit()
+            {
+            }
+
+            private bool _pendingChanges;
+
+            public int PersistedNodesCount => _nodes.Count;
+
+            public bool AnyPendingChange() => _pendingChanges;
+        }
+    }
+}

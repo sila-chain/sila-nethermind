@@ -1,0 +1,523 @@
+// SPDX-FileCopyrightText: 2026 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using Nethermind.Config;
+using Nethermind.Core;
+using Nethermind.Core.Crypto;
+using Nethermind.Core.Sip2930;
+using Nethermind.Core.Extensions;
+using Nethermind.Core.Specs;
+using Nethermind.Crypto;
+using Nethermind.Int256;
+using Nethermind.Serialization.Json;
+using Nethermind.Serialization.Rlp;
+using Nethermind.Specs;
+using Nethermind.Specs.Test;
+
+namespace Sila.Test.Base
+{
+    public static class JsonToSilaTest
+    {
+        private static ulong ParseULong(string? hex) =>
+            Bytes.FromHexString(hex).ToULongFromBigEndianByteArrayWithoutLeadingZeros();
+
+        private static ulong? ParseULongNullable(string? hex) =>
+            hex is null ? null : (ulong?)Bytes.FromHexString(hex).ToULongFromBigEndianByteArrayWithoutLeadingZeros();
+
+        private static ForkActivation TransitionForkActivation(string transitionInfo)
+        {
+            const string timestampPrefix = "Time";
+            const char kSuffix = 'k';
+            if (!transitionInfo.StartsWith(timestampPrefix))
+            {
+                return new ForkActivation(ulong.Parse(transitionInfo));
+            }
+
+            transitionInfo = transitionInfo.Remove(0, timestampPrefix.Length);
+            if (!transitionInfo.EndsWith(kSuffix))
+            {
+                return ForkActivation.TimestampOnly(ulong.Parse(transitionInfo));
+            }
+
+            transitionInfo = transitionInfo.RemoveEnd(kSuffix);
+            return ForkActivation.TimestampOnly(ulong.Parse(transitionInfo) * 1000);
+        }
+
+        public static BlockHeader Convert(TestBlockHeaderJson? headerJson)
+        {
+            if (headerJson is null)
+            {
+                throw new InvalidDataException("Header JSON was null when constructing test.");
+            }
+
+            BlockHeader header = new(
+                new Hash256(headerJson.ParentHash),
+                new Hash256(headerJson.UncleHash),
+                new Address(headerJson.Coinbase),
+                Bytes.FromHexString(headerJson.Difficulty).ToUInt256(),
+                ParseULong(headerJson.Number),
+                ParseULong(headerJson.GasLimit),
+                ParseULong(headerJson.Timestamp),
+                Bytes.FromHexString(headerJson.ExtraData),
+                ParseULongNullable(headerJson.BlobGasUsed),
+                ParseULongNullable(headerJson.ExcessBlobGas),
+                headerJson.ParentBeaconBlockRoot is null ? null : new Hash256(headerJson.ParentBeaconBlockRoot),
+                headerJson.RequestsHash is null ? null : new Hash256(headerJson.RequestsHash),
+                headerJson.SlotNumber is null ? null : ParseULong(headerJson.SlotNumber)
+            )
+            {
+                Bloom = new Bloom(Bytes.FromHexString(headerJson.Bloom)),
+                GasUsed = ParseULong(headerJson.GasUsed),
+                Hash = new Hash256(headerJson.Hash),
+                MixHash = new Hash256(headerJson.MixHash),
+                Nonce = ParseULong(headerJson.Nonce),
+                ReceiptsRoot = new Hash256(headerJson.ReceiptTrie),
+                StateRoot = new Hash256(headerJson.StateRoot),
+                TxRoot = new Hash256(headerJson.TransactionsTrie),
+                WithdrawalsRoot = headerJson.WithdrawalsRoot is null ? null : new Hash256(headerJson.WithdrawalsRoot),
+                BlockAccessListHash = headerJson.BlockAccessListHash is null ? null : new Hash256(headerJson.BlockAccessListHash),
+            };
+
+            if (headerJson.BaseFeePerGas is not null)
+            {
+                header.BaseFeePerGas = ParseULong(headerJson.BaseFeePerGas);
+            }
+
+            return header;
+        }
+
+        public static string? ParseValidationError(TestEngineNewPayloadsJson engineNewPayload, int newPayloadVersion)
+        {
+            if (engineNewPayload.ValidationError is not null)
+            {
+                return engineNewPayload.ValidationError;
+            }
+
+            int validationErrorParamIndex = newPayloadVersion >= 4 ? 4 : 3;
+            if (engineNewPayload.Params.Length <= validationErrorParamIndex)
+            {
+                return null;
+            }
+
+            JsonElement validationError = engineNewPayload.Params[validationErrorParamIndex];
+            return validationError.ValueKind switch
+            {
+                JsonValueKind.Null => null,
+                JsonValueKind.String => validationError.Deserialize<string>(SilaJsonSerializer.JsonOptions),
+                JsonValueKind.Array => string.Join("|", validationError.Deserialize<string[]?>(SilaJsonSerializer.JsonOptions) ?? []),
+                _ => null,
+            };
+        }
+
+
+        public static Transaction Convert(PostStateJson postStateJson, TransactionJson transactionJson, ulong chainId = BlockchainIds.SilaMainnet)
+        {
+            PrivateKey privateKey = new(transactionJson.SecretKey);
+
+            // Invalid-tx state tests carry the actual signed tx in txbytes; the template below is
+            // re-signed pre-SIP-155, which cannot reproduce signature-level invalidity (e.g. INVALID_CHAINID).
+            if (postStateJson.ExpectException is not null && postStateJson.Txbytes is not null)
+            {
+                try
+                {
+                    Transaction decoded = Rlp.Decode<Transaction>(postStateJson.Txbytes, RlpBehaviors.SkipTypedWrapping);
+                    decoded.SenderAddress = privateKey.Address;
+                    return decoded;
+                }
+                catch (RlpException)
+                {
+                    // Undecodable txbytes: fall back to the template; non-signature invalidity
+                    // (e.g. intrinsic gas) is still caught by tx validation at execution time.
+                }
+            }
+            Transaction transaction = new()
+            {
+                Type = transactionJson.Type,
+                Value = transactionJson.Value[postStateJson.Indexes.Value],
+                GasLimit = transactionJson.GasLimit[postStateJson.Indexes.Gas],
+                GasPrice = transactionJson.GasPrice ?? transactionJson.MaxPriorityFeePerGas ?? 0,
+                DecodedMaxFeePerGas = transactionJson.MaxFeePerGas ?? 0,
+                Nonce = transactionJson.Nonce,
+                To = transactionJson.To,
+                Data = transactionJson.Data[postStateJson.Indexes.Data],
+                SenderAddress = privateKey.Address,
+                Signature = new Signature(1, 1, 27),
+                BlobVersionedHashes = transactionJson.BlobVersionedHashes,
+                MaxFeePerBlobGas = transactionJson.MaxFeePerBlobGas
+            };
+            transaction.Hash = transaction.CalculateHash();
+
+            bool hasAccessListField = transactionJson.AccessLists is not null || transactionJson.AccessList is not null;
+            AccessList.Builder builder = new();
+            ProcessAccessList(transactionJson.AccessLists is not null
+                ? transactionJson.AccessLists[postStateJson.Indexes.Data]
+                : transactionJson.AccessList, builder);
+            transaction.AccessList = builder.Build();
+
+            if (hasAccessListField)
+            {
+                transaction.Type = TxType.AccessList;
+            }
+            else if (transaction.AccessList.IsEmpty)
+            {
+                transaction.AccessList = null;
+            }
+
+            if (transactionJson.MaxFeePerGas is not null)
+            {
+                transaction.Type = TxType.SIP1559;
+                // For SIP-1559+ transactions, GasPrice is aliased to MaxPriorityFeePerGas.
+                // Use maxPriorityFeePerGas from JSON, falling back to maxFeePerGas per go-sila behavior.
+                transaction.GasPrice = transactionJson.MaxPriorityFeePerGas ?? transactionJson.MaxFeePerGas.Value;
+            }
+
+            if (transaction.BlobVersionedHashes?.Length > 0)
+                transaction.Type = TxType.Blob;
+
+            if (transactionJson.AuthorizationList is not null)
+            {
+                transaction.AuthorizationList =
+                    [.. transactionJson.AuthorizationList
+                    .Select(i =>
+                    {
+                        if (i.Nonce > ulong.MaxValue)
+                        {
+                            i.Nonce = 0;
+                            transaction.SenderAddress = Address.Zero;
+                        }
+                        UInt256 s = UInt256.Zero;
+                        if (i.S.Length > 66)
+                        {
+                            i.S = "0x0";
+                            transaction.SenderAddress = Address.Zero;
+                        }
+                        else
+                        {
+                            s = UInt256.Parse(i.S);
+                        }
+                        UInt256 r = UInt256.Zero;
+                        if (i.R.Length > 66)
+                        {
+                            i.R = "0x0";
+                            transaction.SenderAddress = Address.Zero;
+                        }
+                        else
+                        {
+                            r = UInt256.Parse(i.R);
+                        }
+                        if (i.V > byte.MaxValue)
+                        {
+                            i.V = 0;
+                            transaction.SenderAddress = Address.Zero;
+                        }
+                        return new AuthorizationTuple(
+                            i.ChainId,
+                            i.Address,
+                            i.Nonce.u0,
+                            (byte)i.V,
+                            r,
+                            s);
+                    })];
+                if (transaction.AuthorizationList.Any())
+                {
+                    transaction.Type = TxType.SetCode;
+                }
+            }
+
+            // State tests identify the sender via `secretKey`, so sign with that key for the
+            // signature to recover to the same sender; otherwise, whenever the sender account is
+            // absent from the pre-state, TransactionProcessor.RecoverSenderIfNeeded re-recovers a
+            // bogus sender from the placeholder signature and then crashes incrementing its nonce.
+            // Address.Zero marks an intentionally-invalid transaction, so leave those as-is.
+            if (transaction.SenderAddress != Address.Zero)
+            {
+                new SilaEcdsa(chainId).Sign(privateKey, transaction, isSip155Enabled: false);
+                transaction.Hash = transaction.CalculateHash();
+            }
+
+            return transaction;
+        }
+
+        public static void ProcessAccessList(AccessListItemJson[]? accessList, AccessList.Builder builder)
+        {
+            foreach (AccessListItemJson accessListItemJson in accessList ?? Array.Empty<AccessListItemJson>())
+            {
+                builder.AddAddress(accessListItemJson.Address);
+                foreach (byte[] storageKey in accessListItemJson.StorageKeys)
+                {
+                    builder.AddStorage(new UInt256(storageKey, true));
+                }
+            }
+        }
+
+        public static Transaction Convert(LegacyTransactionJson transactionJson)
+        {
+            Transaction transaction = new()
+            {
+                Value = transactionJson.Value,
+                GasLimit = transactionJson.GasLimit,
+                GasPrice = transactionJson.GasPrice,
+                Nonce = transactionJson.Nonce,
+                To = transactionJson.To,
+                Data = transactionJson.Data,
+                Signature = new Signature(transactionJson.R, transactionJson.S, transactionJson.V)
+            };
+            transaction.Hash = transaction.CalculateHash();
+            return transaction;
+        }
+
+        public static IEnumerable<GeneralStateTest> Convert(string name, string category, GeneralStateTestJson testJson)
+        {
+            if (testJson.LoadFailure is not null)
+            {
+                return Enumerable.Repeat(new GeneralStateTest { Name = name, Category = category, LoadFailure = testJson.LoadFailure }, 1);
+            }
+
+            List<GeneralStateTest> blockchainTests = [];
+            ulong chainId = LoadChainId(testJson.Config);
+            foreach (KeyValuePair<string, PostStateJson[]> postStateBySpec in testJson.Post)
+            {
+                int iterationNumber = 0;
+                IReleaseSpec fork = LoadSpec(postStateBySpec.Key, testJson.Config?.BlobSchedule);
+                foreach (PostStateJson stateJson in postStateBySpec.Value)
+                {
+                    GeneralStateTest test = new()
+                    {
+                        Name = Path.GetFileName(name) +
+                                    $"_d{stateJson.Indexes.Data}g{stateJson.Indexes.Gas}v{stateJson.Indexes.Value}_",
+                        Category = category,
+                        ForkName = postStateBySpec.Key,
+                        Fork = fork,
+                        ChainId = chainId,
+                        PreviousHash = testJson.Env.PreviousHash,
+                        CurrentCoinbase = testJson.Env.CurrentCoinbase,
+                        CurrentDifficulty = testJson.Env.CurrentDifficulty,
+                        CurrentGasLimit = testJson.Env.CurrentGasLimit,
+                        CurrentNumber = testJson.Env.CurrentNumber,
+                        CurrentTimestamp = testJson.Env.CurrentTimestamp,
+                        CurrentBaseFee = testJson.Env.CurrentBaseFee,
+                        CurrentRandom = testJson.Env.CurrentRandom,
+                        CurrentBeaconRoot = testJson.Env.CurrentBeaconRoot,
+                        CurrentWithdrawalsRoot = testJson.Env.CurrentWithdrawalsRoot,
+                        CurrentExcessBlobGas = testJson.Env.CurrentExcessBlobGas,
+                        CurrentSlotNumber = testJson.Env.SlotNumber,
+                        PostReceiptsRoot = stateJson.Logs,
+                        PostHash = stateJson.Hash,
+                        Pre = testJson.Pre.ToDictionary(p => p.Key, p => p.Value),
+                        Transaction = Convert(stateJson, testJson.Transaction, chainId)
+                    };
+
+                    if (testJson.Info?.Labels?.ContainsKey(iterationNumber.ToString()) ?? false)
+                    {
+                        test.Name += testJson.Info?.Labels?[iterationNumber.ToString()]?.Replace(":label ", string.Empty);
+                    }
+                    blockchainTests.Add(test);
+                    ++iterationNumber;
+                }
+            }
+
+            return blockchainTests;
+        }
+
+        public static BlockchainTest Convert(string name, string category, BlockchainTestJson testJson)
+        {
+            if (testJson.LoadFailure is not null)
+            {
+                return new BlockchainTest { Name = name, Category = category, LoadFailure = testJson.LoadFailure };
+            }
+
+            BlockchainTest test = new()
+            {
+                Name = name,
+                Category = category,
+                ForkName = testJson.Network,
+                Network = testJson.SilaNetwork,
+                NetworkAfterTransition = testJson.SilaNetworkAfterTransition,
+                TransitionForkActivation = testJson.TransitionForkActivation,
+                LastBlockHash = new Hash256(testJson.LastBlockHash),
+                GenesisRlp = testJson.GenesisRlp is null ? null : new Rlp(Bytes.FromHexString(testJson.GenesisRlp)),
+                GenesisBlockHeader = testJson.GenesisBlockHeader,
+                Blocks = testJson.Blocks,
+                EngineNewPayloads = testJson.EngineNewPayloads,
+                Pre = testJson.Pre.ToDictionary(p => p.Key, p => p.Value)
+            };
+
+            HalfBlockchainTestJson half = testJson as HalfBlockchainTestJson;
+            if (half is not null)
+            {
+                test.PostStateRoot = half.PostState;
+            }
+            else
+            {
+                test.PostState = testJson.PostState?.ToDictionary(p => p.Key, p => p.Value);
+                test.PostStateRoot = testJson.PostStateHash;
+            }
+
+            return test;
+        }
+
+        private static readonly SilaJsonSerializer _serializer = new();
+        private static readonly ConcurrentDictionary<SpecOverrideCacheKey, IReleaseSpec> _overriddenSpecs = new();
+
+        public static IEnumerable<GeneralStateTest> ConvertStateTest(string json) =>
+            ConvertStateTests(_serializer.Deserialize<Dictionary<string, GeneralStateTestJson>>(json));
+
+        public static IEnumerable<GeneralStateTest> ConvertStateTest(ReadOnlySpan<byte> json) =>
+            ConvertStateTests(_serializer.Deserialize<Dictionary<string, GeneralStateTestJson>>(json));
+
+        private static List<GeneralStateTest> ConvertStateTests(Dictionary<string, GeneralStateTestJson> testsInFile)
+        {
+            List<GeneralStateTest> tests = [];
+            foreach (KeyValuePair<string, GeneralStateTestJson> namedTest in testsInFile)
+            {
+                (string name, string category) = GetNameAndCategory(namedTest.Key);
+                tests.AddRange(Convert(name, category, namedTest.Value));
+            }
+
+            return tests;
+        }
+
+        public static IEnumerable<TransactionTest> ConvertTransactionTests(string json) =>
+            ConvertTransactionTests(_serializer.Deserialize<Dictionary<string, TransactionTestJson>>(json));
+
+        public static IEnumerable<TransactionTest> ConvertTransactionTests(ReadOnlySpan<byte> json) =>
+            ConvertTransactionTests(_serializer.Deserialize<Dictionary<string, TransactionTestJson>>(json));
+
+        private static List<TransactionTest> ConvertTransactionTests(Dictionary<string, TransactionTestJson> testsInFile)
+        {
+            List<TransactionTest> tests = [];
+            foreach ((string testName, TransactionTestJson testSpec) in testsInFile)
+            {
+                if (testSpec.Result is null)
+                {
+                    continue;
+                }
+
+                (string name, string category) = GetNameAndCategory(testName);
+                foreach ((string fork, TransactionTestResultJson result) in testSpec.Result)
+                {
+                    tests.Add(new TransactionTest
+                    {
+                        Name = $"{name}::{fork}",
+                        Category = category,
+                        Fork = fork,
+                        TxBytes = testSpec.TxBytes,
+                        ExpectedException = result.Exception,
+                        ExpectedIntrinsicGas = result.IntrinsicGas,
+                    });
+                }
+            }
+
+            return tests;
+        }
+
+        public static IEnumerable<BlockchainTest> ConvertToBlockchainTests(string json)
+        {
+            try { return ConvertToBlockchainTests(_serializer.Deserialize<Dictionary<string, BlockchainTestJson>>(json)); }
+            catch (Exception) { return ConvertToBlockchainTests(CosrceFromHalf(_serializer.Deserialize<Dictionary<string, HalfBlockchainTestJson>>(json))); }
+        }
+
+        public static IEnumerable<BlockchainTest> ConvertToBlockchainTests(ReadOnlySpan<byte> json)
+        {
+            try { return ConvertToBlockchainTests(_serializer.Deserialize<Dictionary<string, BlockchainTestJson>>(json)); }
+            catch (Exception) { return ConvertToBlockchainTests(CosrceFromHalf(_serializer.Deserialize<Dictionary<string, HalfBlockchainTestJson>>(json))); }
+        }
+
+        // Some BAL fixtures use the trimmed HalfBlockchainTestJson shape; cosrce on demand.
+        private static Dictionary<string, BlockchainTestJson> CosrceFromHalf(Dictionary<string, HalfBlockchainTestJson> half)
+        {
+            Dictionary<string, BlockchainTestJson> result = [];
+            foreach (KeyValuePair<string, HalfBlockchainTestJson> pair in half) result[pair.Key] = pair.Value;
+            return result;
+        }
+
+        private static List<BlockchainTest> ConvertToBlockchainTests(Dictionary<string, BlockchainTestJson> testsInFile)
+        {
+            List<BlockchainTest> testsByName = [];
+            foreach ((string testName, BlockchainTestJson testSpec) in testsInFile)
+            {
+                string[] transitionInfo = testSpec.Network.Split("At");
+                string[] networks = transitionInfo[0].Split("To");
+
+                testSpec.SilaNetwork = LoadSpec(networks[0], testSpec.Config?.BlobSchedule);
+                if (transitionInfo.Length > 1)
+                {
+                    testSpec.TransitionForkActivation = TransitionForkActivation(transitionInfo[1]);
+                    testSpec.SilaNetworkAfterTransition = LoadSpec(networks[1], testSpec.Config?.BlobSchedule);
+                }
+
+                (string name, string category) = GetNameAndCategory(testName);
+                testsByName.Add(Convert(name, category, testSpec));
+            }
+
+            return testsByName;
+        }
+
+        private static ulong LoadChainId(ConfigJson? config) =>
+            config?.Chainid is null ? MainnetSpecProvider.Instance.ChainId : System.Convert.ToUInt64(config.Chainid, 16);
+
+        private static IReleaseSpec LoadSpec(string name, Dictionary<string, BlobScheduleEntryJson>? blobSchedule)
+        {
+            IReleaseSpec spec = SpecNameParser.Parse(name);
+            if (blobSchedule is null || !blobSchedule.TryGetValue(name, out BlobScheduleEntryJson? blobCount))
+            {
+                return spec;
+            }
+
+            SpecOverrideCacheKey key = new(name, blobCount.Max, blobCount.Target, blobCount.BaseFeeUpdateFraction);
+            return _overriddenSpecs.GetOrAdd(key, static key =>
+            {
+                IReleaseSpec spec = SpecNameParser.Parse(key.Name);
+                return new OverridableReleaseSpec(spec)
+                {
+                    MaxBlobCount = System.Convert.ToUInt64(key.MaxBlobCount, 16),
+                    TargetBlobCount = System.Convert.ToUInt64(key.TargetBlobCount, 16),
+                    BlobBaseFeeUpdateFraction = System.Convert.ToUInt64(key.BlobBaseFeeUpdateFraction, 16)
+                };
+            });
+        }
+
+        private readonly record struct SpecOverrideCacheKey(
+            string Name,
+            string? MaxBlobCount,
+            string? TargetBlobCount,
+            string? BlobBaseFeeUpdateFraction);
+
+        private static (string name, string category) GetNameAndCategory(string key)
+        {
+            key = key.Replace('\\', '/');
+            int index = key.IndexOf(".py::");
+            if (index < 0)
+            {
+                return (key, "");
+            }
+            string name = key.Substring(index + 5);
+            string category = key.Substring(0, index);
+            int startIndex = 0;
+            for (int i = 0; i < 3; i++)
+            {
+                int newIndex = category.IndexOf("/", startIndex);
+                if (newIndex < 0)
+                {
+                    break;
+                }
+                if (index + 1 < category.Length)
+                {
+                    startIndex = newIndex + 1;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            category = category.Substring(startIndex);
+            return (name, category);
+        }
+    }
+}

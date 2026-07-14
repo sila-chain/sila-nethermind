@@ -1,0 +1,213 @@
+// SPDX-FileCopyrightText: 2025 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using Nethermind.Core;
+using Nethermind.Core.Extensions;
+using Nethermind.Savm.GasPolicy;
+using Nethermind.Int256;
+using static System.Runtime.CompilerServices.Unsafe;
+using static Nethermind.Savm.VirtualMachineStatics;
+
+namespace Nethermind.Savm;
+
+public static partial class SavmInstructions
+{
+    /// <summary>
+    /// Interface for single-parameter mathematical operations on 256‐bit vectors.
+    /// Implementations provide a specific operation that takes one 256‐bit operand and returns a 256‐bit result.
+    /// </summary>
+    public interface IOpMath1Param : IGasCost
+    {
+        /// <summary>
+        /// The gas cost for executing the operation.
+        /// </summary>
+        static ulong IGasCost.GasCost => GasCostOf.VeryLow;
+
+        /// <summary>
+        /// Executes the operation on the provided 256‐bit operand.
+        /// </summary>
+        /// <param name="value">The input 256‐bit vector.</param>
+        /// <returns>The result of the operation as a 256‐bit vector.</returns>
+        abstract static SavmWord Operation(SavmWord value);
+    }
+
+    /// <summary>
+    /// Executes a single-parameter mathematical operation on the top element of the SAVM stack.
+    /// The operation is defined by the generic parameter <typeparamref name="TOpMath"/>,
+    /// which implements <see cref="IOpMath1Param"/>.
+    /// </summary>
+    /// <typeparam name="TGasPolicy">The gas policy used for gas accounting.</typeparam>
+    /// <typeparam name="TOpMath">A struct implementing <see cref="IOpMath1Param"/> for the specific math operation.</typeparam>
+    /// <param name="_">An unused virtual machine instance.</param>
+    /// <param name="stack">The SAVM stack from which the operand is read and where the result is written.</param>
+    /// <param name="gas">Reference to the gas state, updated by the operation's cost.</param>
+    /// <param name="programCounter">Reference to the program counter (unused in this operation).</param>
+    /// <returns>
+    /// <see cref="SavmExceptionType.None"/> if the operation completes successfully; otherwise,
+    /// <see cref="SavmExceptionType.StackUnderflow"/> if the stack is empty.
+    /// </returns>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionMath1Param<TGasPolicy, TOpMath>(VirtualMachine<TGasPolicy> _, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TOpMath : struct, IOpMath1Param
+    {
+        // Deduct the gas cost associated with the math operation.
+        TGasPolicy.Consume<TOpMath>(ref gas);
+
+        return Math1ParamCore<TOpMath>(ref stack);
+    }
+
+    /// <summary>Gas-free body of <see cref="InstructionMath1Param{TGasPolicy, TOpMath}"/>, also run directly by the stream executor inside precharged blocks.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static SavmExceptionType Math1ParamCore<TOpMath>(ref SavmStack stack)
+        where TOpMath : struct, IOpMath1Param
+    {
+        // Peek at the top element of the stack without removing it.
+        // This avoids an unnecessary pop/push sequence.
+        ref byte bytesRef = ref stack.PeekBytesByRef();
+        if (IsNullRef(ref bytesRef)) goto StackUnderflow;
+
+        // Read a 256-bit value from unaligned memory on the stack.
+        SavmWord result = TOpMath.Operation(ReadUnaligned<SavmWord>(ref bytesRef));
+
+        // Write the computed result directly back to the stack slot.
+        WriteUnaligned(ref bytesRef, result);
+
+        return SavmExceptionType.None;
+        // Label for error handling when the stack does not have the required element.
+    StackUnderflow:
+        return SavmExceptionType.StackUnderflow;
+    }
+
+    /// <summary>
+    /// Implements the bitwise NOT operation.
+    /// Computes the ones' complement of the input 256‐bit vector.
+    /// </summary>
+    public struct OpNot : IOpMath1Param
+    {
+        public static SavmWord Operation(SavmWord value) => Vector256.OnesComplement(value);
+    }
+
+    /// <summary>
+    /// Implements the ISZERO operation.
+    /// Compares the input 256‐bit vector to zero and returns a predefined marker if the value is zero;
+    /// otherwise, returns a zero vector.
+    /// </summary>
+    public struct OpIsZero : IOpMath1Param
+    {
+#if ZK_SAVM
+        // The zkVM has no hardware SIMD, so Vector256<byte> == default falls back to an 8-iteration
+        // element loop. ISZERO is hot (every require/conditional), so compare as a flat 4x ulong OR
+        // (endianness-agnostic for a zero test).
+        public static SavmWord Operation(SavmWord value)
+        {
+            ref ulong p = ref As<SavmWord, ulong>(ref value);
+            return (p | Add(ref p, 1) | Add(ref p, 2) | Add(ref p, 3)) == 0UL ? OpBitwiseEq.One : default;
+        }
+#else
+        public static SavmWord Operation(SavmWord value) => value == default ? OpBitwiseEq.One : default;
+#endif
+    }
+
+    /// <summary>
+    /// Implements the CLZ opcode.
+    /// Counts leading 0's of 256‐bit vector
+    /// </summary>
+    public struct OpCLZ : IOpMath1Param
+    {
+        static ulong IGasCost.GasCost => GasCostOf.Low;
+
+        public static SavmWord Operation(SavmWord value) => value == default
+            ? Vector256.Create((byte)0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0)
+            : Vector256.Create(0UL, 0UL, 0UL, (ulong)value.CountLeadingZeroBits() << 56).AsByte();
+    }
+
+    /// <summary>
+    /// Implements the BYTE opcode.
+    /// Extracts a byte from a 256-bit word at the position specified by the stack.
+    /// </summary>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionByte<TGasPolicy, TTracingInst>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+        where TTracingInst : struct, IFlag
+    {
+        TGasPolicy.Consume<VeryLowGasCost>(ref gas);
+
+        // Pop the byte position and the 256-bit word.
+        if (!stack.PopUInt256(out UInt256 a))
+            goto StackUnderflow;
+        if (!stack.PopWord256(out Span<byte> bytes))
+            goto StackUnderflow;
+
+        // If the position is out-of-range, push zero. Using direct limb access avoids the
+        // full 256-bit vector compare + defensive `in` copy the JIT emits for `a >= BigInt32`,
+        // and skips the overflow-check path of `(int)a`.
+        if (!a.IsUint64 || a.u0 >= 32)
+        {
+            return stack.PushZero<TTracingInst>();
+        }
+
+        // PopWord256 always returns 32 bytes and we've just checked a.u0 < 32, so bypass the
+        // span bounds check: JIT can't prove 0 <= (int)a.u0 < bytes.Length across the ulong->int cast.
+        return stack.PushByte<TTracingInst>(
+            Unsafe.Add(ref MemoryMarshal.GetReference(bytes), (nint)a.u0));
+
+        // Jump forward to be unpredicted by the branch predictor.
+    StackUnderflow:
+        return SavmExceptionType.StackUnderflow;
+    }
+
+    /// <summary>
+    /// Implements the SIGNEXTEND opcode.
+    /// Performs sign extension on a 256-bit integer in-place based on a specified byte index.
+    /// </summary>
+    [SkipLocalsInit]
+    public static SavmExceptionType InstructionSignExtend<TGasPolicy>(VirtualMachine<TGasPolicy> vm, ref SavmStack stack, ref TGasPolicy gas, ref int programCounter)
+        where TGasPolicy : struct, IGasPolicy<TGasPolicy>
+    {
+        TGasPolicy.Consume<LowGasCost>(ref gas);
+
+        // Pop the index to determine which byte to use for sign extension.
+        if (!stack.PopUInt256(out UInt256 a))
+            goto StackUnderflow;
+        if (a >= BigInt32)
+        {
+            // If the index is out-of-range, no extension is needed.
+            if (!stack.EnsureDepth(1))
+                goto StackUnderflow;
+            return SavmExceptionType.None;
+        }
+
+        int position = 31 - (int)a;
+
+        // Peek at the 256-bit word without removing it.
+        ref byte bytesRef = ref stack.PeekBytesByRef();
+        if (IsNullRef(ref bytesRef))
+            goto StackUnderflow;
+
+        Span<byte> bytes = MemoryMarshal.CreateSpan(ref bytesRef, SavmStack.WordSize);
+        sbyte sign = (sbyte)bytes[position];
+
+        // Extend the sign by replacing higher-order bytes.
+        if (sign >= 0)
+        {
+            // Fill with zero bytes.
+            BytesZero32.AsSpan(0, position).CopyTo(bytes[..position]);
+        }
+        else
+        {
+            // Fill with 0xFF bytes.
+            BytesMax32.AsSpan(0, position).CopyTo(bytes[..position]);
+        }
+
+        return SavmExceptionType.None;
+        // Jump forward to be unpredicted by the branch predictor.
+    StackUnderflow:
+        return SavmExceptionType.StackUnderflow;
+    }
+}

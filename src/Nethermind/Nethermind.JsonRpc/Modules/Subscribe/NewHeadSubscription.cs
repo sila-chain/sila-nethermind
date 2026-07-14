@@ -1,0 +1,59 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using Nethermind.Core.Attributes;
+using Nethermind.Blockchain;
+using Nethermind.Core;
+using Nethermind.Core.Specs;
+using Nethermind.Facade.Sil;
+using Nethermind.JsonRpc.Modules.Sil;
+using Nethermind.Logging;
+
+namespace Nethermind.JsonRpc.Modules.Subscribe
+{
+    public class NewHeadSubscription : Subscription
+    {
+        private readonly IBlockTree _blockTree;
+        private readonly bool _includeTransactions;
+        private readonly ISpecProvider _specProvider;
+        private readonly IBlockForRpcFactory _blockForRpcFactory;
+
+
+        [ConstructorWithSideEffect]
+        public NewHeadSubscription(
+            IJsonRpcDuplexClient jsonRpcDuplexClient,
+            IBlockTree? blockTree,
+            ILogManager? logManager,
+            ISpecProvider specProvider,
+            IBlockForRpcFactory blockForRpcFactory,
+            TransactionsOption? options = null)
+            : base(jsonRpcDuplexClient)
+        {
+            _blockTree = blockTree ?? throw new ArgumentNullException(nameof(blockTree));
+            _logger = logManager?.GetClassLogger<NewHeadSubscription>() ?? throw new ArgumentNullException(nameof(logManager));
+            _includeTransactions = options?.IncludeTransactions ?? false;
+            _specProvider = specProvider;
+            _blockForRpcFactory = blockForRpcFactory;
+
+            _blockTree.BlockAddedToMain += OnBlockAddedToMain;
+            if (_logger.IsTrace) _logger.Trace($"NewHeads subscription {Id} will track BlockAddedToMain");
+        }
+
+        private void OnBlockAddedToMain(object? sender, BlockReplacementEventArgs e) => ScheduleAction(async () =>
+        {
+            using JsonRpcResult result = CreateSubscriptionMessage(_blockForRpcFactory.Create(e.Block, _includeTransactions, _specProvider));
+            await JsonRpcDuplexClient.SendJsonRpcResult(result);
+            if (_logger.IsTrace) _logger.Trace($"NewHeads subscription {Id} printed new block");
+        });
+
+        public override string Type => SubscriptionType.SilSubscription.NewHeads;
+
+        public override void Dispose()
+        {
+            _blockTree.BlockAddedToMain -= OnBlockAddedToMain;
+            base.Dispose();
+            if (_logger.IsTrace) _logger.Trace($"NewHeads subscription {Id} will no longer track BlockAddedToMain");
+        }
+    }
+}

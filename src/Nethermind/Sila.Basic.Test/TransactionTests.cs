@@ -1,0 +1,120 @@
+// SPDX-FileCopyrightText: 2022 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Numerics;
+using Sila.Test.Base;
+using Nethermind.Core;
+using Nethermind.Core.Extensions;
+using Nethermind.Crypto;
+using Nethermind.Int256;
+using Nethermind.Serialization.Rlp;
+using NUnit.Framework;
+
+namespace Sila.Basic.Test;
+
+[Parallelizable(ParallelScope.All)]
+public class TransactionTests
+{
+    [OneTimeSetUp]
+    public void SetUp() => Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory);
+
+    private static IEnumerable<TransactionTest> LoadTests() =>
+        TestLoader.LoadFromFile<TransactionTestJson[], TransactionTest>(
+            "txtest.json",
+            jsonArray => jsonArray.Select(Convert)
+        );
+
+    [TestCaseSource(nameof(LoadTests))]
+    public void Test(TransactionTest test)
+    {
+        SilaEcdsa silaEcdsa = new(TestBlockchainIds.ChainId);
+        Transaction decodedUnsigned = Rlp.Decode<Transaction>(test.Unsigned);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(decodedUnsigned.Value, Is.EqualTo(test.Value), "value");
+            Assert.That(decodedUnsigned.GasPrice, Is.EqualTo(test.GasPrice), "gasPrice");
+            Assert.That(decodedUnsigned.GasLimit, Is.EqualTo(test.StartGas), "gasLimit");
+            Assert.That(decodedUnsigned.Data.AsArray(), Is.EqualTo(test.Data), "data");
+            Assert.That(decodedUnsigned.To, Is.EqualTo(test.To), "to");
+            Assert.That(decodedUnsigned.Nonce, Is.EqualTo(test.Nonce), "nonce");
+        }
+
+        Transaction decodedSigned = Rlp.Decode<Transaction>(test.Signed);
+        silaEcdsa.Sign(test.PrivateKey, decodedUnsigned, false);
+
+        Assert.That(decodedUnsigned.Signature.R.Span.SequenceEqual(decodedSigned.Signature.R.Span), Is.True, "R");
+
+        BigInteger expectedS = decodedSigned.Signature.S.Span.ToUnsignedBigInteger();
+        BigInteger actualS = decodedUnsigned.Signature.S.Span.ToUnsignedBigInteger();
+        BigInteger otherS = (BigInteger)SecP256k1Curve.N - actualS;
+
+        Assert.That(otherS == expectedS || actualS == expectedS, "S is wrong");
+
+        ulong vToCompare = decodedUnsigned.Signature.V;
+        if (otherS == expectedS)
+        {
+            vToCompare = vToCompare == 27ul ? 28ul : 27ul;
+        }
+
+        Assert.That(vToCompare, Is.EqualTo(decodedSigned.Signature.V), "V");
+    }
+
+    private static TransactionTest Convert(TransactionTestJson testJson)
+    {
+        TransactionTest test = new()
+        {
+            Value = (UInt256)testJson.Value,
+            Data = Bytes.FromHexString(testJson.Data),
+            GasPrice = (UInt256)testJson.GasPrice,
+            PrivateKey = new PrivateKey(testJson.Key),
+            Nonce = testJson.Nonce,
+            Signed = new Rlp(Bytes.FromHexString(testJson.Signed))
+        };
+        byte[] unsigned = Bytes.FromHexString(testJson.Unsigned);
+
+        if (unsigned[0] == 0xf8)
+            unsigned[1] -= 3;
+        else
+            unsigned[0] -= 3;
+
+        test.Unsigned = new Rlp(unsigned.Slice(0, unsigned.Length - 3));
+        test.StartGas = testJson.StartGas;
+        test.To = string.IsNullOrEmpty(testJson.To) ? null : new Address(testJson.To);
+        return test;
+    }
+
+    private class TransactionTestJson
+    {
+        public string Key { get; set; }
+        public ulong Nonce { get; set; }
+        public long GasPrice { get; set; }
+        public ulong StartGas { get; set; }
+        public string To { get; set; }
+        public long Value { get; set; }
+        public string Data { get; set; }
+        public string Unsigned { get; set; }
+        public string Signed { get; set; }
+    }
+
+    [DebuggerDisplay("{PrivateKey}")]
+    public class TransactionTest
+    {
+        public PrivateKey PrivateKey { get; set; }
+        public ulong Nonce { get; set; }
+        public UInt256 GasPrice { get; set; }
+        public ulong StartGas { get; set; }
+        public Address To { get; set; }
+        public UInt256 Value { get; set; }
+        public byte[] Data { get; set; }
+        public Rlp Unsigned { get; set; }
+        public Rlp Signed { get; set; }
+
+        public override string ToString() => PrivateKey.ToString();
+    }
+}

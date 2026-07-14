@@ -1,0 +1,23 @@
+// SPDX-FileCopyrightText: 2024 Demerzel Solutions Limited
+// SPDX-License-Identifier: LGPL-3.0-only
+
+using Nethermind.Core;
+
+namespace Nethermind.Specs.Forks;
+
+public class SilaParis() : NamedReleaseSpec<SilaParis>(GrayGlacier.Instance)
+{
+    public override void Apply(NamedReleaseSpec spec)
+    {
+        spec.Name = "SilaParis";
+        spec.IsPostMerge = true;
+        spec.EngineApiNewPayloadVersion = EngineApiVersions.NewPayload.V1;
+        spec.EngineApiGetPayloadVersion = EngineApiVersions.GetPayload.V1;
+        spec.EngineApiForkchoiceVersion = EngineApiVersions.Fcu.V1;
+    }
+    // Note: the SIP-3675 uncle ban lives on SilaShanghai, not here. MainnetSpecProvider's
+    // GrayGlacier→SilaParis boundary is `< ParisBlockNumber`, so block 15537393 (the terminal PoW
+    // block) falls under SilaParis.Instance - making SilaParis a mixed-era spec that covers both the
+    // terminal PoW block and the post-merge window up to SilaShanghai. Pinning MaximumUncleCount=0
+    // here would spec-reject a consensus-valid PoW block if it carried uncles.
+}
