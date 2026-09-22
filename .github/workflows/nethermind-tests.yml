@@ -7,7 +7,7 @@ concurrency:
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
     inputs:
       coverage:
@@ -17,7 +17,7 @@ on:
         type: boolean
 
 env:
-  COLLECT_COVERAGE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' || github.event.inputs.coverage }}
+  COLLECT_COVERAGE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event.inputs.coverage }}
   DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION: 1
   TERM: xterm
 
