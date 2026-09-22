@@ -2,7 +2,7 @@ name: Sync PR Gate (Hoodi)
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: sync-pr-${{ github.event.pull_request.number }}
@@ -18,7 +18,7 @@ permissions:
 jobs:
   sync-hoodi:
     name: "Sync hoodi (${{ matrix.mode }})"
-    if: github.event.pull_request.head.repo.fork == false
+    if: github.event.pull_request.head.repo.fork == false && vars.APP_ID != ''
     runs-on: ubuntu-arm64-8-core
     timeout-minutes: 180
     strategy:
