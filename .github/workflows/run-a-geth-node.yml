@@ -140,7 +140,7 @@ jobs:
           }')
 
           gh workflow run run-smoketests.yml \
-            --repo NethermindSil/post-merge-smoke-tests --ref main \
+            --repo NethermindEth/post-merge-smoke-tests --ref main \
             -f github_username="${{ github.actor }}" \
             -f base_tag="${{ env.BASE_TAG }}" \
             -f tags="rpc-comparison" \
@@ -158,7 +158,7 @@ jobs:
           MAX_WAIT_MINUTES: "5"
           INTERVAL: "5"
           TIMEOUT: "30"
-          ORG_NAME: "NethermindSil"
+          ORG_NAME: "NethermindEth"
           REPO_NAME: "post-merge-smoke-tests"
           NAME_FILTER: ${{ env.BASE_TAG }}
           REF: "main"
@@ -180,7 +180,7 @@ jobs:
           ARTIFACT_ID=""
           for attempt in $(seq 1 10); do
             ARTIFACT_ID=$(curl -s -H "Accept: application/vnd.github.v3+json" -H "Authorization: token $GH_APP_TOKEN" \
-              "https://api.github.com/repos/NethermindSil/post-merge-smoke-tests/actions/runs/${{ env.RUN_ID }}/artifacts" | jq -r '.artifacts[0].id // empty')
+              "https://api.github.com/repos/NethermindEth/post-merge-smoke-tests/actions/runs/${{ env.RUN_ID }}/artifacts" | jq -r '.artifacts[0].id // empty')
             [ -n "$ARTIFACT_ID" ] && break
             echo "Artifact not listed yet (attempt $attempt/10); retrying in 15s..."
             sleep 15
@@ -189,7 +189,7 @@ jobs:
             echo "No machine-details artifact found for run ${{ env.RUN_ID }}."
             exit 1
           fi
-          curl -L -H "Accept: application/vnd.github.v3+json" -H "Authorization: token $GH_APP_TOKEN" -o artifact.zip "https://api.github.com/repos/NethermindSil/post-merge-smoke-tests/actions/artifacts/$ARTIFACT_ID/zip"
+          curl -L -H "Accept: application/vnd.github.v3+json" -H "Authorization: token $GH_APP_TOKEN" -o artifact.zip "https://api.github.com/repos/NethermindEth/post-merge-smoke-tests/actions/artifacts/$ARTIFACT_ID/zip"
           unzip artifact.zip -d ./downloaded-artifacts/
 
       - name: Display machine specs content

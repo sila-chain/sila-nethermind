@@ -331,7 +331,7 @@ jobs:
         uses: benc-uk/workflow-dispatch@v1
         with:
           workflow: run-single-node.yml
-          repo: NethermindSil/post-merge-smoke-tests
+          repo: NethermindEth/post-merge-smoke-tests
           ref: "main"
           token: "${{ steps.gh-app.outputs.token }}"
           inputs: '{
@@ -353,7 +353,7 @@ jobs:
           MAX_WAIT_MINUTES: "5"
           INTERVAL: "5"
           TIMEOUT: "20"
-          ORG_NAME: "NethermindSil"
+          ORG_NAME: "NethermindEth"
           REPO_NAME: "post-merge-smoke-tests"
           NAME_FILTER: ${{ env.BASE_TAG }}
           REF: "main"
@@ -368,8 +368,8 @@ jobs:
 
       - name: Download machine specs artifact
         run: |
-          ARTIFACT_ID=$(curl -H "Accept: application/vnd.github.v3+json" -H "Authorization: token ${{ steps.gh-app.outputs.token }}" https://api.github.com/repos/NethermindSil/post-merge-smoke-tests/actions/runs/${{ env.RUN_ID }}/artifacts | jq '.artifacts[0].id')
-          curl -L -H "Accept: application/vnd.github.v3+json" -H "Authorization: token ${{ steps.gh-app.outputs.token }}" -o artifact.zip https://api.github.com/repos/NethermindSil/post-merge-smoke-tests/actions/artifacts/$ARTIFACT_ID/zip
+          ARTIFACT_ID=$(curl -H "Accept: application/vnd.github.v3+json" -H "Authorization: token ${{ steps.gh-app.outputs.token }}" https://api.github.com/repos/NethermindEth/post-merge-smoke-tests/actions/runs/${{ env.RUN_ID }}/artifacts | jq '.artifacts[0].id')
+          curl -L -H "Accept: application/vnd.github.v3+json" -H "Authorization: token ${{ steps.gh-app.outputs.token }}" -o artifact.zip https://api.github.com/repos/NethermindEth/post-merge-smoke-tests/actions/artifacts/$ARTIFACT_ID/zip
           unzip artifact.zip -d ./downloaded-artifacts/
 
       - name: Display machine specs content

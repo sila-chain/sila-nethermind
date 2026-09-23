@@ -114,7 +114,7 @@ jobs:
       - name: Check out homebrew-nethermind repository
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/homebrew-nethermind
+          repository: NethermindEth/homebrew-nethermind
           token: ${{ steps.gh-app.outputs.token }}
 
       - name: Update formula file

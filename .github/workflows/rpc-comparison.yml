@@ -585,7 +585,7 @@ jobs:
       - name: Checkout rpc-tests
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/rpc-tests
+          repository: NethermindEth/rpc-tests
           ref: main
 
       - name: Setup Go environment
@@ -693,7 +693,7 @@ jobs:
           GH_TOKEN: ${{ steps.gh-app.outputs.token }}
         run: |
           gh workflow run manual-destroy-smoketests.yml \
-            --repo NethermindSil/post-merge-smoke-tests --ref main \
+            --repo NethermindEth/post-merge-smoke-tests --ref main \
             -f workflow_run_id="${{ needs.create_main_node.outputs.run_id }}" \
             -f timeout="0"
 
@@ -703,7 +703,7 @@ jobs:
           GH_TOKEN: ${{ steps.gh-app.outputs.token }}
         run: |
           gh workflow run manual-destroy-smoketests.yml \
-            --repo NethermindSil/post-merge-smoke-tests --ref main \
+            --repo NethermindEth/post-merge-smoke-tests --ref main \
             -f workflow_run_id="${{ needs.create_geth_node.outputs.run_id }}" \
             -f timeout="0"
 
@@ -713,6 +713,6 @@ jobs:
           GH_TOKEN: ${{ steps.gh-app.outputs.token }}
         run: |
           gh workflow run manual-destroy-smoketests.yml \
-            --repo NethermindSil/post-merge-smoke-tests --ref main \
+            --repo NethermindEth/post-merge-smoke-tests --ref main \
             -f workflow_run_id="${{ needs.create_reference_node.outputs.run_id }}" \
             -f timeout="0"
