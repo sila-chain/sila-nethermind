@@ -15,7 +15,7 @@ namespace Nethermind.Taiko.Test;
 
 [TestFixture]
 [Parallelizable(ParallelScope.All)]
-public class TaikoEthSyncingInfoTests
+public class TaikoSilSyncingInfoTests
 {
     [TestCaseSource(nameof(GetFullInfoCases))]
     public SyncingResult GetFullInfo_ReturnsExpected(ulong? suggested, ulong? beacon, ulong? head, SyncMode innerMode)
@@ -23,7 +23,7 @@ public class TaikoEthSyncingInfoTests
         ISilSyncingInfo inner = Substitute.For<ISilSyncingInfo>();
         inner.SyncMode.Returns(innerMode);
 
-        return new TaikoEthSyncingInfo(BlockTreeWith(suggested, beacon, head), inner).GetFullInfo();
+        return new TaikoSilSyncingInfo(BlockTreeWith(suggested, beacon, head), inner).GetFullInfo();
     }
 
     [Test]
@@ -37,7 +37,7 @@ public class TaikoEthSyncingInfoTests
         blockTree.Head.Returns(Build.A.Block.WithHeader(Build.A.BlockHeader.WithNumber(500UL).TestObject).TestObject);
 
         ISilSyncingInfo inner = Substitute.For<ISilSyncingInfo>();
-        TaikoEthSyncingInfo info = new(blockTree, inner);
+        TaikoSilSyncingInfo info = new(blockTree, inner);
 
         Assert.That(info.UpdateAndGetSyncTime(), Is.EqualTo(TimeSpan.Zero), "first call: starts the stopwatch");
         Thread.Sleep(10);
@@ -55,7 +55,7 @@ public class TaikoEthSyncingInfoTests
         ISilSyncingInfo inner = Substitute.For<ISilSyncingInfo>();
         inner.SyncMode.Returns(SyncMode.WaitingForBlock);
 
-        Assert.That(new TaikoEthSyncingInfo(Substitute.For<IBlockTree>(), inner).SyncMode, Is.EqualTo(SyncMode.WaitingForBlock));
+        Assert.That(new TaikoSilSyncingInfo(Substitute.For<IBlockTree>(), inner).SyncMode, Is.EqualTo(SyncMode.WaitingForBlock));
     }
 
     private static IBlockTree BlockTreeWith(ulong? suggested, ulong? beacon, ulong? head)

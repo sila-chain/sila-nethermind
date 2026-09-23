@@ -14,9 +14,9 @@ namespace Nethermind.Taiko.Rpc;
 /// live only on the engine/auth namespace (<see cref="TaikoEngineRpcModule"/>) — matching
 /// the alethia-reth reference shape — to avoid two divergent code paths.
 /// </summary>
-public class TaikoExtendedEthModule(
+public class TaikoExtendedSilModule(
     ISyncConfig syncConfig,
-    IL1OriginStore l1OriginStore) : ITaikoExtendedEthRpcModule
+    IL1OriginStore l1OriginStore) : ITaikoExtendedSilRpcModule
 {
     /// <summary>
     /// Cached "not found" result for L1-origin lookups.
