@@ -26,7 +26,7 @@ namespace Nethermind.Taiko;
 /// reports <c>false</c> during the very plateau this decorator exists to fix.
 /// </para>
 /// </remarks>
-public sealed class TaikoEthSyncingInfo(
+public sealed class TaikoSilSyncingInfo(
     IBlockTree blockTree,
     ISilSyncingInfo inner) : ISilSyncingInfo
 {

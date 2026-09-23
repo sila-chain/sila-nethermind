@@ -5,7 +5,7 @@
 # dotTrace). Posts the report as a PR comment.
 #
 # Trigger modes:
-#   1. PR comment — `@claude-bench [options]` (NethermindSil/core team only).
+#   1. PR comment — `@claude-bench [options]` (NethermindEth/core team only).
 #   2. Manual — workflow_dispatch with explicit parameters.
 #   3. Repository dispatch — called from gas-benchmarks repo.
 #
@@ -70,7 +70,7 @@ permissions:
   actions: read
 
 jobs:
-  # Gate: verify the commenter is a member of the NethermindSil/core team.
+  # Gate: verify the commenter is a member of the NethermindEth/core team.
   # The job-level `if` does a cheap author_association pre-filter; the team check
   # step does the real authorization. This prevents any org member outside `core`
   # from burning Claude API credits or posting on PRs via @claude-bench.
@@ -92,7 +92,7 @@ jobs:
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: NethermindSil
+          owner: NethermindEth
 
       - name: Check team membership
         id: check
@@ -106,12 +106,12 @@ jobs:
             exit 0
           fi
 
-          # Check if the commenter is a member of NethermindSil/core.
+          # Check if the commenter is a member of NethermindEth/core.
           # The API returns 204 for members, 404 for non-members.
-          if gh api "orgs/NethermindSil/teams/core/memberships/${COMMENT_AUTHOR}" --silent 2>/dev/null; then
+          if gh api "orgs/NethermindEth/teams/core/memberships/${COMMENT_AUTHOR}" --silent 2>/dev/null; then
             echo "authorized=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "::notice::@${COMMENT_AUTHOR} is not a member of NethermindSil/core — skipping."
+            echo "::notice::@${COMMENT_AUTHOR} is not a member of NethermindEth/core — skipping."
             echo "authorized=false" >> "${GITHUB_OUTPUT}"
           fi
 

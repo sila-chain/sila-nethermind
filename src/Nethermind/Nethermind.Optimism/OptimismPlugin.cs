@@ -125,9 +125,9 @@ public class OptimismModule(ChainSpec chainSpec, IOptimismConfig optimismConfig)
             .AddSingleton<IHealthHintService, IBlocksConfig>((blocksConfig) =>
                 new ManualHealthHintService(blocksConfig.SecondsPerSlot * 6, HealthHintConstants.InfinityHint))
 
-            .AddSingleton<OptimismEthModuleFactory>()
-                .Bind<IRpcModuleFactory<IOptimismEthRpcModule>, OptimismEthModuleFactory>()
-                .Bind<IRpcModuleFactory<ISilRpcModule>, OptimismEthModuleFactory>()
+            .AddSingleton<OptimismSilModuleFactory>()
+                .Bind<IRpcModuleFactory<IOptimismSilRpcModule>, OptimismSilModuleFactory>()
+                .Bind<IRpcModuleFactory<ISilRpcModule>, OptimismSilModuleFactory>()
 
             .AddSingleton<IOptimismSignalSuperchainV1Handler, ILogManager>(logManager =>
                 new LoggingOptimismSignalSuperchainV1Handler(OptimismConstants.CurrentProtocolVersion, logManager))
@@ -151,8 +151,8 @@ public class OptimismModule(ChainSpec chainSpec, IOptimismConfig optimismConfig)
                 .AddSingleton<ISystemConfigDeriver, CLChainSpecEngineParameters>(clParameters =>
                     new SystemConfigDeriver(clParameters.SystemConfigProxy!))
                 // Single L2-facing sil module instance for internal CL use (distinct from the sil_ request pool).
-                .AddSingleton<IOptimismEthRpcModule>(ctx =>
-                    ctx.Resolve<IRpcModuleFactory<IOptimismEthRpcModule>>().Create())
+                .AddSingleton<IOptimismSilRpcModule>(ctx =>
+                    ctx.Resolve<IRpcModuleFactory<IOptimismSilRpcModule>>().Create())
                 .AddSingleton<IL2Api, L2Api>()
                 .AddSingleton<IExecutionEngineManager, ExecutionEngineManager>()
                 .AddSingleton<OptimismCL>()

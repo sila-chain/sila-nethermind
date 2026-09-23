@@ -612,9 +612,9 @@ public class ChainSpecBasedSpecProviderTests
     {
         ChainSpec chainSpec = LoadChainSpecFromChainFolder("foundation");
         ChainSpecBasedSpecProvider provider = new(chainSpec);
-        MainnetSpecProvider sila-mainnet = MainnetSpecProvider.Instance;
+        MainnetSpecProvider silaMainnet = MainnetSpecProvider.Instance;
 
-        CompareSpecs(sila-mainnet, provider, forkActivation, CompareSpecsOptions.CheckDifficultyBomb);
+        CompareSpecs(silaMainnet, provider, forkActivation, CompareSpecsOptions.CheckDifficultyBomb);
 
         using (Assert.EnterMultipleScope())
         {

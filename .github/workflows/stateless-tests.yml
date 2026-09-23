@@ -4,9 +4,9 @@ on:
   merge_group:
     types: [checks_requested]
   pull_request:
-    branches: [master]
+    branches: [main]
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:

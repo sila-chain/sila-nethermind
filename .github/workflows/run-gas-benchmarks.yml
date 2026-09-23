@@ -231,7 +231,7 @@ jobs:
       - name: Checkout Gas Benchmarks
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/gas-benchmarks
+          repository: NethermindEth/gas-benchmarks
           ref: main
           lfs: true
 

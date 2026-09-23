@@ -19,7 +19,7 @@ namespace Nethermind.Taiko;
 /// the default cumulative strategy underflows on the per-block ZK-gas <c>Difficulty</c>),
 /// <see cref="TaikoSyncProgressResolver"/> (widens
 /// <see cref="ISyncProgressResolver.FindBestHeader"/> for the snapshot-invariant check),
-/// <see cref="TaikoEthSyncingInfo"/> (widens the suggested-header read for
+/// <see cref="TaikoSilSyncingInfo"/> (widens the suggested-header read for
 /// <c>sil_syncing</c>), and <see cref="TaikoBeaconSync"/> (widens the
 /// <c>chainMerged</c> check inside <c>IsBeaconSyncHeadersFinished</c> so second-and-onwards
 /// beacon-sync triggers can hand off to <see cref="SyncMode.Full"/>).
@@ -31,7 +31,7 @@ public sealed class TaikoSynchronizerModule : Module
         .AddDecorator<ISyncProgressResolver>((ctx, inner) =>
             new TaikoSyncProgressResolver(ctx.Resolve<IBlockTree>(), inner))
         .AddDecorator<ISilSyncingInfo>((ctx, inner) =>
-            new TaikoEthSyncingInfo(ctx.Resolve<IBlockTree>(), inner))
+            new TaikoSilSyncingInfo(ctx.Resolve<IBlockTree>(), inner))
         .AddDecorator<IBeaconSyncStrategy>((ctx, inner) =>
             new TaikoBeaconSync(
                 inner,

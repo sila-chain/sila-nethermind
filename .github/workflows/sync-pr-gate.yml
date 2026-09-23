@@ -2,7 +2,7 @@ name: Sync PR Gate (Hoodi)
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: sync-pr-${{ github.event.pull_request.number }}
@@ -18,7 +18,7 @@ permissions:
 jobs:
   sync-hoodi:
     name: "Sync hoodi (${{ matrix.mode }})"
-    if: github.event.pull_request.head.repo.fork == false
+    if: github.event.pull_request.head.repo.fork == false && vars.APP_ID != ''
     runs-on: ubuntu-arm64-8-core
     timeout-minutes: 180
     strategy:
@@ -49,7 +49,7 @@ jobs:
       - name: Checkout tests repository
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/post-merge-smoke-tests
+          repository: NethermindEth/post-merge-smoke-tests
           path: tests
           token: ${{ steps.gh-app.outputs.token }}
           clean: true
@@ -83,7 +83,7 @@ jobs:
       - name: Install Sedge
         if: steps.cache-sedge.outputs.cache-hit != 'true'
         run: |
-          git clone https://github.com/NethermindSil/sedge.git sedge --branch core --single-branch
+          git clone https://github.com/NethermindEth/sedge.git sedge --branch core --single-branch
           cd sedge
           make compile
 

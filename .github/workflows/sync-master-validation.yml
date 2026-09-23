@@ -136,7 +136,7 @@ jobs:
           machine_type: "${{ matrix.config.agent }}"
           image: "linode/ubuntu24.04"
           tags: "core, self-hosted, dynamic"
-          organization: "NethermindSil"
+          organization: "NethermindEth"
           repo_name: "nethermind"
           blocked_ports: "8545,8546,8547,8551,8552,8553"
 
@@ -169,7 +169,7 @@ jobs:
       - name: Checkout tests repository
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/post-merge-smoke-tests
+          repository: NethermindEth/post-merge-smoke-tests
           path: tests
           token: ${{ steps.gh-app.outputs.token }}
           clean: true
@@ -193,7 +193,7 @@ jobs:
 
       - name: Install Sedge environment
         run: |
-          git clone https://github.com/NethermindSil/sedge.git sedge --branch core --single-branch
+          git clone https://github.com/NethermindEth/sedge.git sedge --branch core --single-branch
           cd sedge
           make compile
 
@@ -355,7 +355,7 @@ jobs:
           runner_label: ${{ matrix.config.runner_label }}
           search_phrase: ${{ matrix.config.runner_label }}
           root_password: ${{ secrets.LINODE_ROOT_PASSWORD }}
-          organization: "NethermindSil"
+          organization: "NethermindEth"
           repo_name: "nethermind"
 
       - name: Destroy Runner
@@ -367,7 +367,7 @@ jobs:
           runner_label: ${{ matrix.config.runner_label }}
           search_phrase: ${{ matrix.config.runner_label }}
           root_password: ${{ secrets.LINODE_ROOT_PASSWORD }}
-          organization: "NethermindSil"
+          organization: "NethermindEth"
           repo_name: "nethermind"
 
   notify-on-failure:

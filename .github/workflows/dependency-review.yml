@@ -12,7 +12,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
-      - name: Dependency review
-        uses: actions/dependency-review-action@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
         with:
-          fail-on-severity: high
+          cache: true
+          cache-dependency-path: src/Nethermind/Nethermind.Runner/packages.lock.json
+
+      - name: Restore locked dependencies and audit vulnerabilities
+        run: dotnet restore src/Nethermind/Nethermind.slnx --locked-mode

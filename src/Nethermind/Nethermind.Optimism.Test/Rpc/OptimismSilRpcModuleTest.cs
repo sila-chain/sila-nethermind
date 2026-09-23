@@ -35,7 +35,7 @@ using NUnit.Framework;
 
 namespace Nethermind.Optimism.Test.Rpc;
 
-public class OptimismEthRpcModuleTest
+public class OptimismSilRpcModuleTest
 {
     [SetUp]
     public void Setup()
@@ -65,7 +65,7 @@ public class OptimismEthRpcModuleTest
             .ForTest(sealEngineType: SealEngineType.Optimism)
             .WithBlockFinder(blockFinder)
             .WithReceiptFinder(receiptFinder)
-            .WithOptimismEthRpcModule(
+            .WithOptimismSilRpcModule(
                 sequencerRpcClient: Substitute.For<IJsonRpcClient>(),
                 accountStateProvider: Substitute.For<IAccountStateProvider>(),
                 ecdsa: Substitute.For<ISilaEcdsa>(),
@@ -86,7 +86,7 @@ public class OptimismEthRpcModuleTest
             .ForTest(sealEngineType: SealEngineType.Optimism)
             .WithBlockchainBridge(bridge)
             .WithTxSender(txSender)
-            .WithOptimismEthRpcModule(
+            .WithOptimismSilRpcModule(
                 sequencerRpcClient: null /* explicitly using null to behave as Sequencer */,
                 accountStateProvider: Substitute.For<IAccountStateProvider>(),
                 ecdsa: new OptimismSilaEcdsa(silaEcdsa),
@@ -139,7 +139,7 @@ public class OptimismEthRpcModuleTest
         TestRpcBlockchain rpcBlockchain = await TestRpcBlockchain
             .ForTest(sealEngineType: SealEngineType.Optimism)
             .WithBlockchainBridge(bridge)
-            .WithOptimismEthRpcModule(
+            .WithOptimismSilRpcModule(
                 sequencerRpcClient: Substitute.For<IJsonRpcClient>(),
                 accountStateProvider: Substitute.For<IAccountStateProvider>(),
                 ecdsa: Substitute.For<ISilaEcdsa>(),
@@ -213,7 +213,7 @@ public class OptimismEthRpcModuleTest
         TestRpcBlockchain rpcBlockchain = await TestRpcBlockchain
             .ForTest(sealEngineType: SealEngineType.Optimism)
             .WithBlockchainBridge(bridge)
-            .WithOptimismEthRpcModule(
+            .WithOptimismSilRpcModule(
                 sequencerRpcClient: Substitute.For<IJsonRpcClient>(),
                 accountStateProvider: Substitute.For<IAccountStateProvider>(),
                 ecdsa: Substitute.For<ISilaEcdsa>(),
@@ -573,7 +573,7 @@ public class OptimismEthRpcModuleTest
             .ForTest(sealEngineType: SealEngineType.Optimism)
             .WithBlockchainBridge(bridge)
             .WithBlockFinder(MockBlockFinder(block))
-            .WithOptimismEthRpcModule(
+            .WithOptimismSilRpcModule(
                 sequencerRpcClient: Substitute.For<IJsonRpcClient>(),
                 accountStateProvider: Substitute.For<IAccountStateProvider>(),
                 ecdsa: Substitute.For<ISilaEcdsa>(),
@@ -612,14 +612,14 @@ public class OptimismEthRpcModuleTest
 
 internal static class TestRpcBlockchainExt
 {
-    public static TestRpcBlockchain.Builder<TestRpcBlockchain> WithOptimismEthRpcModule(
+    public static TestRpcBlockchain.Builder<TestRpcBlockchain> WithOptimismSilRpcModule(
         this TestRpcBlockchain.Builder<TestRpcBlockchain> @this,
         IJsonRpcClient? sequencerRpcClient,
         IAccountStateProvider accountStateProvider,
         ISilaEcdsa ecdsa,
         ITxSealer sealer,
         IOptimismSpecHelper opSpecHelper) =>
-        @this.WithEthRpcModule(blockchain => new OptimismEthRpcModule(
+        @this.WithEthRpcModule(blockchain => new OptimismSilRpcModule(
             blockchain.RpcConfig,
             blockchain.Bridge,
             blockchain.BlockFinder,

@@ -27,7 +27,7 @@ using Nethermind.State;
 
 namespace Nethermind.Optimism.Rpc;
 
-public class OptimismEthModuleFactory : ModuleFactoryBase<IOptimismEthRpcModule>
+public class OptimismSilModuleFactory : ModuleFactoryBase<IOptimismSilRpcModule>
 {
     private readonly ILogManager _logManager;
     private readonly IStateReader _stateReader;
@@ -38,7 +38,7 @@ public class OptimismEthModuleFactory : ModuleFactoryBase<IOptimismEthRpcModule>
     private readonly IJsonRpcConfig _rpcConfig;
     private readonly ISpecProvider _specProvider;
     private readonly IGasPriceOracle _gasPriceOracle;
-    private readonly ISilSyncingInfo _ethSyncingInfo;
+    private readonly ISilSyncingInfo _silSyncingInfo;
     private readonly IFeeHistoryOracle _feeHistoryOracle;
     private readonly ISilaEcdsa _ecdsa;
     private readonly ITxSealer _sealer;
@@ -56,7 +56,7 @@ public class OptimismEthModuleFactory : ModuleFactoryBase<IOptimismEthRpcModule>
     private readonly HeadBlockSignal _headBlockSignal;
     private readonly IBlockForRpcFactory _blockForRpcFactory;
 
-    public OptimismEthModuleFactory(IJsonRpcConfig rpcConfig,
+    public OptimismSilModuleFactory(IJsonRpcConfig rpcConfig,
         IBlockchainBridgeFactory blockchainBridgeFactory,
         IBlockFinder blockFinder,
         IBlockTree blockTree,
@@ -95,7 +95,7 @@ public class OptimismEthModuleFactory : ModuleFactoryBase<IOptimismEthRpcModule>
         _rpcConfig = rpcConfig;
         _specProvider = specProvider;
         _gasPriceOracle = gasPriceOracle;
-        _ethSyncingInfo = silSyncingInfo;
+        _silSyncingInfo = silSyncingInfo;
         _feeHistoryOracle = feeHistoryOracle;
         _ecdsa = ecdsa;
         _blockFinder = blockFinder;
@@ -107,7 +107,7 @@ public class OptimismEthModuleFactory : ModuleFactoryBase<IOptimismEthRpcModule>
         _forkInfo = forkInfo;
         _logIndexConfig = logIndexConfig;
         _receiptConfig = receiptConfig;
-        ILogger logger = logManager.GetClassLogger<OptimismEthModuleFactory>();
+        ILogger logger = logManager.GetClassLogger<OptimismSilModuleFactory>();
         if (config.SequencerUrl is null && logger.IsWarn)
         {
             logger.Warn("SequencerUrl is not set. Nethermind will behave as a Sequencer");
@@ -124,7 +124,7 @@ public class OptimismEthModuleFactory : ModuleFactoryBase<IOptimismEthRpcModule>
         _headBlockSignal = new HeadBlockSignal(blockTree);
     }
 
-    public override IOptimismEthRpcModule Create() => new OptimismEthRpcModule(
+    public override IOptimismSilRpcModule Create() => new OptimismSilRpcModule(
             _rpcConfig,
             _blockchainBridgeFactory.CreateBlockchainBridge(),
             _blockFinder,
@@ -137,7 +137,7 @@ public class OptimismEthModuleFactory : ModuleFactoryBase<IOptimismEthRpcModule>
             _logManager,
             _specProvider,
             _gasPriceOracle,
-            _ethSyncingInfo,
+            _silSyncingInfo,
             _feeHistoryOracle,
             _protocolsManager,
             _forkInfo,
