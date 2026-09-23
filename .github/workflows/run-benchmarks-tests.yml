@@ -8,7 +8,7 @@ on:
 
 jobs:
   run-benchmarks:
-    if: github.repository_owner == 'NethermindSil'
+    if: github.repository_owner == 'NethermindEth'
     name: Triggering Nethermind Benchmark Performance Run
     runs-on: ubuntu-latest
     steps:

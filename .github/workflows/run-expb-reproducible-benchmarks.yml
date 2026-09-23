@@ -6,7 +6,7 @@ on:
       expb_repo:
         description: execution-payloads-benchmarks repository in owner/repo format
         required: false
-        default: NethermindSil/execution-payloads-benchmarks
+        default: NethermindEth/execution-payloads-benchmarks
       expb_branch:
         description: execution-payloads-benchmarks branch or tag
         required: false
@@ -224,7 +224,7 @@ jobs:
             state_layout="flat"
             payload_set="superblocks"
             payload_sets='["superblocks","realblocks","fusaka"]'
-            expb_repo="NethermindSil/execution-payloads-benchmarks"
+            expb_repo="NethermindEth/execution-payloads-benchmarks"
             expb_branch="main"
             expb_data_dir="/mnt/sda/expb-data"
             delay_seconds="0"
@@ -239,7 +239,7 @@ jobs:
             state_layout="flat"
             payload_set="superblocks"
             payload_sets='["superblocks","realblocks","fusaka"]'
-            expb_repo="NethermindSil/execution-payloads-benchmarks"
+            expb_repo="NethermindEth/execution-payloads-benchmarks"
             expb_branch="main"
             expb_data_dir="/mnt/sda/expb-data"
             delay_seconds="0"
@@ -675,8 +675,8 @@ jobs:
             exit 1
           fi
 
-          if [[ "${EXPB_REPO}" == "NethermindSil/execution-payloads-benchmarks" && "${EXPB_BRANCH}" == "main" ]]; then
-            expb_source="git+https://github.com/NethermindSil/execution-payloads-benchmarks"
+          if [[ "${EXPB_REPO}" == "NethermindEth/execution-payloads-benchmarks" && "${EXPB_BRANCH}" == "main" ]]; then
+            expb_source="git+https://github.com/NethermindEth/execution-payloads-benchmarks"
           elif [[ -n "${EXPB_BRANCH}" ]]; then
             expb_source="git+https://github.com/${EXPB_REPO}@${EXPB_BRANCH}"
           else
@@ -1770,8 +1770,8 @@ jobs:
             echo "uv is required on runner but was not found in PATH."
             exit 1
           fi
-          if [[ "${EXPB_REPO}" == "NethermindSil/execution-payloads-benchmarks" && "${EXPB_BRANCH}" == "main" ]]; then
-            expb_source="git+https://github.com/NethermindSil/execution-payloads-benchmarks"
+          if [[ "${EXPB_REPO}" == "NethermindEth/execution-payloads-benchmarks" && "${EXPB_BRANCH}" == "main" ]]; then
+            expb_source="git+https://github.com/NethermindEth/execution-payloads-benchmarks"
           elif [[ -n "${EXPB_BRANCH}" ]]; then
             expb_source="git+https://github.com/${EXPB_REPO}@${EXPB_BRANCH}"
           else

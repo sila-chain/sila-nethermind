@@ -32,7 +32,7 @@ jobs:
       - name: Check out Nethermind docs repository
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/docs
+          repository: NethermindEth/docs
           path: d
           token: ${{ steps.gh-app.outputs.token }}
       - name: Set up .NET
