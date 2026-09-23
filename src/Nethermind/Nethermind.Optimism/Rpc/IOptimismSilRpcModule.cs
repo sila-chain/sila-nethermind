@@ -7,4 +7,4 @@ using Nethermind.JsonRpc.Modules;
 namespace Nethermind.Optimism.Rpc;
 
 [RpcModule(ModuleType.Sil)]
-public interface IOptimismEthRpcModule : ISilRpcModule;
+public interface IOptimismSilRpcModule : ISilRpcModule;

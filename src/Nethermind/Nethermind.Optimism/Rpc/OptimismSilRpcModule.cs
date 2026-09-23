@@ -34,7 +34,7 @@ using Nethermind.Wallet;
 
 namespace Nethermind.Optimism.Rpc;
 
-public class OptimismEthRpcModule(
+public class OptimismSilRpcModule(
     IJsonRpcConfig rpcConfig,
     IBlockchainBridge blockchainBridge,
     IBlockFinder blockFinder,
@@ -82,7 +82,7 @@ public class OptimismEthRpcModule(
         secondsPerSlot,
         headBlockSignal,
         capabilitiesProvider,
-        blockForRpcFactory), IOptimismEthRpcModule
+        blockForRpcFactory), IOptimismSilRpcModule
 {
     public override ResultWrapper<ReceiptForRpc[]?> sil_getBlockReceipts(BlockParameter blockParameter)
     {
@@ -212,7 +212,7 @@ public class OptimismEthRpcModule(
         SearchResult<Block> searchResult = _blockFinder.SearchForBlock(blockParameter);
         if (searchResult.IsError || searchResult.Object is null)
         {
-            return GetFailureResult<TransactionForRpc?, Block>(searchResult, _ethSyncingInfo.SyncMode.HaveNotSyncedBodiesYet());
+            return GetFailureResult<TransactionForRpc?, Block>(searchResult, _silSyncingInfo.SyncMode.HaveNotSyncedBodiesYet());
         }
 
         Block block = searchResult.Object;
@@ -249,7 +249,7 @@ public class OptimismEthRpcModule(
         SearchResult<Block> searchResult = _blockFinder.SearchForBlock(blockParameter, true);
         if (searchResult.IsError)
         {
-            return GetFailureResult<BlockForRpc?, Block>(searchResult, _ethSyncingInfo.SyncMode.HaveNotSyncedBodiesYet());
+            return GetFailureResult<BlockForRpc?, Block>(searchResult, _silSyncingInfo.SyncMode.HaveNotSyncedBodiesYet());
         }
 
         Block? block = searchResult.Object;
