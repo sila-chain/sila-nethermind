@@ -31,7 +31,7 @@ jobs:
       - name: Checkout surge-taiko-mono
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/surge-taiko-mono
+          repository: NethermindEth/surge-taiko-mono
           path: ${{ env.SURGE_TAIKO_MONO_DIR }}
           ref: surge-shasta
 
@@ -65,7 +65,7 @@ jobs:
       - name: Checkout Pacaya fork
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/surge-taiko-mono
+          repository: NethermindEth/surge-taiko-mono
           path: >-
             ${{ format('{0}/{1}', env.SURGE_TAIKO_MONO_DIR,
             env.PACAYA_FORK_TAIKO_MONO_DIR) }}
@@ -74,7 +74,7 @@ jobs:
       - name: Checkout Shasta fork
         uses: actions/checkout@v6
         with:
-          repository: NethermindSil/surge-taiko-mono
+          repository: NethermindEth/surge-taiko-mono
           path: >-
             ${{ format('{0}/{1}', env.SURGE_TAIKO_MONO_DIR,
             env.SHASTA_FORK_TAIKO_MONO_DIR) }}
